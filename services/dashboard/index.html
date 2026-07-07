@@ -1,0 +1,386 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Memory Dashboard</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: -apple-system, sans-serif; background: #f5f5f7; color: #333; padding: 20px; }
+        .container { max-width: 1000px; margin: 0 auto; }
+        h1 { text-align: center; margin: 20px 0; }
+        .tabs { display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap; }
+        .tab { padding: 8px 14px; border: none; background: #e0e0e0; border-radius: 8px; cursor: pointer; font-size: 13px; }
+        .tab.active { background: #007aff; color: white; }
+        .panel { display: none; background: white; border-radius: 12px; padding: 20px; }
+        .panel.active { display: block; }
+        .stat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: #f0f0f0; border-radius: 8px; padding: 15px; text-align: center; }
+        .stat-card .number { font-size: 24px; font-weight: bold; color: #007aff; }
+        .stat-card .label { font-size: 12px; color: #666; margin-top: 5px; }
+        .btn { padding: 8px 14px; background: #007aff; color: white; border: none; border-radius: 6px; cursor: pointer; font-size: 13px; margin: 3px 2px; }
+        .btn-small { padding: 4px 8px; font-size: 11px; }
+        .btn-danger { background: #ff3b30; }
+        .search-box { width: 100%; padding: 10px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 15px; }
+        .item { border-bottom: 1px solid #eee; padding: 12px 0; }
+        .item-content { font-size: 14px; margin-bottom: 5px; }
+        .item-meta { font-size: 11px; color: #888; }
+        .item-quote { font-size: 12px; color: #666; font-style: italic; margin: 5px 0; padding-left: 8px; border-left: 3px solid #007aff; }
+        .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 10px; margin-right: 4px; }
+        .badge-core { background: #ffd700; color: #333; }
+        .badge-feel { background: #ff69b4; color: white; }
+        .badge-type { background: #e0e0e0; }
+        textarea { width: 100%; min-height: 150px; padding: 12px; border: 1px solid #ddd; border-radius: 8px; margin-bottom: 10px; font-size: 13px; }
+        .section { margin-bottom: 20px; }
+        .conv-item { padding: 10px; background: #f9f9f9; border-radius: 6px; margin-bottom: 8px; cursor: pointer; }
+        .conv-item:hover { background: #e8e8e8; }
+        .msg { padding: 8px; margin-bottom: 6px; border-radius: 6px; font-size: 13px; }
+        .msg-user { background: #e3f2fd; }
+        .msg-ai { background: #f1f8e9; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Memory Dashboard</h1>
+        <div class="tabs">
+            <button class="tab active" onclick="showPanel('overview')">总览</button>
+            <button class="tab" onclick="showPanel('l0')">L0原文</button>
+            <button class="tab" onclick="showPanel('l1')">L1记忆</button>
+            <button class="tab" onclick="showPanel('profile')">画像</button>
+            <button class="tab" onclick="showPanel('import')">导入</button>
+        </div>
+
+        <div id="overview" class="panel active">
+            <div class="stat-grid">
+                <div class="stat-card"><div class="number" id="stat-l0">-</div><div class="label">L0消息</div></div>
+                <div class="stat-card"><div class="number" id="stat-l1">-</div><div class="label">L1记忆</div></div>
+                <div class="stat-card"><div class="number" id="stat-conv">-</div><div class="label">对话数</div></div>
+                <div class="stat-card"><div class="number" id="stat-core">-</div><div class="label">核心记忆</div></div>
+                <div class="stat-card"><div class="number" id="stat-status">-</div><div class="label">状态</div></div>
+            </div>
+            <h3>记忆类型分布</h3>
+            <div id="type-stats" style="margin:10px 0;"></div>
+            <h3>来源分布</h3>
+            <div id="client-stats" style="margin:10px 0;"></div>
+            <button class="btn" onclick="loadStats()">刷新</button>
+        </div>
+
+        <div id="l0" class="panel">
+            <h3>对话列表</h3>
+            <div id="conv-list"></div>
+            <h3 style="margin-top:15px;">消息内容</h3>
+            <div id="l0-messages"></div>
+        </div>
+
+        <div id="l1" class="panel">
+            <div style="margin-bottom:15px;">
+                <button class="btn" onclick="loadL1('all')">全部</button>
+                <button class="btn" onclick="loadL1('preference_change')">偏好</button>
+                <button class="btn" onclick="loadL1('fact')">事实</button>
+                <button class="btn" onclick="loadL1('event')">事件</button>
+                <button class="btn" onclick="loadL1('feel')">感受</button>
+                <button class="btn" onclick="loadL1('relationship')">关系</button>
+                <button class="btn" onclick="loadL1('core')">仅核心</button>
+            </div>
+            <input type="text" class="search-box" id="l1-search" placeholder="搜索L1记忆...">
+            <button class="btn" onclick="searchL1()">搜索</button>
+            <div id="l1-list" style="margin-top:15px;"></div>
+        </div>
+
+        <div id="profile" class="panel">
+            <div class="section"><h3>关于用户</h3><textarea id="profile-user"></textarea></div>
+            <div class="section"><h3>关于AI</h3><textarea id="profile-ai"></textarea></div>
+            <div class="section"><h3>关于我们</h3><textarea id="profile-us"></textarea></div>
+            <button class="btn" onclick="saveProfile()">保存</button>
+            <span id="profile-status"></span>
+        </div>
+
+        <div id="import" class="panel">
+            <h3>导入历史对话</h3>
+            <div style="margin-bottom:15px;">
+                <button class="btn" onclick="document.getElementById('file-input').click()">选择文件</button>
+                <input type="file" id="file-input" accept=".json,.txt" style="display:none" onchange="handleFile(event)">
+                <span id="file-name" style="margin-left:10px;color:#666;"></span>
+            </div>
+            <select id="import-client" style="margin-bottom:10px;">
+                <option value="kelivo">Kelivo</option>
+                <option value="other">其他</option>
+            </select>
+            <textarea id="import-text" placeholder="或粘贴JSON"></textarea>
+            <button class="btn" onclick="doImport()">导入</button>
+            <div id="import-status" style="margin-top:10px;"></div>
+        </div>
+    </div>
+
+    <script>
+        var API = '/api';
+        var currentConv = null;
+        var currentPage = 0;
+        var pageSize = 100;
+
+        function formatTime(ts) {
+            if (!ts) return '';
+            try {
+                var str = ts.replace(' ', 'T');
+                if (str.indexOf('Z') === -1 && str.indexOf('+') === -1) str += 'Z';
+                var d = new Date(str);
+                var y = d.getFullYear();
+                var mo = String(d.getMonth() + 1).padStart(2, '0');
+                var day = String(d.getDate()).padStart(2, '0');
+                var h = String(d.getHours()).padStart(2, '0');
+                var mi = String(d.getMinutes()).padStart(2, '0');
+                return y + '-' + mo + '-' + day + ' ' + h + ':' + mi;
+            } catch(e) { return ts.substring(0, 16); }
+        }
+
+        function showPanel(name) {
+            document.querySelectorAll('.panel').forEach(function(p) { p.classList.remove('active'); });
+            document.querySelectorAll('.tab').forEach(function(t) { t.classList.remove('active'); });
+            document.getElementById(name).classList.add('active');
+            event.target.classList.add('active');
+            if (name === 'overview') loadStats();
+            if (name === 'l0') loadConversations();
+            if (name === 'l1') loadL1('all');
+            if (name === 'profile') loadProfile();
+        }
+
+        function loadStats() {
+            fetch(API + '/stats').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('stat-l0').textContent = d.l0_messages;
+                document.getElementById('stat-l1').textContent = d.l1_memories;
+                document.getElementById('stat-status').textContent = 'OK';
+            });
+            fetch(API + '/stats/detail').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('stat-conv').textContent = d.conv_count || 0;
+                document.getElementById('stat-core').textContent = d.core_count || 0;
+                var typeHtml = '';
+                var types = d.type_stats || {};
+                Object.keys(types).forEach(function(k) {
+                    typeHtml += '<span style="display:inline-block;margin:3px 6px;padding:4px 10px;background:#e8e8e8;border-radius:12px;font-size:12px;">' + k + ': ' + types[k] + '</span>';
+                });
+                document.getElementById('type-stats').innerHTML = typeHtml || '<span style="color:#888;">暂无数据</span>';
+                var clientHtml = '';
+                var clients = d.client_stats || {};
+                Object.keys(clients).forEach(function(k) {
+                    clientHtml += '<span style="display:inline-block;margin:3px 6px;padding:4px 10px;background:#d4eda;border-radius:12px;font-size:12px;">' + k + ': ' + clients[k] + '</span>';
+                });
+                document.getElementById('client-stats').innerHTML = clientHtml || '<span style="color:#888;">暂无数据</span>';
+            });
+        }
+
+        function loadConversations() {
+            fetch(API + '/l0/conversations').then(function(r) { return r.json(); }).then(function(d) {
+                var html = '';
+                (d.conversations || []).forEach(function(c) {
+                    html += '<div class="conv-item" onclick="loadL0Messages(\'' + c.conv_id + '\')">';
+                    html += '<strong>' + c.conv_id + '</strong> (' + c.client + ')<br>';
+                    html += '<span style="font-size:11px;color:#666;">' + c.msg_count + ' 条 | ' + formatTime(c.last_ts) + '</span>';
+                    html += '<br><button class="btn btn-small btn-danger" onclick="event.stopPropagation();deleteConv(\'' + c.conv_id + '\')">删除对话</button>';                    
+                    html += '</div>';
+                });
+                document.getElementById('conv-list').innerHTML = html || '<p>暂无对话</p>';
+            });
+        }
+
+        function loadL0Messages(convId) {
+            currentConv = convId;
+            currentPage = 0;
+            renderL0Page();
+        }
+
+        function renderL0Page() {
+            fetch(API + '/l0/messages?conv_id=' + currentConv).then(function(r) { return r.json(); }).then(function(d) {
+                var messages = d.messages || [];
+                var start = currentPage * pageSize;
+                var end = start + pageSize;
+                var page = messages.slice(start, end);
+                var html = '<div style="margin-bottom:10px;"><span>共 ' + messages.length + ' 条，显示 ' + (start+1) + '-' + Math.min(end, messages.length) + '</span>';
+                if (currentPage > 0) html += ' <button class="btn btn-small" onclick="currentPage--;renderL0Page()">上一页</button>';
+                if (end < messages.length) html += ' <button class="btn btn-small" onclick="currentPage++;renderL0Page()">下一页</button>';
+                html += '</div>';
+                page.forEach(function(m) {
+                    var cls = m.role === 'user' ? 'msg-user' : 'msg-ai';
+                    var prefix = m.role === 'user' ? '👤' : '🤖';
+                html += '<div class="msg ' + cls + '"><span style="font-size:10px;color:#999;cursor:pointer;text-decoration:underline;" onclick="editTimestamp(' + m.id + ',\'' + (m.ts || '') + '\')">' + formatTime(m.ts) + '</span> <span style="font-size:10px;color:#ff3b30;cursor:pointer;" onclick="deleteMsg(' + m.id + ')">删除</span><br>' + prefix + ' ' + m.content + '</div>';
+                });
+                document.getElementById('l0-messages').innerHTML = html || '<p>无消息</p>';
+            });
+        }
+
+        function loadL1(type) {
+            var url = API + '/l1/list?limit=100';
+            if (type !== 'all' && type !== 'core') url += '&event_type=' + type;
+            fetch(url).then(function(r) { return r.json(); }).then(function(d) {
+                var memories = d.memories || [];
+                if (type === 'core') memories = memories.filter(function(m) { return m.is_core; });
+                renderL1(memories);
+            });
+        }
+
+        function searchL1() {
+            var q = document.getElementById('l1-search').value;
+            if (!q) return;
+            fetch(API + '/search', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({query: q, mode: 'semantic', n: 20})
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                var memories = (d.memories || []).map(function(m) {
+                var meta = m.metadata || {};
+                    return { id: parseInt(m.id.replace('l1_','')), content: m.l1_summary || '', quote: m.quote || meta.quote || '', event_type: meta.event_type || '', tags: meta.tags || '', valence: meta.valence, arousal: meta.arousal, is_core: meta.is_core || 0, access_count: 0, ts: meta.ts || '', client: meta.client || '' };
+                });
+                renderL1(memories);
+            });
+        }
+
+        function renderL1(memories) {
+            var html = '<p style="color:#666;margin-bottom:10px;">共 ' + memories.length + ' 条</p>';
+            memories.forEach(function(m) {
+                html += '<div class="item">';
+                html += '<div class="item-content">';
+                if (m.is_core) html += '<span class="badge badge-core">核心</span>';
+                if (m.event_type === 'feel') html += '<span class="badge badge-feel">感受</span>';
+                else if (m.event_type) html += '<span class="badge badge-type">' + m.event_type + '</span>';
+                html += m.content + '</div>';
+                if (m.quote && m.quote !== m.content) html += '<div class="item-quote">"' + m.quote + '"</div>';
+                if (m.tags) html += '<div style="font-size:11px;color:#007aff;margin:3px 0;">标签: ' + m.tags + '</div>';
+                html += '<div class="item-meta">' + formatTime(m.ts) + ' | ' + (m.client || 'AI') + ' |翻阅' + (m.access_count||0) + '次';
+                if (m.valence != null) html += ' | v' + m.valence + '/a' + (m.arousal||0);
+                html += '</div>';
+                html += '<div style="margin-top:6px;">';
+                html += '<button class="btn btn-small" onclick="toggleCore(' + m.id + ',' + (m.is_core||0) + ')">' + (m.is_core ? '取消核心' : '标记核心') + '</button> ';
+                html += '<button class="btn btn-small" onclick="editTags(' + m.id + ')">编辑标签</button> ';
+                html += '<button class="btn btn-small" onclick="changeType(' + m.id + ')">改类型</button> ';
+                html += '<button class="btn btn-small btn-danger" onclick="deleteL1(' + m.id + ')">删除</button>';
+                html += '</div>';
+            });
+            document.getElementById('l1-list').innerHTML = html || '<p>暂无记忆</p>';
+        }
+
+        function toggleCore(id, cur) {
+            fetch(API + '/l1/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({is_core: cur ? 0 : 1}) }).then(function() { loadL1('all'); });
+        }
+
+        function editTags(id) {
+            var t = prompt('输入标签（逗号分隔）：');
+            if (t === null) return;
+            var arr = t.split(',').map(function(s){return s.trim();}).filter(function(s){return s;});
+            fetch(API + '/l1/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({tags: JSON.stringify(arr)}) }).then(function() { loadL1('all'); });
+        }
+
+        function changeType(id) {
+            var types = ['preference_change','fact','event','plan','relationship','feel','general'];
+            var c = prompt('选择类型：\n' + types.map(function(t,i){return (i+1)+'.'+t;}).join('\n') + '\n\n输入数字：');
+            if (!c) return;
+            var idx = parseInt(c) - 1;
+            if (idx >= 0 && idx < types.length) {
+                fetch(API + '/l1/' + id, { method: 'PUT', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({event_type: types[idx]}) }).then(function() { loadL1('all'); });
+            }
+        }
+
+        function deleteL1(id) {
+            if (!confirm('确定删除？')) return;
+            fetch(API + '/l1/' + id, { method: 'DELETE' }).then(function() { loadL1('all'); });
+        }
+
+        function loadProfile() {
+            fetch(API + '/profile').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('profile-user').value = d.about_user || '';
+                document.getElementById('profile-ai').value = d.about_ai || '';
+                document.getElementById('profile-us').value = d.about_us || '';
+            });
+        }
+
+        function saveProfile() {
+            fetch(API + '/profile', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ about_user: document.getElementById('profile-user').value, about_ai: document.getElementById('profile-ai').value, about_us: document.getElementById('profile-us').value }) }).then(function() { document.getElementById('profile-status').textContent = '已保存'; setTimeout(function(){document.getElementById('profile-status').textContent='';},2000); });
+        }
+
+        function handleFile(event) {
+            var file = event.target.files[0];
+            if (!file) return;
+            document.getElementById('file-name').textContent = file.name;
+            var reader = new FileReader();
+            reader.onload = function(e) { document.getElementById('import-text').value = e.target.result; };
+            reader.readAsText(file);
+        }
+
+        function doImport() {
+            var text = document.getElementById('import-text').value.trim();
+            if (!text) return;
+            var data = JSON.parse(text);
+            var messages = [];
+            var client = document.getElementById('import-client').value;
+            if (Array.isArray(data)) {
+                messages = data;
+            } else if (data.messages && data.conversations) {
+                var conv = data.conversations[0];
+                var vs = (conv && conv.versionSelections) || {};
+                var msgMap = {};
+                var groupMap = {};
+                data.messages.forEach(function(m) {
+                    msgMap[m.id] = m;
+                    var gid = m.groupId || m.id;
+                    if (!groupMap[gid]) groupMap[gid] = [];
+                    groupMap[gid].push(m);
+                });
+                var seen = {};
+                var mids = conv ? conv.messageIds : data.messages.map(function(m){return m.id;});
+                mids.forEach(function(mid) {
+                    var msg = msgMap[mid];
+                    if (!msg) return;
+                var gid = msg.groupId || msg.id;
+                if (seen[gid]) return;
+                    seen[gid] = true;
+                    var versions = groupMap[gid] || [msg];
+                    var chosen = msg;
+                    if (vs[gid] !== undefined) {
+                        for (var i = 0; i < versions.length; i++) {
+                            if (versions[i].version === vs[gid]) { chosen = versions[i]; break; }
+                        }
+                    }if (chosen.content) {
+                        messages.push({role: chosen.role, content: chosen.content, timestamp: chosen.timestamp || ''});
+                    }
+                });
+
+            } else if (data.messages) {
+                messages = data.messages;
+            }
+            if (messages.length === 0) {
+                document.getElementById('import-status').textContent = '未解析到消息';
+                return;
+            }
+            document.getElementById('import-status').textContent = '解析到 ' + messages.length + ' 条，正在导入...';
+            fetch(API + '/import_conversation', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({client: client, messages: messages})
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('import-status').textContent = d.status === 'ok' ? '导入成功！保存' + d.saved + '条' : '失败';
+                if (d.status === 'ok') document.getElementById('import-text').value = '';
+            });
+        }
+
+        function editTimestamp(id, currentTs) {
+            var newTs = prompt('修改时间（格式：2026-07-05 01:25:00）：', currentTs);
+            if (!newTs) return;
+            fetch(API + '/l0/' + id + '/timestamp', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ts: newTs})
+            }).then(function() { renderL0Page(); });
+        }
+
+        function deleteMsg(id) {
+            if (!confirm('确定删除这条消息？')) return;
+            fetch(API + '/l0/message/' + id, { method: 'DELETE' }).then(function() { renderL0Page(); });
+        }
+
+        function deleteConv(convId) {
+            if (!confirm('确定删除整个对话？（所有消息都会被删除）')) return;
+            fetch(API + '/l0/conversation/' + convId, { method: 'DELETE' }).then(function() { loadConversations(); document.getElementById('l0-messages').innerHTML = ''; });
+        }
+
+        loadStats();
+    </script>
+</body>
+</html>

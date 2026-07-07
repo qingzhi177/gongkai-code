@@ -1,0 +1,12 @@
+data/sqlite/*.db
+data/chroma/
+data/profile/*.md
+data/extract.log
+data/backup.log
+services/memory-service/venv/
+services/memory-service/__pycache__/
+services/gateway/node_modules/
+services/memory-service/.env
+services/gateway/.env
+*.pyc
+.DS_Store

@@ -1,0 +1,134 @@
+from pydantic import BaseModel
+from typing import Optional, List
+import chromadb
+import jieba
+import os
+from dotenv import load_dotenv
+import httpx
+import json
+from datetime import datetime
+
+load_dotenv()
+
+app = FastAPI(title="Memory Service")
+
+# ChromaDB 客户端
+chroma_client = chromadb.HttpClient(
+    host=os.getenv("CHROMA_HOST", "localhost"),
+    port=int(os.getenv("CHROMA_PORT", 8000))
+)
+
+# 获取或创建 collections
+try:
+    l0_collection = chroma_client.get_or_create_collection(
+        name="l0_archive",
+        metadata={"description": "L0 原文档案"}
+    )
+    l1_collection = chroma_client.get_or_create_collection(
+        name="l1_memories",
+        metadata={"description": "L1 记忆索引"}
+    )
+except Exception as e:
+    print(f"ChromaDB 连接失败: {e}")
+
+# API 配置
+ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY")
+ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# Pydantic 模型
+class SearchRequest(BaseModel):
+    query: str
+    mode: str = "semantic"  # semantic / exact / emotion
+    event_type: Optional[str] = None
+    after: Optional[str] = None
+    before: Optional[str] = None
+    tags: Optional[str] = None
+    emotion_valence: Optional[str] = None
+    n: int = 10
+
+class EmbeddingResponse(BaseModel):
+    embeddings: List[List[float]]
+
+# Embedding 函数
+async def get_embedding(text: str) -> List[float]:
+    """调用阿里百炼获取 embedding"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{ALIBABA_BASE_URL}/embeddings",
+                headers={
+                    "Authorization": f"Bearer {ALIBABA_API_KEY}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": "text-embedding-v3",
+                    "input": text,
+                    "encoding_format": "float"
+                }
+            )
+            response.raise_for_status()
+            result = response.json()
+            return result["data"][0]["embedding"]
+    except Exception as e:
+        print(f"Embedding 失败: {e}")
+        raise HTTPException(status_code=500, detail=f"Embedding 失败: {str(e)}")
+
+# 检索接口
+@app.post("/search")
+async def search_memories(req: SearchRequest):
+    """检索记忆"""
+    try:
+        if req.mode == "semantic":
+            # 语义检索
+            query_embedding = await get_embedding(req.query)
+            
+            results = l1_collection.query(
+                query_embeddings=[query_embedding],
+                n_results=req.n,
+                include=["documents", "metadatas", "distances"]
+            )
+            
+            memories = []
+            if results["ids"] and len(results["ids"][0]) > 0:
+                for i in range(len(results["ids"][0])):
+                    memories.append({
+                        "id": results["ids"][0][i],
+                        "content": results["documents"][0][i],
+                        "metadata": results["metadatas"][0][i],
+                        "score": 1 - results["distances"][0][i]  # 转换为相似度
+                    })
+            
+            return {"memories": memories, "total": len(memories)}
+        
+        elif req.mode == "exact":
+            # FTS5 逐字检索（暂时用简单实现）
+            return {"memories": [], "total": 0, "message": "FTS5 exact search 待实现"}
+        
+        else:
+            raise HTTPException(status_code=400, detail="不支持的检索模式")
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 健康检查
+@app.get("/health")
+async def health():
+    return {"status": "ok", "timestamp": datetime.now().isoformat()}
+
+# 测试 embedding
+@app.get("/test/embedding")
+async def test_embedding():
+    """测试 embedding 是否正常"""
+    try:
+        embedding = await get_embedding("测试文本")
+        return {
+            "status": "ok",
+            "dimension": len(embedding),
+            "sample": embedding[:5]
+        }
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8001)
