@@ -264,6 +264,17 @@ async function executeTool(name, args) {
   return '未知工具。';
 }
 
+// Anthropic 格式端点
+app.post('/v1/messages', (req, res) => {
+  req.body._anthropicFormat = true;
+  req.body.model = req.body.model || process.env.DEFAULT_MODEL;
+  if (req.body.system && !req.body.messages.find(m => m.role === 'system')) {
+    req.body.messages = [{ role: 'system', content: req.body.system }, ...req.body.messages];
+  }
+  req.url = '/v1/chat/completions';
+  app.handle(req, res);
+});
+
 // OpenAI 兼容 API 端点
 app.post('/v1/chat/completions', async (req, res) => {
   try {
@@ -299,78 +310,103 @@ ${memoryMenu}
     ];
     // 确定转发目标
     let apiUrl, apiKey, requestModel;
-    
+    const claudeBaseUrl = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com/v1';
+    const defaultModel = process.env.DEFAULT_MODEL || 'deepseek-chat';
+
     if (model && model.includes('deepseek')) {
       apiUrl = 'https://api.deepseek.com/v1/chat/completions';
       apiKey = process.env.DEEPSEEK_API_KEY;
       requestModel = model;
-    } else if (model && model.includes('claude')) {
-      apiUrl = 'https://api.anthropic.com/v1/messages';
+    } else if (model && (model.includes('claude') || model.includes('opus') || model.includes('sonnet'))) {
+      apiUrl = claudeBaseUrl + '/messages';
       apiKey = process.env.CLAUDE_API_KEY;
       requestModel = model;
     } else {
-      // 默认走 DepSeek
-      apiUrl = 'https://api.deepseek.com/v1/chat/completions';
-      apiKey = process.env.DEEPSEEK_API_KEY;
-      requestModel = 'deepseek-chat';
+      // 默认用配置的模型
+      apiUrl = claudeBaseUrl + '/messages';
+      apiKey = process.env.CLAUDE_API_KEY;
+      requestModel = defaultModel;
     }
-    
-    // 发送请求（带工具定义）
+
+    // 发送请求（Anthropic 原生格式）
+    const systemMessage = augmentedMessages.find(m => m.role === 'system');
+    const nonSystemMessages = augmentedMessages.filter(m => m.role !== 'system');
+
     const apiResponse = await axios.post(apiUrl, {
       model: requestModel,
-      messages: augmentedMessages,
+      system: systemMessage ? systemMessage.content : '',
+      messages: nonSystemMessages,
       tools: [...(req.body.tools || []), ...TOOLS],
-      stream: false
+      max_tokens: 4096
     }, {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json'
+        'Content-Type': 'application/json',
+        'anthropic-version': '2023-06-01'
       },
       timeout: 120000
     });
-    
+
     let result = apiResponse.data;
-    
-    // 处理工具调用循环
+    console.log('[DEBUG] API返回:', JSON.stringify(result).substring(0, 500));
+
+    // 处理工具调用循环（Anthropic 格式）
     let maxLoops = 5;
     while (maxLoops > 0) {
-      const choice = result.choices && result.choices[0];
-      if (!choice) break;
-      const msg = choice.message;
-      if (choice.finish_reason !== 'tool_calls' || !msg.tool_calls) break;
-      
+      if (result.stop_reason !== 'tool_use') break;
+      const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
+      if (toolUseBlocks.length === 0) break;
+
       // 执行工具
-      const toolMessages = [];
-      for (const tc of msg.tool_calls) {
-        const toolResult = await executeTool(
-          tc.function.name,
-          JSON.parse(tc.function.arguments)
-        );
-        toolMessages.push({
-          role: 'tool',
-          tool_call_id: tc.id,
+      const toolResults = [];
+      for (const toolUse of toolUseBlocks) {
+        const toolResult = await executeTool(toolUse.name, toolUse.input);
+        toolResults.push({
+          type: 'tool_result',
+          tool_use_id: toolUse.id,
           content: toolResult
         });
       }
-      // 把工具结果喂回 LM
-      augmentedMessages.push(msg);
-      augmentedMessages.push(...toolMessages);
-      
+
+      // 把工具结果喂回
+      nonSystemMessages.push({ role: 'assistant', content: result.content });
+      nonSystemMessages.push({ role: 'user', content: toolResults });
+
       const followUp = await axios.post(apiUrl, {
         model: requestModel,
-        messages: augmentedMessages,
-      tools: [...(req.body.tools || []), ...TOOLS],
-        stream: false
+        system: systemMessage ? systemMessage.content : '',
+        messages: nonSystemMessages,
+        tools: [...(req.body.tools || []), ...TOOLS],
+        max_tokens: 4096
       }, {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01'
         },
         timeout: 120000
       });
+
       result = followUp.data;
       maxLoops--;
     }
+
+    // 转换成 OpenAI 格式返回给 Kelivo
+    const openaiResult = {
+      id: result.id,
+      object: 'chat.completion',
+      created: Math.floor(Date.now() / 1000),
+      model: requestModel,
+      choices: [{
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: result.content.filter(c => c.type === 'text').map(c => c.text).join('')
+        },
+        finish_reason: result.stop_reason === 'end_turn' ? 'stop' : result.stop_reason
+      }]
+    };
+    
     // 异步保存对话到 L0（生成稳定的 conv_id）
     const client = req.headers['x-client-name'] || 'unknown';
     let conv_id = req.body.conversation_id;
@@ -391,8 +427,28 @@ ${memoryMenu}
       messages: originalMessages
     }).catch(err => console.error('保存对话失败:', err.message));    
      
-    // 返回最终结果
-    res.json(result);
+    // 根据请求来源决定返回格式
+    if (req.body._anthropicFormat) {
+      // Anthropic 格式进来的，直接返回原始响应
+      res.json(result);
+    } else {
+      // OpenAI 格式进来的，转换后返回
+      const openaiResult = {
+        id: result.id || 'chatcmpl-' + Date.now(),
+        object: 'chat.completion',
+        created: Math.floor(Date.now() / 1000),
+        model: requestModel,
+        choices: [{
+          index: 0,
+          message: {
+            role: 'assistant',
+            content: result.content ? result.content.filter(c => c.type === 'text').map(c => c.text).join('') : (result.choices && result.choices[0] ? result.choices[0].message.content : '')
+          },
+          finish_reason: 'stop'
+        }]
+      };
+      res.json(openaiResult);
+    }
     
   } catch (error) {
     console.error('网关错误:', error.response?.data || error.message);
