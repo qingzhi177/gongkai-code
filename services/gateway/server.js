@@ -264,6 +264,25 @@ async function executeTool(name, args) {
   return '未知工具。';
 }
 
+// ============ 功能3(B-1)：工具回环检测 ============
+// Kelivo 看到 tool_use 卡片后会自己执行该工具，并把 { role:'user', content:[tool_result...] }
+// 回传给网关发起新一轮请求。判定特征：最后一条 user 消息的 content 是数组、且其中含
+// tool_result 块、且没有任何真实文本输入。正常用户消息不可能满足（要么是字符串，要么含 text 块）。
+function isToolLoopback(messages) {
+  if (!Array.isArray(messages) || messages.length === 0) return false;
+  const lastUser = [...messages].reverse().find(m => m.role === 'user');
+  if (!lastUser || !Array.isArray(lastUser.content)) return false;
+  let hasToolResult = false;
+  let hasRealInput = false;
+  for (const block of lastUser.content) {
+    if (!block || typeof block !== 'object') { hasRealInput = true; continue; }
+    if (block.type === 'tool_result') { hasToolResult = true; continue; }
+    // 任何非 tool_result 块（text/image 等）都算真实输入
+    hasRealInput = true;
+  }
+  return hasToolResult && !hasRealInput;
+}
+
 // ============ 流式输出辅助（功能1：SSE） ============
 
 // 发送 Anthropic 风格 SSE 事件
@@ -353,6 +372,29 @@ function makeEmitter(res, isAnthropic, requestModel) {
       sseSend(res, 'content_block_delta', {
         type: 'content_block_delta', index: feIndex, delta: { type: 'signature_delta', signature: sig }
       });
+    },
+    // 功能3：透传一个只读的工具调用展示卡片（网关仍在内部执行，这里只做前端可视）。
+    // 发一个完整的 tool_use content block；stop_reason 始终保持 end_turn，杜绝 Kelivo 回环。
+    toolUseCard(id, name, input) {
+      if (!isAnthropic) return;   // 最小验证只针对 Anthropic 格式（Kelivo 实际走这条）
+      // 先关掉当前打开的 text/thinking 块
+      if (openType !== null) {
+        sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
+        openType = null;
+      }
+      feIndex++;
+      const toolIndex = feIndex;
+      sseSend(res, 'content_block_start', {
+        type: 'content_block_start', index: toolIndex,
+        content_block: { type: 'tool_use', id, name, input: {} }
+      });
+      // 参数作为一段 input_json_delta 发出
+      sseSend(res, 'content_block_delta', {
+        type: 'content_block_delta', index: toolIndex,
+        delta: { type: 'input_json_delta', partial_json: JSON.stringify(input || {}) }
+      });
+      sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: toolIndex });
+      // 卡片块已关闭；openType 保持 null，后续正文/思考会开新块
     },
     // 收尾
     finish(stopReason) {
@@ -519,6 +561,51 @@ app.post('/v1/messages', (req, res) => {
 app.post('/v1/chat/completions', async (req, res) => {
   try {
     const { model, messages, stream } = req.body;
+
+    // ============ 功能3(B-1)：拦截 Kelivo 的工具回环请求 ============
+    // Kelivo 看到 tool_use 卡片后，会自动执行该工具并回传一个"工具结果"请求
+    // （最后一条 user 消息的 content 全是 tool_result 块）。但工具已在上一轮由网关
+    // 内部执行并回答过，这里直接短路返回空 end_turn，避免重复调用、重复回答、污染记忆。
+    if (isToolLoopback(messages)) {
+      console.log('[LOOPBACK] 检测到工具回环请求，短路返回空 end_turn（不处理、不存记忆）');
+      const loopModel = req.body.model || process.env.DEFAULT_MODEL || 'claude';
+      if (stream) {
+        res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders && res.flushHeaders();
+        const msgId = 'msg_' + Date.now();
+        sseSend(res, 'message_start', {
+          type: 'message_start',
+          message: {
+            id: msgId, type: 'message', role: 'assistant', model: loopModel,
+            content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 }
+          }
+        });
+        sseSend(res, 'message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 0 }
+        });
+        sseSend(res, 'message_stop', { type: 'message_stop' });
+        res.end();
+      } else if (req.body._anthropicFormat) {
+        res.json({
+          id: 'msg_' + Date.now(), type: 'message', role: 'assistant', model: loopModel,
+          content: [], stop_reason: 'end_turn', stop_sequence: null,
+          usage: { input_tokens: 0, output_tokens: 0 }
+        });
+      } else {
+        res.json({
+          id: 'chatcmpl-' + Date.now(), object: 'chat.completion',
+          created: Math.floor(Date.now() / 1000), model: loopModel,
+          choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }]
+        });
+      }
+      return;
+    }
+
     // 获取用户最新消息
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
     const userContent = lastUserMsg ? lastUserMsg.content : '';
@@ -606,9 +693,10 @@ ${memoryMenu}
           const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
           if (toolUseBlocks.length === 0) break;
 
-          // 本地静默执行工具（功能1不向前端展示，留给功能3）
+          // 功能3（路线B最小验证）：执行前先向前端 emit 只读展示卡片；工具仍在网关内部执行。
           const toolResults = [];
           for (const toolUse of toolUseBlocks) {
+            emitter.toolUseCard(toolUse.id, toolUse.name, toolUse.input);
             const toolResult = await executeTool(toolUse.name, toolUse.input);
             toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
           }
