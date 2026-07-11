@@ -378,7 +378,7 @@ function makeEmitter(res, isAnthropic, requestModel) {
 
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
-async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter, thinking, maxTokens }) {
+async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter, thinking, outputConfig, maxTokens }) {
   // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
   // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
   const body = {
@@ -391,10 +391,13 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
   };
   if (thinking) {
     body.thinking = thinking;
+    // adaptive 格式没有 budget_tokens；前端调的预算被 Kelivo 换算成 output_config.effort。
     const budget = thinking.budget_tokens || 1024;
     // 安全兜底：max_tokens 必须大于 budget，否则上游报错。留 4096 给正文。
     if (body.max_tokens <= budget) body.max_tokens = budget + 4096;
   }
+  // 功能2补丁：透传 output_config（effort），让前端的思考预算调节真正生效。
+  if (outputConfig) body.output_config = outputConfig;
   // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
   let upstream = null;
   let lastErr = null;
@@ -573,7 +576,8 @@ ${memoryMenu}
     // ============ 功能1：流式分支（stream:true 时走这里，非流式逻辑完全不变） ============
     if (stream) {
       const isAnthropic = !!req.body._anthropicFormat;
-      console.log('[THINKING] 前端是否请求思维链:', req.body.thinking ? JSON.stringify(req.body.thinking) : '否');
+      console.log('[THINKING] 前端是否请求思维链:', req.body.thinking ? JSON.stringify(req.body.thinking) : '否',
+        '| output_config:', req.body.output_config ? JSON.stringify(req.body.output_config) : '无');
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -593,8 +597,9 @@ ${memoryMenu}
           result = await streamRound({
             apiUrl, apiKey, requestModel, systemContent,
             messages: nonSystemMessages, tools: allTools, emitter,
-            thinking: req.body.thinking,     // 功能2：仅透传前端请求的 thinking
-            maxTokens: req.body.max_tokens   // 优先用前端的 max_tokens
+            thinking: req.body.thinking,          // 功能2：仅透传前端请求的 thinking
+            outputConfig: req.body.output_config, // 功能2补丁：透传 effort，让预算调节生效
+            maxTokens: req.body.max_tokens        // 优先用前端的 max_tokens
           });
 
           if (result.stop_reason !== 'tool_use') break;
@@ -651,6 +656,8 @@ ${memoryMenu}
         // 安全兜底：max_tokens 必须大于 budget，否则上游报错。留 4096 给正文。
         if (b.max_tokens <= budget) b.max_tokens = budget + 4096;
       }
+      // 透传 output_config：opus-4.6 等 adaptive 模型的预算是靠 effort 字段传的，丢了预算调节就不生效
+      if (req.body.output_config) b.output_config = req.body.output_config;
       return b;
     };
 
