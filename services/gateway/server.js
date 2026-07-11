@@ -281,7 +281,8 @@ function sseSendRaw(res, obj) {
 // 内部可能跑多轮上游请求（工具循环），但前端只看到一条消息、一个文本块。
 function makeEmitter(res, isAnthropic, requestModel) {
   const msgId = 'msg_' + Date.now();
-  let textStarted = false;
+  let feIndex = -1;      // 前端侧递增块索引（跨工具轮次连续）
+  let openType = null;   // 当前打开的块类型：'text' | 'thinking' | null
   return {
     start() {
       if (isAnthropic) {
@@ -300,18 +301,28 @@ function makeEmitter(res, isAnthropic, requestModel) {
         });
       }
     },
+    // 内部：确保打开正确类型的块（类型切换时先关旧块再开新块）
+    _open(type) {
+      if (openType === type) return;
+      if (openType !== null) {
+        sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
+      }
+      feIndex++;
+      openType = type;
+      const content_block = type === 'thinking'
+        ? { type: 'thinking', thinking: '' }
+        : { type: 'text', text: '' };
+      sseSend(res, 'content_block_start', {
+        type: 'content_block_start', index: feIndex, content_block
+      });
+    },
     // 转发一段正文文本
     textDelta(text) {
       if (!text) return;
       if (isAnthropic) {
-        if (!textStarted) {
-          sseSend(res, 'content_block_start', {
-            type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' }
-          });
-          textStarted = true;
-        }
+        this._open('text');
         sseSend(res, 'content_block_delta', {
-          type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text }
+          type: 'content_block_delta', index: feIndex, delta: { type: 'text_delta', text }
         });
       } else {
         sseSendRaw(res, {
@@ -320,10 +331,33 @@ function makeEmitter(res, isAnthropic, requestModel) {
         });
       }
     },
+    // 转发一段思维链（功能2）
+    thinkingDelta(text) {
+      if (!text) return;
+      if (isAnthropic) {
+        this._open('thinking');
+        sseSend(res, 'content_block_delta', {
+          type: 'content_block_delta', index: feIndex, delta: { type: 'thinking_delta', thinking: text }
+        });
+      } else {
+        // OpenAI 兼容：思维链走 reasoning_content（推理模型通用约定）
+        sseSendRaw(res, {
+          id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model: requestModel, choices: [{ index: 0, delta: { reasoning_content: text }, finish_reason: null }]
+        });
+      }
+    },
+    // thinking 块结束时透传 signature（Anthropic 要求，用于回喂校验）
+    thinkingSignature(sig) {
+      if (!sig || !isAnthropic || openType !== 'thinking') return;
+      sseSend(res, 'content_block_delta', {
+        type: 'content_block_delta', index: feIndex, delta: { type: 'signature_delta', signature: sig }
+      });
+    },
     // 收尾
     finish(stopReason) {
       if (isAnthropic) {
-        if (textStarted) sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        if (openType !== null) sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
         sseSend(res, 'message_delta', {
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn', stop_sequence: null },
@@ -344,23 +378,45 @@ function makeEmitter(res, isAnthropic, requestModel) {
 
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
-async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter }) {
-  const upstream = await axios.post(apiUrl, {
+async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter, thinking, maxTokens }) {
+  // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
+  // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
+  const body = {
     model: requestModel,
     system: systemContent,
     messages,
     tools,
-    max_tokens: 4096,
+    max_tokens: maxTokens || 4096,
     stream: true
-  }, {
-    headers: {
-      'Authorization': `Bearer ${apiKey}`,
-      'Content-Type': 'application/json',
-      'anthropic-version': '2023-06-01'
-    },
-    timeout: 120000,
-    responseType: 'stream'
-  });
+  };
+  if (thinking) {
+    body.thinking = thinking;
+    const budget = thinking.budget_tokens || 1024;
+    // 安全兜底：max_tokens 必须大于 budget，否则上游报错。留 4096 给正文。
+    if (body.max_tokens <= budget) body.max_tokens = budget + 4096;
+  }
+  // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
+  let upstream = null;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      upstream = await axios.post(apiUrl, body, {
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+          'anthropic-version': '2023-06-01'
+        },
+        timeout: 120000,
+        responseType: 'stream'
+      });
+      break;
+    } catch (e) {
+      lastErr = e;
+      console.error(`[STREAM] 建连失败(第${attempt}次):`, e.response?.status || e.message);
+      if (attempt < 3) await new Promise(r => setTimeout(r, 500 * attempt));
+    }
+  }
+  if (!upstream) throw lastErr;
 
   return await new Promise((resolve, reject) => {
     const blocks = {};       // 上游 index -> block
@@ -376,7 +432,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
         case 'content_block_start': {
           const cb = evt.content_block || {};
           blocks[evt.index] = {
-            type: cb.type, text: cb.text || '', name: cb.name, id: cb.id, _partialJson: ''
+            type: cb.type, text: cb.text || '', name: cb.name, id: cb.id,
+            thinking: cb.thinking || '', signature: cb.signature || '', _partialJson: ''
           };
           break;
         }
@@ -388,8 +445,13 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
             emitter.textDelta(evt.delta.text);          // 功能1：转发正文
           } else if (evt.delta.type === 'input_json_delta') {
             b._partialJson += evt.delta.partial_json || '';   // 累积工具入参
+          } else if (evt.delta.type === 'thinking_delta') {
+            b.thinking += evt.delta.thinking || '';
+            emitter.thinkingDelta(evt.delta.thinking || '');  // 功能2：转发思维链
+          } else if (evt.delta.type === 'signature_delta') {
+            b.signature += evt.delta.signature || '';         // 累积签名，工具循环回喂必需
+            emitter.thinkingSignature(evt.delta.signature || '');
           }
-          // thinking_delta 暂不处理（留给功能2）
           break;
         }
         case 'message_delta':
@@ -418,6 +480,12 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
     upstream.data.on('end', () => {
       const content = Object.keys(blocks).sort((a, b) => a - b).map(k => {
         const b = blocks[k];
+        if (b.type === 'thinking') {
+          // 保留 thinking 块及 signature：extended thinking + 工具循环回喂上游时必需
+          const tb = { type: 'thinking', thinking: b.thinking };
+          if (b.signature) tb.signature = b.signature;
+          return tb;
+        }
         if (b.type === 'text') return { type: 'text', text: b.text };
         if (b.type === 'tool_use') {
           let input = {};
@@ -505,6 +573,7 @@ ${memoryMenu}
     // ============ 功能1：流式分支（stream:true 时走这里，非流式逻辑完全不变） ============
     if (stream) {
       const isAnthropic = !!req.body._anthropicFormat;
+      console.log('[THINKING] 前端是否请求思维链:', req.body.thinking ? JSON.stringify(req.body.thinking) : '否');
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache');
       res.setHeader('Connection', 'keep-alive');
@@ -517,29 +586,40 @@ ${memoryMenu}
       let result = null;
       let maxLoops = 5;
 
-      // 工具循环：内部可跑多轮，但前端只看到一条消息
-      while (maxLoops > 0) {
-        result = await streamRound({
-          apiUrl, apiKey, requestModel, systemContent,
-          messages: nonSystemMessages, tools: allTools, emitter
-        });
+      // 流式分支独立兜底：头已发出，出错也不能冒泡到外层 catch（会撞 headers-sent 变成空回）
+      try {
+        // 工具循环：内部可跑多轮，但前端只看到一条消息
+        while (maxLoops > 0) {
+          result = await streamRound({
+            apiUrl, apiKey, requestModel, systemContent,
+            messages: nonSystemMessages, tools: allTools, emitter,
+            thinking: req.body.thinking,     // 功能2：仅透传前端请求的 thinking
+            maxTokens: req.body.max_tokens   // 优先用前端的 max_tokens
+          });
 
-        if (result.stop_reason !== 'tool_use') break;
-        const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
-        if (toolUseBlocks.length === 0) break;
+          if (result.stop_reason !== 'tool_use') break;
+          const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
+          if (toolUseBlocks.length === 0) break;
 
-        // 本地静默执行工具（功能1不向前端展示，留给功能3）
-        const toolResults = [];
-        for (const toolUse of toolUseBlocks) {
-          const toolResult = await executeTool(toolUse.name, toolUse.input);
-          toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
+          // 本地静默执行工具（功能1不向前端展示，留给功能3）
+          const toolResults = [];
+          for (const toolUse of toolUseBlocks) {
+            const toolResult = await executeTool(toolUse.name, toolUse.input);
+            toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
+          }
+          nonSystemMessages.push({ role: 'assistant', content: result.content });
+          nonSystemMessages.push({ role: 'user', content: toolResults });
+          maxLoops--;
         }
-        nonSystemMessages.push({ role: 'assistant', content: result.content });
-        nonSystemMessages.push({ role: 'user', content: toolResults });
-        maxLoops--;
+        emitter.finish(result ? result.stop_reason : 'end_turn');
+      } catch (streamErr) {
+        console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);
+        // 已经发过头，只能在流内把错误信息作为正文吐出去并正常收尾，避免前端空回
+        try {
+          emitter.textDelta(`\n[网关错误] ${streamErr.response?.data?.error?.message || streamErr.message}`);
+        } catch (_) {}
+        emitter.finish('end_turn');
       }
-
-      emitter.finish(result ? result.stop_reason : 'end_turn');
 
       // 异步保存对话到 L0（与非流式一致）
       const client = req.headers['x-client-name'] || 'unknown';
@@ -556,13 +636,25 @@ ${memoryMenu}
       return;
     }
 
-    const apiResponse = await axios.post(apiUrl, {
-      model: requestModel,
-      system: systemMessage ? systemMessage.content : '',
-      messages: nonSystemMessages,
-      tools: [...(req.body.tools || []), ...TOOLS],
-      max_tokens: 4096
-    }, {
+    // 功能2：非流式也仅透传前端请求的 thinking，构造请求体的小 helper
+    const buildBody = () => {
+      const b = {
+        model: requestModel,
+        system: systemMessage ? systemMessage.content : '',
+        messages: nonSystemMessages,
+        tools: [...(req.body.tools || []), ...TOOLS],
+        max_tokens: req.body.max_tokens || 4096
+      };
+      if (req.body.thinking) {
+        b.thinking = req.body.thinking;
+        const budget = req.body.thinking.budget_tokens || 1024;
+        // 安全兜底：max_tokens 必须大于 budget，否则上游报错。留 4096 给正文。
+        if (b.max_tokens <= budget) b.max_tokens = budget + 4096;
+      }
+      return b;
+    };
+
+    const apiResponse = await axios.post(apiUrl, buildBody(), {
       headers: {
         'Authorization': `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
@@ -596,13 +688,7 @@ ${memoryMenu}
       nonSystemMessages.push({ role: 'assistant', content: result.content });
       nonSystemMessages.push({ role: 'user', content: toolResults });
 
-      const followUp = await axios.post(apiUrl, {
-        model: requestModel,
-        system: systemMessage ? systemMessage.content : '',
-        messages: nonSystemMessages,
-        tools: [...(req.body.tools || []), ...TOOLS],
-        max_tokens: 4096
-      }, {
+      const followUp = await axios.post(apiUrl, buildBody(), {
         headers: {
           'Authorization': `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
@@ -676,6 +762,11 @@ ${memoryMenu}
     
   } catch (error) {
     console.error('网关错误:', error.response?.data || error.message);
+    // 防护：流式已发过头时不能再写 json 响应，否则触发 ERR_HTTP_HEADERS_SENT
+    if (res.headersSent) {
+      try { res.end(); } catch (_) {}
+      return;
+    }
     res.status(500).json({
       error: {
         message: error.response?.data?.error?.message || error.message,
