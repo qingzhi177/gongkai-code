@@ -221,8 +221,8 @@ async function executeTool(name, args) {
     }
   }
   
-  // Kelivo 常用工具兼容
-  if (name === 'get_current_time' || name === 'get_time') {
+  // Kelivo 常用工具兼容（前端实际传的时间工具名是 get_time_info）
+  if (name === 'get_current_time' || name === 'get_time' || name === 'get_time_info') {
     const now = new Date();
     now.setHours(now.getHours() + 8);
     return '当前时间：' + now.toISOString().substring(0, 19).replace('T', ' ') + '（北京时间）';
@@ -262,6 +262,175 @@ async function executeTool(name, args) {
   }
 
   return '未知工具。';
+}
+
+// ============ 流式输出辅助（功能1：SSE） ============
+
+// 发送 Anthropic 风格 SSE 事件
+function sseSend(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
+}
+
+// 发送 OpenAI 风格 SSE 数据块
+function sseSendRaw(res, obj) {
+  res.write(`data: ${JSON.stringify(obj)}\n\n`);
+}
+
+// 对前端维持“单条逻辑消息”的发射器。
+// 内部可能跑多轮上游请求（工具循环），但前端只看到一条消息、一个文本块。
+function makeEmitter(res, isAnthropic, requestModel) {
+  const msgId = 'msg_' + Date.now();
+  let textStarted = false;
+  return {
+    start() {
+      if (isAnthropic) {
+        sseSend(res, 'message_start', {
+          type: 'message_start',
+          message: {
+            id: msgId, type: 'message', role: 'assistant', model: requestModel,
+            content: [], stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 }
+          }
+        });
+      } else {
+        sseSendRaw(res, {
+          id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model: requestModel, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+        });
+      }
+    },
+    // 转发一段正文文本
+    textDelta(text) {
+      if (!text) return;
+      if (isAnthropic) {
+        if (!textStarted) {
+          sseSend(res, 'content_block_start', {
+            type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' }
+          });
+          textStarted = true;
+        }
+        sseSend(res, 'content_block_delta', {
+          type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text }
+        });
+      } else {
+        sseSendRaw(res, {
+          id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model: requestModel, choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+        });
+      }
+    },
+    // 收尾
+    finish(stopReason) {
+      if (isAnthropic) {
+        if (textStarted) sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+        sseSend(res, 'message_delta', {
+          type: 'message_delta',
+          delta: { stop_reason: stopReason || 'end_turn', stop_sequence: null },
+          usage: { output_tokens: 0 }
+        });
+        sseSend(res, 'message_stop', { type: 'message_stop' });
+      } else {
+        sseSendRaw(res, {
+          id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
+          model: requestModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+        });
+        res.write('data: [DONE]\n\n');
+      }
+      res.end();
+    }
+  };
+}
+
+// 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
+// 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
+async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter }) {
+  const upstream = await axios.post(apiUrl, {
+    model: requestModel,
+    system: systemContent,
+    messages,
+    tools,
+    max_tokens: 4096,
+    stream: true
+  }, {
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      'anthropic-version': '2023-06-01'
+    },
+    timeout: 120000,
+    responseType: 'stream'
+  });
+
+  return await new Promise((resolve, reject) => {
+    const blocks = {};       // 上游 index -> block
+    let stopReason = null;
+    let msgId = null;
+    let buffer = '';
+
+    function handleEvent(evt) {
+      switch (evt.type) {
+        case 'message_start':
+          msgId = (evt.message && evt.message.id) || msgId;
+          break;
+        case 'content_block_start': {
+          const cb = evt.content_block || {};
+          blocks[evt.index] = {
+            type: cb.type, text: cb.text || '', name: cb.name, id: cb.id, _partialJson: ''
+          };
+          break;
+        }
+        case 'content_block_delta': {
+          const b = blocks[evt.index];
+          if (!b) break;
+          if (evt.delta.type === 'text_delta') {
+            b.text += evt.delta.text;
+            emitter.textDelta(evt.delta.text);          // 功能1：转发正文
+          } else if (evt.delta.type === 'input_json_delta') {
+            b._partialJson += evt.delta.partial_json || '';   // 累积工具入参
+          }
+          // thinking_delta 暂不处理（留给功能2）
+          break;
+        }
+        case 'message_delta':
+          if (evt.delta && evt.delta.stop_reason) stopReason = evt.delta.stop_reason;
+          break;
+      }
+    }
+
+    upstream.data.on('data', chunk => {
+      buffer += chunk.toString('utf8');
+      let idx;
+      while ((idx = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, idx);
+        buffer = buffer.slice(idx + 2);
+        let dataStr = '';
+        for (const line of raw.split('\n')) {
+          if (line.startsWith('data:')) dataStr += line.slice(5).trim();
+        }
+        if (!dataStr || dataStr === '[DONE]') continue;
+        let evt;
+        try { evt = JSON.parse(dataStr); } catch (e) { continue; }
+        try { handleEvent(evt); } catch (e) { /* 单事件解析失败不影响整体 */ }
+      }
+    });
+
+    upstream.data.on('end', () => {
+      const content = Object.keys(blocks).sort((a, b) => a - b).map(k => {
+        const b = blocks[k];
+        if (b.type === 'text') return { type: 'text', text: b.text };
+        if (b.type === 'tool_use') {
+          let input = {};
+          try { input = b._partialJson ? JSON.parse(b._partialJson) : {}; } catch (e) { }
+          return { type: 'tool_use', id: b.id, name: b.name, input };
+        }
+        return null;
+      }).filter(Boolean);
+      resolve({ id: msgId, content, stop_reason: stopReason });
+    });
+
+    upstream.data.on('error', reject);
+  });
 }
 
 // Anthropic 格式端点
@@ -331,6 +500,61 @@ ${memoryMenu}
     // 发送请求（Anthropic 原生格式）
     const systemMessage = augmentedMessages.find(m => m.role === 'system');
     const nonSystemMessages = augmentedMessages.filter(m => m.role !== 'system');
+    const allTools = [...(req.body.tools || []), ...TOOLS];
+
+    // ============ 功能1：流式分支（stream:true 时走这里，非流式逻辑完全不变） ============
+    if (stream) {
+      const isAnthropic = !!req.body._anthropicFormat;
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders && res.flushHeaders();
+
+      const emitter = makeEmitter(res, isAnthropic, requestModel);
+      emitter.start();
+
+      const systemContent = systemMessage ? systemMessage.content : '';
+      let result = null;
+      let maxLoops = 5;
+
+      // 工具循环：内部可跑多轮，但前端只看到一条消息
+      while (maxLoops > 0) {
+        result = await streamRound({
+          apiUrl, apiKey, requestModel, systemContent,
+          messages: nonSystemMessages, tools: allTools, emitter
+        });
+
+        if (result.stop_reason !== 'tool_use') break;
+        const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
+        if (toolUseBlocks.length === 0) break;
+
+        // 本地静默执行工具（功能1不向前端展示，留给功能3）
+        const toolResults = [];
+        for (const toolUse of toolUseBlocks) {
+          const toolResult = await executeTool(toolUse.name, toolUse.input);
+          toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
+        }
+        nonSystemMessages.push({ role: 'assistant', content: result.content });
+        nonSystemMessages.push({ role: 'user', content: toolResults });
+        maxLoops--;
+      }
+
+      emitter.finish(result ? result.stop_reason : 'end_turn');
+
+      // 异步保存对话到 L0（与非流式一致）
+      const client = req.headers['x-client-name'] || 'unknown';
+      let conv_id = req.body.conversation_id;
+      if (!conv_id) {
+        const firstUserMsg = req.body.messages.find(m => m.role === 'user');
+        const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
+        conv_id = client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
+      }
+      const originalMessages = req.body.messages.filter(m => m.role !== 'system');
+      axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
+        conv_id, client, messages: originalMessages
+      }).catch(err => console.error('保存对话失败:', err.message));
+      return;
+    }
 
     const apiResponse = await axios.post(apiUrl, {
       model: requestModel,
