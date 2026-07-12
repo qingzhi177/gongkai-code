@@ -396,20 +396,27 @@ function makeEmitter(res, isAnthropic, requestModel) {
       sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: toolIndex });
       // 卡片块已关闭；openType 保持 null，后续正文/思考会开新块
     },
-    // 收尾
-    finish(stopReason) {
+    // 收尾。功能4：usage 为跨轮累加后的真实 token 用量，写进最后的 message_delta / chunk。
+    finish(stopReason, usage) {
+      const u = usage || { input_tokens: 0, output_tokens: 0 };
       if (isAnthropic) {
         if (openType !== null) sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
         sseSend(res, 'message_delta', {
           type: 'message_delta',
           delta: { stop_reason: stopReason || 'end_turn', stop_sequence: null },
-          usage: { output_tokens: 0 }
+          usage: u
         });
         sseSend(res, 'message_stop', { type: 'message_stop' });
       } else {
+        // OpenAI 兼容：usage 放最后一个 chunk 顶层（含 stream_options 时的通用约定）
         sseSendRaw(res, {
           id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-          model: requestModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+          model: requestModel, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: u.input_tokens || 0,
+            completion_tokens: u.output_tokens || 0,
+            total_tokens: (u.input_tokens || 0) + (u.output_tokens || 0)
+          }
         });
         res.write('data: [DONE]\n\n');
       }
@@ -468,11 +475,20 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
     let stopReason = null;
     let msgId = null;
     let buffer = '';
+    // 功能4：捕获上游 usage。input/cache 在 message_start，output 在 message_delta。
+    let usage = { input_tokens: 0, output_tokens: 0 };
 
     function handleEvent(evt) {
       switch (evt.type) {
         case 'message_start':
           msgId = (evt.message && evt.message.id) || msgId;
+          if (evt.message && evt.message.usage) {
+            const u = evt.message.usage;
+            usage.input_tokens = u.input_tokens || 0;
+            if (u.cache_creation_input_tokens != null) usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
+            if (u.cache_read_input_tokens != null) usage.cache_read_input_tokens = u.cache_read_input_tokens;
+            if (u.output_tokens != null) usage.output_tokens = u.output_tokens;
+          }
           break;
         case 'content_block_start': {
           const cb = evt.content_block || {};
@@ -501,6 +517,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
         }
         case 'message_delta':
           if (evt.delta && evt.delta.stop_reason) stopReason = evt.delta.stop_reason;
+          // 功能4：output_tokens 在 message_delta.usage（累积值）
+          if (evt.usage && evt.usage.output_tokens != null) usage.output_tokens = evt.usage.output_tokens;
           break;
       }
     }
@@ -539,7 +557,7 @@ async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messag
         }
         return null;
       }).filter(Boolean);
-      resolve({ id: msgId, content, stop_reason: stopReason });
+      resolve({ id: msgId, content, stop_reason: stopReason, usage });
     });
 
     upstream.data.on('error', reject);
@@ -676,6 +694,8 @@ ${memoryMenu}
       const systemContent = systemMessage ? systemMessage.content : '';
       let result = null;
       let maxLoops = 5;
+      // 功能4：跨轮累加 usage（多轮工具调用的 token 全算上）
+      const totalUsage = { input_tokens: 0, output_tokens: 0 };
 
       // 流式分支独立兜底：头已发出，出错也不能冒泡到外层 catch（会撞 headers-sent 变成空回）
       try {
@@ -688,6 +708,16 @@ ${memoryMenu}
             outputConfig: req.body.output_config, // 功能2补丁：透传 effort，让预算调节生效
             maxTokens: req.body.max_tokens        // 优先用前端的 max_tokens
           });
+
+          // 功能4：累加本轮 usage（input/output 相加，cache 字段取本轮）
+          if (result.usage) {
+            totalUsage.input_tokens += result.usage.input_tokens || 0;
+            totalUsage.output_tokens += result.usage.output_tokens || 0;
+            if (result.usage.cache_creation_input_tokens != null)
+              totalUsage.cache_creation_input_tokens = (totalUsage.cache_creation_input_tokens || 0) + result.usage.cache_creation_input_tokens;
+            if (result.usage.cache_read_input_tokens != null)
+              totalUsage.cache_read_input_tokens = (totalUsage.cache_read_input_tokens || 0) + result.usage.cache_read_input_tokens;
+          }
 
           if (result.stop_reason !== 'tool_use') break;
           const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
@@ -704,7 +734,7 @@ ${memoryMenu}
           nonSystemMessages.push({ role: 'user', content: toolResults });
           maxLoops--;
         }
-        emitter.finish(result ? result.stop_reason : 'end_turn');
+        emitter.finish(result ? result.stop_reason : 'end_turn', totalUsage);
       } catch (streamErr) {
         console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);
         // 已经发过头，只能在流内把错误信息作为正文吐出去并正常收尾，避免前端空回
@@ -761,6 +791,19 @@ ${memoryMenu}
     let result = apiResponse.data;
     console.log('[DEBUG] API返回:', JSON.stringify(result).substring(0, 500));
 
+    // 功能4：跨轮累加 usage（非流式多轮工具调用的 token 全算上）
+    const nsUsage = { input_tokens: 0, output_tokens: 0 };
+    const addUsage = (u) => {
+      if (!u) return;
+      nsUsage.input_tokens += u.input_tokens || 0;
+      nsUsage.output_tokens += u.output_tokens || 0;
+      if (u.cache_creation_input_tokens != null)
+        nsUsage.cache_creation_input_tokens = (nsUsage.cache_creation_input_tokens || 0) + u.cache_creation_input_tokens;
+      if (u.cache_read_input_tokens != null)
+        nsUsage.cache_read_input_tokens = (nsUsage.cache_read_input_tokens || 0) + u.cache_read_input_tokens;
+    };
+    addUsage(result.usage);
+
     // 处理工具调用循环（Anthropic 格式）
     let maxLoops = 5;
     while (maxLoops > 0) {
@@ -793,8 +836,11 @@ ${memoryMenu}
       });
 
       result = followUp.data;
+      addUsage(result.usage);
       maxLoops--;
     }
+    // 用累加后的 usage 覆盖 result.usage（Anthropic 路径直接返回 result）
+    result.usage = { ...(result.usage || {}), ...nsUsage };
 
     // 转换成 OpenAI 格式返回给 Kelivo
     const openaiResult = {
@@ -850,11 +896,17 @@ ${memoryMenu}
             content: result.content ? result.content.filter(c => c.type === 'text').map(c => c.text).join('') : (result.choices && result.choices[0] ? result.choices[0].message.content : '')
           },
           finish_reason: 'stop'
-        }]
+        }],
+        // 功能4：补上 usage（OpenAI 格式），映射自累加后的 Anthropic usage
+        usage: {
+          prompt_tokens: nsUsage.input_tokens || 0,
+          completion_tokens: nsUsage.output_tokens || 0,
+          total_tokens: (nsUsage.input_tokens || 0) + (nsUsage.output_tokens || 0)
+        }
       };
       res.json(openaiResult);
     }
-    
+
   } catch (error) {
     console.error('网关错误:', error.response?.data || error.message);
     // 防护：流式已发过头时不能再写 json 响应，否则触发 ERR_HTTP_HEADERS_SENT
