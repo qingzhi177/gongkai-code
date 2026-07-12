@@ -427,12 +427,12 @@ function makeEmitter(res, isAnthropic, requestModel) {
 
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
-async function streamRound({ apiUrl, apiKey, requestModel, systemContent, messages, tools, emitter, thinking, outputConfig, maxTokens }) {
+async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens }) {
   // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
   // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
   const body = {
     model: requestModel,
-    system: systemContent,
+    system,   // 功能5：数组分段（稳定前缀带 cache_control）
     messages,
     tools,
     max_tokens: maxTokens || 4096,
@@ -633,12 +633,12 @@ app.post('/v1/chat/completions', async (req, res) => {
       getProfile(),
       getMemoryMenu(userContent)
     ]);
-    // 构建 system prompt
-    const systemPrompt = `你是一位有记忆的AI伙伴。以下是你的人格画像和相关记忆。
+    // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
+    // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
+    const systemPrefix = `你是一位有记忆的AI伙伴。以下是你的人格画像。
 
 [人格画像]
 ${profile}
-${memoryMenu}
 
 你可以使用以下工具：
 - recall: 需要更多细节时搜索记忆库
@@ -648,11 +648,27 @@ ${memoryMenu}
 当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。
 根据对话内容自然地回应，记忆是你的底色而非剧本。`;
 
-    // 注入 system prompt
-    const augmentedMessages = [
-      { role: 'system', content: systemPrompt },
-      ...messages.filter(m => m.role !== 'system')
+    // system 用数组分段，稳定前缀带 cache_control 缓存断点（Anthropic prompt caching）
+    const systemBlocks = [
+      { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral' } }
     ];
+
+    // 功能5：把动态的相关记忆目录注入到最新一条 user 消息前面（保持 system 前缀稳定）。
+    // content 可能是字符串或 Anthropic 块数组，两种都处理。
+    const augmentedMessages = messages.filter(m => m.role !== 'system').map(m => ({ ...m }));
+    if (memoryMenu) {
+      for (let i = augmentedMessages.length - 1; i >= 0; i--) {
+        if (augmentedMessages[i].role !== 'user') continue;
+        const m = augmentedMessages[i];
+        const menuText = `[相关记忆目录]${memoryMenu}\n\n`;
+        if (typeof m.content === 'string') {
+          m.content = menuText + m.content;
+        } else if (Array.isArray(m.content)) {
+          m.content = [{ type: 'text', text: menuText }, ...m.content];
+        }
+        break;
+      }
+    }
     // 确定转发目标
     let apiUrl, apiKey, requestModel;
     const claudeBaseUrl = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com/v1';
@@ -673,8 +689,7 @@ ${memoryMenu}
       requestModel = defaultModel;
     }
 
-    // 发送请求（Anthropic 原生格式）
-    const systemMessage = augmentedMessages.find(m => m.role === 'system');
+    // 发送请求（Anthropic 原生格式）。功能5：system 用 systemBlocks（带缓存断点）。
     const nonSystemMessages = augmentedMessages.filter(m => m.role !== 'system');
     const allTools = [...(req.body.tools || []), ...TOOLS];
 
@@ -691,7 +706,6 @@ ${memoryMenu}
       const emitter = makeEmitter(res, isAnthropic, requestModel);
       emitter.start();
 
-      const systemContent = systemMessage ? systemMessage.content : '';
       let result = null;
       let maxLoops = 5;
       // 功能4：跨轮累加 usage（多轮工具调用的 token 全算上）
@@ -702,7 +716,7 @@ ${memoryMenu}
         // 工具循环：内部可跑多轮，但前端只看到一条消息
         while (maxLoops > 0) {
           result = await streamRound({
-            apiUrl, apiKey, requestModel, systemContent,
+            apiUrl, apiKey, requestModel, system: systemBlocks,
             messages: nonSystemMessages, tools: allTools, emitter,
             thinking: req.body.thinking,          // 功能2：仅透传前端请求的 thinking
             outputConfig: req.body.output_config, // 功能2补丁：透传 effort，让预算调节生效
@@ -734,6 +748,9 @@ ${memoryMenu}
           nonSystemMessages.push({ role: 'user', content: toolResults });
           maxLoops--;
         }
+        // 功能5：缓存命中日志（cache_read>0 即命中稳定前缀缓存）
+        console.log('[CACHE] 输入', totalUsage.input_tokens, '| 写缓存', totalUsage.cache_creation_input_tokens || 0,
+          '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens);
         emitter.finish(result ? result.stop_reason : 'end_turn', totalUsage);
       } catch (streamErr) {
         console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);
@@ -741,7 +758,7 @@ ${memoryMenu}
         try {
           emitter.textDelta(`\n[网关错误] ${streamErr.response?.data?.error?.message || streamErr.message}`);
         } catch (_) {}
-        emitter.finish('end_turn');
+        emitter.finish('end_turn', totalUsage);
       }
 
       // 异步保存对话到 L0（与非流式一致）
@@ -763,7 +780,7 @@ ${memoryMenu}
     const buildBody = () => {
       const b = {
         model: requestModel,
-        system: systemMessage ? systemMessage.content : '',
+        system: systemBlocks,   // 功能5：可缓存的稳定 system 前缀（数组 + cache_control）
         messages: nonSystemMessages,
         tools: [...(req.body.tools || []), ...TOOLS],
         max_tokens: req.body.max_tokens || 4096
