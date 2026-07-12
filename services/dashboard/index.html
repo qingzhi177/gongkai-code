@@ -48,6 +48,7 @@
             <button class="tab" onclick="showPanel('l1')">L1记忆</button>
             <button class="tab" onclick="showPanel('profile')">画像</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
+            <button class="tab" onclick="showPanel('config')">配置</button>
         </div>
 
         <div id="overview" class="panel active">
@@ -110,6 +111,32 @@
             <button class="btn" onclick="doImport()">导入</button>
             <div id="import-status" style="margin-top:10px;"></div>
         </div>
+
+        <div id="config" class="panel">
+            <h3>当前使用</h3>
+            <div id="config-active" style="margin-bottom:8px;color:#666;">-</div>
+            <div style="margin-bottom:20px;">
+                <select id="config-active-provider" style="margin-right:8px;" onchange="onActiveProviderChange()"></select>
+                <select id="config-active-model" style="margin-right:8px;"></select>
+                <button class="btn" onclick="setActive()">应用并热重载</button>
+                <span id="config-active-status" style="margin-left:8px;"></span>
+            </div>
+
+            <h3>供应商列表</h3>
+            <div id="config-provider-list" style="margin-bottom:20px;"></div>
+
+            <h3 id="config-form-title">添加供应商</h3>
+            <input type="hidden" id="config-edit-id" value="">
+            <div class="section">
+                <input type="text" id="config-name" placeholder="名称（如：中转站A）" style="width:100%;margin-bottom:8px;">
+                <input type="text" id="config-baseurl" placeholder="Base URL（如：https://xxx.com/v1）" style="width:100%;margin-bottom:8px;">
+                <input type="password" id="config-apikey" placeholder="API Key（编辑时留空则不修改）" style="width:100%;margin-bottom:8px;" autocomplete="new-password">
+                <input type="text" id="config-models" placeholder="模型列表，逗号分隔（如：claude-opus-4-6,claude-sonnet-4-5）" style="width:100%;margin-bottom:8px;">
+                <button class="btn" onclick="saveProvider()">保存</button>
+                <button class="btn" onclick="resetProviderForm()" style="background:#999;">清空</button>
+                <span id="config-form-status" style="margin-left:8px;"></span>
+            </div>
+        </div>
     </div>
 
     <script>
@@ -142,6 +169,7 @@
             if (name === 'l0') loadConversations();
             if (name === 'l1') loadL1('all');
             if (name === 'profile') loadProfile();
+            if (name === 'config') loadConfig();
         }
 
         function loadStats() {
@@ -378,6 +406,159 @@
         function deleteConv(convId) {
             if (!confirm('确定删除整个对话？（所有消息都会被删除）')) return;
             fetch(API + '/l0/conversation/' + convId, { method: 'DELETE' }).then(function() { loadConversations(); document.getElementById('l0-messages').innerHTML = ''; });
+        }
+
+        // ============ 功能6：模型配置 ============
+        var configProviders = [];   // 缓存供应商列表
+        var configActive = null;    // { provider_id, model }
+
+        function loadConfig() {
+            fetch(API + '/config/providers').then(function(r) { return r.json(); }).then(function(d) {
+                configProviders = d.providers || [];
+                configActive = d.active || null;
+                renderProviderList();
+                renderActiveSelectors();
+            });
+        }
+
+        function renderProviderList() {
+            if (configProviders.length === 0) {
+                document.getElementById('config-provider-list').innerHTML = '<span style="color:#888;">暂无供应商，请在下方添加</span>';
+                return;
+            }
+            var html = '';
+            configProviders.forEach(function(p) {
+                var models = (p.models || []).join(', ') || '（无）';
+                html += '<div style="border:1px solid #ddd;border-radius:8px;padding:10px;margin-bottom:8px;">';
+                html += '<b>' + escapeHtml(p.name) + '</b>';
+                html += '<span style="color:#888;font-size:12px;margin-left:8px;">key: ' + (p.has_key ? '***（已设置）' : '未设置') + '</span>';
+                html += '<div style="color:#666;font-size:12px;margin:4px 0;">' + escapeHtml(p.base_url) + '</div>';
+                html += '<div style="color:#666;font-size:12px;">模型: ' + escapeHtml(models) + '</div>';
+                html += '<div style="margin-top:6px;">';
+                html += '<button class="btn" style="font-size:12px;padding:4px 10px;" onclick="editProvider(' + p.id + ')">编辑</button>';
+                html += '<button class="btn" style="font-size:12px;padding:4px 10px;background:#e74c3c;" onclick="deleteProvider(' + p.id + ')">删除</button>';
+                html += '</div></div>';
+            });
+            document.getElementById('config-provider-list').innerHTML = html;
+        }
+
+        function renderActiveSelectors() {
+            var provSel = document.getElementById('config-active-provider');
+            var provHtml = '<option value="">— 选择供应商 —</option>';
+            configProviders.forEach(function(p) {
+                var sel = (configActive && configActive.provider_id === p.id) ? ' selected' : '';
+                provHtml += '<option value="' + p.id + '"' + sel + '>' + escapeHtml(p.name) + '</option>';
+            });
+            provSel.innerHTML = provHtml;
+            onActiveProviderChange();
+
+            // 当前使用提示
+            if (configActive && configActive.provider_id) {
+                var cur = configProviders.filter(function(p){ return p.id === configActive.provider_id; })[0];
+                document.getElementById('config-active').textContent = cur
+                    ? ('当前：' + cur.name + ' / ' + configActive.model)
+                    : '当前选中的供应商已被删除，请重新选择';
+            } else {
+                document.getElementById('config-active').textContent = '未配置（网关回退到 .env）';
+            }
+        }
+
+        // 供应商下拉变化时，刷新该供应商的模型下拉
+        function onActiveProviderChange() {
+            var pid = parseInt(document.getElementById('config-active-provider').value, 10);
+            var modelSel = document.getElementById('config-active-model');
+            var p = configProviders.filter(function(x){ return x.id === pid; })[0];
+            if (!p) { modelSel.innerHTML = '<option value="">—</option>'; return; }
+            var html = '';
+            (p.models || []).forEach(function(m) {
+                var sel = (configActive && configActive.model === m) ? ' selected' : '';
+                html += '<option value="' + escapeHtml(m) + '"' + sel + '>' + escapeHtml(m) + '</option>';
+            });
+            modelSel.innerHTML = html || '<option value="">（该供应商无模型）</option>';
+        }
+
+        function setActive() {
+            var pid = parseInt(document.getElementById('config-active-provider').value, 10);
+            var model = document.getElementById('config-active-model').value;
+            var status = document.getElementById('config-active-status');
+            if (!pid || !model) { status.textContent = '请选择供应商和模型'; status.style.color = '#e74c3c'; return; }
+            status.textContent = '应用中...'; status.style.color = '#666';
+            fetch(API + '/config/active', {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ provider_id: pid, model: model })
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                if (d.status === 'ok') {
+                    // 记忆服务保存后会自动通知网关热重载
+                    var reloaded = d.gateway_reloaded ? '，网关已热重载' : '（网关重载未确认，可稍后重试）';
+                    status.textContent = '已应用' + reloaded; status.style.color = '#27ae60';
+                    loadConfig();
+                } else {
+                    status.textContent = '失败：' + (d.message || '未知错误'); status.style.color = '#e74c3c';
+                }
+            }).catch(function(e) { status.textContent = '请求失败：' + e.message; status.style.color = '#e74c3c'; });
+        }
+
+        function saveProvider() {
+            var id = document.getElementById('config-edit-id').value;
+            var name = document.getElementById('config-name').value.trim();
+            var baseUrl = document.getElementById('config-baseurl').value.trim();
+            var apiKey = document.getElementById('config-apikey').value;
+            var modelsRaw = document.getElementById('config-models').value.trim();
+            var status = document.getElementById('config-form-status');
+            if (!name || !baseUrl) { status.textContent = '名称和 Base URL 必填'; status.style.color = '#e74c3c'; return; }
+            var models = modelsRaw ? modelsRaw.split(',').map(function(s){ return s.trim(); }).filter(Boolean) : [];
+            var body = { name: name, base_url: baseUrl, models: models };
+            // api_key 留空时不传，后端保留原 key（编辑场景）
+            if (apiKey) body.api_key = apiKey;
+            var url = id ? (API + '/config/providers/' + id) : (API + '/config/providers');
+            var method = id ? 'PUT' : 'POST';
+            status.textContent = '保存中...'; status.style.color = '#666';
+            fetch(url, { method: method, headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'ok') {
+                        status.textContent = '已保存'; status.style.color = '#27ae60';
+                        resetProviderForm();
+                        loadConfig();
+                    } else {
+                        status.textContent = '失败：' + (d.message || '未知'); status.style.color = '#e74c3c';
+                    }
+                }).catch(function(e) { status.textContent = '请求失败：' + e.message; status.style.color = '#e74c3c'; });
+        }
+
+        function editProvider(id) {
+            var p = configProviders.filter(function(x){ return x.id === id; })[0];
+            if (!p) return;
+            document.getElementById('config-edit-id').value = p.id;
+            document.getElementById('config-name').value = p.name;
+            document.getElementById('config-baseurl').value = p.base_url;
+            document.getElementById('config-apikey').value = '';  // 不回显真实 key
+            document.getElementById('config-apikey').placeholder = p.has_key ? 'API Key（留空则不修改已存的 key）' : 'API Key';
+            document.getElementById('config-models').value = (p.models || []).join(',');
+            document.getElementById('config-form-title').textContent = '编辑供应商 #' + p.id;
+            document.getElementById('config-form-status').textContent = '';
+        }
+
+        function resetProviderForm() {
+            document.getElementById('config-edit-id').value = '';
+            document.getElementById('config-name').value = '';
+            document.getElementById('config-baseurl').value = '';
+            document.getElementById('config-apikey').value = '';
+            document.getElementById('config-apikey').placeholder = 'API Key（编辑时留空则不修改）';
+            document.getElementById('config-models').value = '';
+            document.getElementById('config-form-title').textContent = '添加供应商';
+            document.getElementById('config-form-status').textContent = '';
+        }
+
+        function deleteProvider(id) {
+            if (!confirm('确定删除这个供应商？')) return;
+            fetch(API + '/config/providers/' + id, { method: 'DELETE' })
+                .then(function(r) { return r.json(); }).then(function() { loadConfig(); });
+        }
+
+        function escapeHtml(s) {
+            return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
+                return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+            });
         }
 
         loadStats();

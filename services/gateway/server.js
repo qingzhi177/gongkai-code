@@ -11,6 +11,34 @@ app.use(express.json({ limit: '10mb' }));
 const MEMORY_SERVICE_URL = process.env.MEMORY_SERVICE_URL || 'http://localhost:8001';
 const PORT = process.env.PORT || 3000;
 
+// 功能6：动态配置缓存。启动时和 /reload-config 时从记忆服务拉取当前供应商配置。
+// 拉取失败或未配置时，转发逻辑回退到 .env（配置优先，.env 兜底）。
+let activeConfig = null;   // { name, base_url, api_key, model } 或 null
+// 返回 'active'（拉到并启用配置）| 'unconfigured'（服务正常但未配置，回退 .env）| 'error'（拉取失败，回退 .env）
+async function loadActiveConfig() {
+  try {
+    const res = await axios.get(`${MEMORY_SERVICE_URL}/config/current`, { timeout: 5000 });
+    if (res.data && res.data.configured) {
+      activeConfig = {
+        name: res.data.name,
+        base_url: res.data.base_url,
+        api_key: res.data.api_key,
+        model: res.data.model
+      };
+      console.log(`[CONFIG] 已加载配置：${activeConfig.name} / ${activeConfig.model}`);
+      return 'active';
+    } else {
+      activeConfig = null;
+      console.log('[CONFIG] 记忆服务未配置供应商，回退到 .env');
+      return 'unconfigured';
+    }
+  } catch (e) {
+    activeConfig = null;
+    console.error('[CONFIG] 拉取配置失败，回退到 .env：', e.message);
+    return 'error';
+  }
+}
+
 // 工具定义
 const TOOLS = [
   {
@@ -669,12 +697,19 @@ ${profile}
         break;
       }
     }
-    // 确定转发目标
+    // 确定转发目标。功能6：配置优先，.env 兜底。
     let apiUrl, apiKey, requestModel;
     const claudeBaseUrl = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com/v1';
     const defaultModel = process.env.DEFAULT_MODEL || 'deepseek-chat';
 
-    if (model && model.includes('deepseek')) {
+    if (activeConfig && activeConfig.base_url && activeConfig.api_key) {
+      // 用 Dashboard 配置的供应商。base_url 统一补 /messages（Anthropic 原生格式）。
+      const base = activeConfig.base_url.replace(/\/$/, '');
+      apiUrl = base.endsWith('/messages') ? base : base + '/messages';
+      apiKey = activeConfig.api_key;
+      // 前端指定了 model 就用前端的，否则用配置里选定的 model
+      requestModel = model || activeConfig.model || defaultModel;
+    } else if (model && model.includes('deepseek')) {
       apiUrl = 'https://api.deepseek.com/v1/chat/completions';
       apiKey = process.env.DEEPSEEK_API_KEY;
       requestModel = model;
@@ -945,7 +980,20 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
+// 功能6：热重载配置接口（Dashboard 保存后调用，不重启进程）
+app.post('/reload-config', async (req, res) => {
+  const state = await loadActiveConfig();
+  // active/unconfigured 都算重载成功（unconfigured 是正常状态，回退 .env）；只有 error 是拉取失败
+  res.json({
+    status: state === 'error' ? 'error' : 'ok',
+    state: state,
+    active: activeConfig ? { name: activeConfig.name, base_url: activeConfig.base_url, model: activeConfig.model } : null
+  });
+});
+
 // 启动
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`Memory Gateway running on port ${PORT}`);
+  // 启动时拉取一次配置（失败不阻塞启动，转发逻辑会回退到 .env）
+  await loadActiveConfig();
 });

@@ -10,16 +10,45 @@ from datetime import datetime
 from pathlib import Path
 import jieba
 from rank_bm25 import BM25Okapi
+from cryptography.fernet import Fernet
+import json
 
 load_dotenv()
 
 app = FastAPI(title="Memory Service")
+
+# 功能6：配置加密。CONFIG_SECRET_KEY 用于加密存储 API Key（Fernet 对称加密）。
+_config_secret = os.getenv("CONFIG_SECRET_KEY")
+_fernet = Fernet(_config_secret.encode()) if _config_secret else None
+
+def encrypt_secret(plain: str) -> str:
+    """加密明文 API Key；未配置密钥时降级为明文存储（并告警）。"""
+    if not plain:
+        return ""
+    if not _fernet:
+        print("[CONFIG] 警告：未配置 CONFIG_SECRET_KEY，API Key 将明文存储")
+        return plain
+    return _fernet.encrypt(plain.encode()).decode()
+
+def decrypt_secret(token: str) -> str:
+    """解密 API Key；解密失败（如密钥变更）时返回空串。"""
+    if not token:
+        return ""
+    if not _fernet:
+        return token
+    try:
+        return _fernet.decrypt(token.encode()).decode()
+    except Exception:
+        print("[CONFIG] 警告：API Key 解密失败（密钥可能已变更）")
+        return ""
 
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", 8000))
 ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY")
 ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DATA_DIR = Path(os.getenv("DATA_DIR", "/home/qingzhi/memory-system/data"))
+# 功能6：网关地址，用于配置变更后通知网关热重载
+GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:3000")
 SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
 SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
@@ -59,6 +88,21 @@ def init_db():
         access_count INTEGER DEFAULT 0,
         ts DATETIME DEFAULT CURRENT_TIMESTAMP,
         status TEXT DEFAULT 'active'
+    )''')
+    # 功能6：供应商配置表。api_key 加密存储；models 存 JSON 数组。
+    c.execute('''CREATE TABLE IF NOT EXISTS providers (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        base_url TEXT NOT NULL,
+        api_key_enc TEXT DEFAULT '',
+        models TEXT DEFAULT '[]',
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    # 当前选中的供应商 + 模型（单行，key 固定为 1）
+    c.execute('''CREATE TABLE IF NOT EXISTS active_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        provider_id INTEGER,
+        model TEXT
     )''')
     conn.commit()
     conn.close()
@@ -678,6 +722,140 @@ async def delete_l0_conversation(conv_id: str):
     conn.commit()
     conn.close()
     return {"status": "ok"}
+
+# ============ 功能6：供应商模型配置（CRUD + 加密） ============
+
+class ProviderData(BaseModel):
+    name: str
+    base_url: str
+    api_key: Optional[str] = None   # 明文传入；为 None 表示不修改已存的 key
+    models: List[str] = []
+
+class ActiveConfig(BaseModel):
+    provider_id: int
+    model: str
+
+def _mask_key(enc: str) -> str:
+    """给 Dashboard 显示用：有 key 就返回 ***，没有返回空。"""
+    return "***" if enc else ""
+
+@app.get("/config/providers")
+async def list_providers():
+    """列出所有供应商。api_key 脱敏为 ***，不返回明文。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute("SELECT id, name, base_url, api_key_enc, models FROM providers ORDER BY id").fetchall()
+    active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
+    conn.close()
+    providers = []
+    for r in rows:
+        providers.append({
+            "id": r[0], "name": r[1], "base_url": r[2],
+            "api_key": _mask_key(r[3]),
+            "has_key": bool(r[3]),
+            "models": json.loads(r[4] or "[]"),
+        })
+    return {
+        "providers": providers,
+        "active": {"provider_id": active[0], "model": active[1]} if active else None,
+    }
+
+@app.post("/config/providers")
+async def create_provider(req: ProviderData):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    enc = encrypt_secret(req.api_key) if req.api_key else ""
+    c.execute(
+        "INSERT INTO providers (name, base_url, api_key_enc, models) VALUES (?, ?, ?, ?)",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False)),
+    )
+    pid = c.lastrowid
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "id": pid}
+
+@app.put("/config/providers/{pid}")
+async def update_provider(pid: int, req: ProviderData):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute("SELECT api_key_enc FROM providers WHERE id = ?", (pid,)).fetchone()
+    if not row:
+        conn.close()
+        return {"status": "error", "message": "provider not found"}
+    # api_key 为 None/空 时保留原 key（前端显示 *** 时不会回传真实 key）
+    if req.api_key:
+        enc = encrypt_secret(req.api_key)
+    else:
+        enc = row[0]
+    c.execute(
+        "UPDATE providers SET name = ?, base_url = ?, api_key_enc = ?, models = ? WHERE id = ?",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), pid),
+    )
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.delete("/config/providers/{pid}")
+async def delete_provider(pid: int):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    c.execute("DELETE FROM providers WHERE id = ?", (pid,))
+    # 如果删的是当前选中的供应商，清空 active
+    active = c.execute("SELECT provider_id FROM active_config WHERE id = 1").fetchone()
+    if active and active[0] == pid:
+        c.execute("DELETE FROM active_config WHERE id = 1")
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+async def notify_gateway_reload():
+    """通知网关热重载配置（localhost 内部调用，不走 nginx）。失败不影响配置保存。"""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            await client.post(f"{GATEWAY_URL}/reload-config")
+        return True
+    except Exception as e:
+        print(f"[CONFIG] 通知网关重载失败：{e}")
+        return False
+
+@app.post("/config/active")
+async def set_active(req: ActiveConfig):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    exists = c.execute("SELECT id FROM providers WHERE id = ?", (req.provider_id,)).fetchone()
+    if not exists:
+        conn.close()
+        return {"status": "error", "message": "provider not found"}
+    c.execute(
+        "INSERT INTO active_config (id, provider_id, model) VALUES (1, ?, ?) "
+        "ON CONFLICT(id) DO UPDATE SET provider_id = excluded.provider_id, model = excluded.model",
+        (req.provider_id, req.model),
+    )
+    conn.commit()
+    conn.close()
+    reloaded = await notify_gateway_reload()
+    return {"status": "ok", "gateway_reloaded": reloaded}
+
+@app.get("/config/current")
+async def get_current_config():
+    """给网关拉取用：返回当前选中供应商的 base_url + 解密后的真实 api_key + model。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
+    if not active:
+        conn.close()
+        return {"configured": False}
+    row = c.execute("SELECT name, base_url, api_key_enc FROM providers WHERE id = ?", (active[0],)).fetchone()
+    conn.close()
+    if not row:
+        return {"configured": False}
+    return {
+        "configured": True,
+        "name": row[0],
+        "base_url": row[1],
+        "api_key": decrypt_secret(row[2]) if row[2] else "",
+        "model": active[1],
+    }
 
 @app.get("/health")
 async def health():
