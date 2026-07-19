@@ -127,8 +127,41 @@ const TOOLS = [
         required: []
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'bocha_search',
+      description: '用博查 API 联网搜索，返回可信来源的实时网页摘要。在需要可靠的中文网络信息、供应商不支持内置搜索时使用。',
+      parameters: {
+        type: 'object',
+        properties: {
+          query: { type: 'string', description: '搜索关键词' }
+        },
+        required: ['query']
+      }
+    }
   }
 ];
+
+// 功能7补丁：Anthropic 原生格式转换。
+// 我们的 TOOLS 用 OpenAI 格式 {type:"function", function:{name,description,parameters}}，
+// 新版 Anthropic API 要求原生格式 {type:"custom", name, description, input_schema}。
+// 前端工具（Kelivo 发来的）已经是原生格式，原样保留。
+function toAnthropicTool(t) {
+  if (t.function) {
+    // OpenAI 格式 → Anthropic 原生
+    const fn = t.function;
+    return {
+      type: 'custom',
+      name: fn.name,
+      description: fn.description || '',
+      input_schema: fn.parameters || { type: 'object', properties: {} }
+    };
+  }
+  // 已经是原生格式，原样返回
+  return t;
+}
 
 // 读取 L2 画像
 async function getProfile() {
@@ -254,6 +287,36 @@ async function executeTool(name, args) {
     const now = new Date();
     now.setHours(now.getHours() + 8);
     return '当前时间：' + now.toISOString().substring(0, 19).replace('T', ' ') + '（北京时间）';
+  }
+
+  // 功能7：博查 API 联网搜索（显式可控的搜索工具）
+  if (name === 'bocha_search') {
+    console.log('🔍 [BOCHA_SEARCH] 触发！query:', args.query);
+    const bochaKey = process.env.BOCHA_API_KEY;
+    if (!bochaKey) return '网络搜索未配置（缺少 BOCHA_API_KEY）。';
+    try {
+      const res = await axios.post('https://api.bochaai.com/v1/web-search', {
+        query: args.query,
+        summary: true,
+        count: 5
+      }, {
+        headers: {
+          'Authorization': `Bearer ${bochaKey}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 20000
+      });
+      const pages = res.data?.data?.webPages?.value || [];
+      if (pages.length === 0) return '未搜索到相关结果。';
+      let out = `[网络搜索结果：${args.query}]\n`;
+      pages.forEach((p, i) => {
+        const text = p.summary || p.snippet || '';
+        out += `\n${i + 1}. ${p.name || ''}\n${p.url || ''}\n${text}\n`;
+      });
+      return out;
+    } catch (e) {
+      return `网络搜索失败: ${e.response?.status || ''} ${e.message}`;
+    }
   }
 
   // 兼容 Kelivo 前端的记忆工具（重定向到我们的记忆库）
@@ -455,7 +518,7 @@ function makeEmitter(res, isAnthropic, requestModel) {
 
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
-async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens }) {
+async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens, toolChoice }) {
   // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
   // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
   const body = {
@@ -466,6 +529,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
     max_tokens: maxTokens || 4096,
     stream: true
   };
+  // 功能7补丁：透传 tool_choice，让强制工具调用生效
+  if (toolChoice) body.tool_choice = toolChoice;
   if (thinking) {
     body.thinking = thinking;
     // adaptive 格式没有 budget_tokens；前端调的预算被 Kelivo 换算成 output_config.effort。
@@ -672,6 +737,7 @@ ${profile}
 - recall: 需要更多细节时搜索记忆库
 - feel: 记录你当下的感受
 - update_profile: 更新人格画像
+- bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）
 
 当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。
 根据对话内容自然地回应，记忆是你的底色而非剧本。`;
@@ -726,7 +792,10 @@ ${profile}
 
     // 发送请求（Anthropic 原生格式）。功能5：system 用 systemBlocks（带缓存断点）。
     const nonSystemMessages = augmentedMessages.filter(m => m.role !== 'system');
-    const allTools = [...(req.body.tools || []), ...TOOLS];
+    // 功能7补丁：合并工具并统一转换为 Anthropic 原生格式（新版 API 要求）。
+    // 前端工具已是原生格式，TOOLS 是 OpenAI 格式，toAnthropicTool 做统一归一。
+    const allTools = [...(req.body.tools || []), ...TOOLS].map(toAnthropicTool);
+    console.log('[TOOLS] 合并后:', JSON.stringify(allTools.map(t => t.name)));
 
     // ============ 功能1：流式分支（stream:true 时走这里，非流式逻辑完全不变） ============
     if (stream) {
@@ -753,9 +822,10 @@ ${profile}
           result = await streamRound({
             apiUrl, apiKey, requestModel, system: systemBlocks,
             messages: nonSystemMessages, tools: allTools, emitter,
-            thinking: req.body.thinking,          // 功能2：仅透传前端请求的 thinking
-            outputConfig: req.body.output_config, // 功能2补丁：透传 effort，让预算调节生效
-            maxTokens: req.body.max_tokens        // 优先用前端的 max_tokens
+            thinking: req.body.thinking,
+            outputConfig: req.body.output_config,
+            maxTokens: req.body.max_tokens,
+            toolChoice: req.body.tool_choice   // 功能7补丁
           });
 
           // 功能4：累加本轮 usage（input/output 相加，cache 字段取本轮）
@@ -817,9 +887,11 @@ ${profile}
         model: requestModel,
         system: systemBlocks,   // 功能5：可缓存的稳定 system 前缀（数组 + cache_control）
         messages: nonSystemMessages,
-        tools: [...(req.body.tools || []), ...TOOLS],
+        tools: allTools,   // 功能7补丁：用已格式转换的 allTools（Anthropic 原生格式）
         max_tokens: req.body.max_tokens || 4096
       };
+      // 功能7补丁：透传 tool_choice（如果前端指定了），让强制工具调用生效
+      if (req.body.tool_choice) b.tool_choice = req.body.tool_choice;
       if (req.body.thinking) {
         b.thinking = req.body.thinking;
         const budget = req.body.thinking.budget_tokens || 1024;
