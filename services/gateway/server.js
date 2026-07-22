@@ -11,6 +11,27 @@ app.use(express.json({ limit: '10mb' }));
 const MEMORY_SERVICE_URL = process.env.MEMORY_SERVICE_URL || 'http://localhost:8001';
 const PORT = process.env.PORT || 3000;
 
+// bug修复：工具回环短路时不请求上游、没有真实 usage。缓存上一轮真实回答的 usage（按 conv_id），
+// 回环时取出返回，避免 Kelivo 把已显示的 token 数用 0 覆盖（工具场景显示 0 的根因）。
+const lastUsageByConv = new Map();
+const LAST_USAGE_MAX = 500;   // 简单容量上限，超了清最早的
+function rememberUsage(convId, usage) {
+  if (!convId || !usage) return;
+  if (lastUsageByConv.size >= LAST_USAGE_MAX) {
+    const firstKey = lastUsageByConv.keys().next().value;
+    lastUsageByConv.delete(firstKey);
+  }
+  lastUsageByConv.set(convId, { ...usage });
+}
+// 与下方保存对话时的 conv_id 计算保持一致，保证回环请求能命中缓存。
+function computeConvId(req) {
+  const client = req.headers['x-client-name'] || 'unknown';
+  if (req.body.conversation_id) return req.body.conversation_id;
+  const firstUserMsg = (req.body.messages || []).find(m => m.role === 'user');
+  const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
+  return client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
+}
+
 // 功能6：动态配置缓存。启动时和 /reload-config 时从记忆服务拉取当前供应商配置。
 // 拉取失败或未配置时，转发逻辑回退到 .env（配置优先，.env 兜底）。
 let activeConfig = null;   // { name, base_url, api_key, model } 或 null
@@ -393,26 +414,38 @@ function makeEmitter(res, isAnthropic, requestModel) {
   const msgId = 'msg_' + Date.now();
   let feIndex = -1;      // 前端侧递增块索引（跨工具轮次连续）
   let openType = null;   // 当前打开的块类型：'text' | 'thinking' | null
+  let started = false;   // bug修复：message_start 是否已发（Anthropic 只能发一次）
   return {
     start() {
-      if (isAnthropic) {
-        sseSend(res, 'message_start', {
-          type: 'message_start',
-          message: {
-            id: msgId, type: 'message', role: 'assistant', model: requestModel,
-            content: [], stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 }
-          }
-        });
-      } else {
+      // bug修复：Anthropic 的 message_start 延迟到拿到上游真实 input usage 再发（见 _ensureStarted）。
+      // Kelivo 只认第一个 message_start，提前发占位 0 会让输入 token 永远显示 0。
+      if (!isAnthropic) {
         sseSendRaw(res, {
           id: msgId, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
           model: requestModel, choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
         });
       }
     },
+    // bug修复：惰性发送 Anthropic message_start，只发一次。
+    // 优先带上游真实 input usage；若在拿到 usage 前就有内容要发（异常兜底），用占位 0。
+    _ensureStarted(u) {
+      if (!isAnthropic || started) return;
+      started = true;
+      const usageObj = { input_tokens: (u && u.input_tokens) || 0, output_tokens: 0 };
+      if (u && u.cache_creation_input_tokens != null) usageObj.cache_creation_input_tokens = u.cache_creation_input_tokens;
+      if (u && u.cache_read_input_tokens != null) usageObj.cache_read_input_tokens = u.cache_read_input_tokens;
+      sseSend(res, 'message_start', {
+        type: 'message_start',
+        message: {
+          id: msgId, type: 'message', role: 'assistant', model: requestModel,
+          content: [], stop_reason: null, stop_sequence: null,
+          usage: usageObj
+        }
+      });
+    },
     // 内部：确保打开正确类型的块（类型切换时先关旧块再开新块）
     _open(type) {
+      this._ensureStarted();   // bug修复：任何内容块前必须已发 message_start
       if (openType === type) return;
       if (openType !== null) {
         sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
@@ -468,6 +501,7 @@ function makeEmitter(res, isAnthropic, requestModel) {
     // 发一个完整的 tool_use content block；stop_reason 始终保持 end_turn，杜绝 Kelivo 回环。
     toolUseCard(id, name, input) {
       if (!isAnthropic) return;   // 最小验证只针对 Anthropic 格式（Kelivo 实际走这条）
+      this._ensureStarted();   // bug修复：工具卡片块前必须已发 message_start
       // 先关掉当前打开的 text/thinking 块
       if (openType !== null) {
         sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: feIndex });
@@ -486,6 +520,29 @@ function makeEmitter(res, isAnthropic, requestModel) {
       });
       sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: toolIndex });
       // 卡片块已关闭；openType 保持 null，后续正文/思考会开新块
+    },
+    // bug修复：解除工具卡片的 loading 状态。发一个 web_search_tool_result 块（Kelivo 的 Claude 解析器
+    // 唯一会转成 toolResults chunk 的流块），tool_use_id 匹配卡片 id → Kelivo 按 id 命中并把该工具块
+    // loading 置为 false。不解除的话 hasLoadingTool 恒真，token 永远显示 0。
+    toolResolve(id, resultText) {
+      if (!isAnthropic) return;
+      feIndex++;
+      const idx = feIndex;
+      sseSend(res, 'content_block_start', {
+        type: 'content_block_start', index: idx,
+        content_block: {
+          type: 'web_search_tool_result',
+          tool_use_id: id,
+          // content 用空结果数组即可满足解析（我们的工具结果本身不走这个展示，只为解除 loading）
+          content: []
+        }
+      });
+      sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
+    },
+    // bug修复：上游 message_start 拿到真实 input usage 时调用，触发惰性发送带真实 token 的 message_start。
+    // Kelivo 从 message_start.message.usage.input_tokens 读输入 token。output_tokens 走 message_delta。
+    inputUsage(u) {
+      this._ensureStarted(u);
     },
     // 收尾。功能4：usage 为跨轮累加后的真实 token 用量，写进最后的 message_delta / chunk。
     finish(stopReason, usage) {
@@ -581,6 +638,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
             if (u.cache_creation_input_tokens != null) usage.cache_creation_input_tokens = u.cache_creation_input_tokens;
             if (u.cache_read_input_tokens != null) usage.cache_read_input_tokens = u.cache_read_input_tokens;
             if (u.output_tokens != null) usage.output_tokens = u.output_tokens;
+            // bug修复：拿到真实 input usage 后补发 message_start 覆盖占位的 0（只补发一次）
+            emitter.inputUsage(usage);
           }
           break;
         case 'content_block_start': {
@@ -680,24 +739,31 @@ app.post('/v1/chat/completions', async (req, res) => {
     if (isToolLoopback(messages)) {
       console.log('[LOOPBACK] 检测到工具回环请求，短路返回空 end_turn（不处理、不存记忆）');
       const loopModel = req.body.model || process.env.DEFAULT_MODEL || 'claude';
+      // bug修复：回环没有上游请求、拿不到 usage。取出上一轮真实回答缓存的 usage 返回，
+      // 否则回环是本轮最后收到的响应，Kelivo 会用它的 0 覆盖已显示的真实 token。
+      const cachedUsage = lastUsageByConv.get(computeConvId(req)) || { input_tokens: 0, output_tokens: 0 };
       if (stream) {
         res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
         res.setHeader('Cache-Control', 'no-cache');
         res.setHeader('Connection', 'keep-alive');
         res.flushHeaders && res.flushHeaders();
         const msgId = 'msg_' + Date.now();
+        // message_start 带回真实 input（含 cache 字段）
+        const startUsage = { input_tokens: cachedUsage.input_tokens || 0, output_tokens: 0 };
+        if (cachedUsage.cache_creation_input_tokens != null) startUsage.cache_creation_input_tokens = cachedUsage.cache_creation_input_tokens;
+        if (cachedUsage.cache_read_input_tokens != null) startUsage.cache_read_input_tokens = cachedUsage.cache_read_input_tokens;
         sseSend(res, 'message_start', {
           type: 'message_start',
           message: {
             id: msgId, type: 'message', role: 'assistant', model: loopModel,
             content: [], stop_reason: null, stop_sequence: null,
-            usage: { input_tokens: 0, output_tokens: 0 }
+            usage: startUsage
           }
         });
         sseSend(res, 'message_delta', {
           type: 'message_delta',
           delta: { stop_reason: 'end_turn', stop_sequence: null },
-          usage: { output_tokens: 0 }
+          usage: cachedUsage
         });
         sseSend(res, 'message_stop', { type: 'message_stop' });
         res.end();
@@ -705,13 +771,18 @@ app.post('/v1/chat/completions', async (req, res) => {
         res.json({
           id: 'msg_' + Date.now(), type: 'message', role: 'assistant', model: loopModel,
           content: [], stop_reason: 'end_turn', stop_sequence: null,
-          usage: { input_tokens: 0, output_tokens: 0 }
+          usage: cachedUsage
         });
       } else {
         res.json({
           id: 'chatcmpl-' + Date.now(), object: 'chat.completion',
           created: Math.floor(Date.now() / 1000), model: loopModel,
-          choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }]
+          choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
+          usage: {
+            prompt_tokens: cachedUsage.input_tokens || 0,
+            completion_tokens: cachedUsage.output_tokens || 0,
+            total_tokens: (cachedUsage.input_tokens || 0) + (cachedUsage.output_tokens || 0)
+          }
         });
       }
       return;
@@ -842,11 +913,15 @@ ${profile}
           const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
           if (toolUseBlocks.length === 0) break;
 
-          // 功能3（路线B最小验证）：执行前先向前端 emit 只读展示卡片；工具仍在网关内部执行。
+          // 功能3：执行前先向前端 emit 只读展示卡片；工具仍在网关内部执行。
           const toolResults = [];
           for (const toolUse of toolUseBlocks) {
             emitter.toolUseCard(toolUse.id, toolUse.name, toolUse.input);
             const toolResult = await executeTool(toolUse.name, toolUse.input);
+            // bug修复：卡片是 tool_use 块 → Kelivo 会创建 loading 工具块，且因为它没有该工具的
+            // onToolCall 而永不解除，hasLoadingTool 恒真 → 阻断 token 归属（显示 0 的根因）。
+            // 补发一个 tool_use_id 匹配的结果块解除该 loading（Kelivo 唯一会解析成 toolResults 的流块）。
+            emitter.toolResolve(toolUse.id, toolResult);
             toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
           }
           nonSystemMessages.push({ role: 'assistant', content: result.content });
@@ -856,6 +931,8 @@ ${profile}
         // 功能5：缓存命中日志（cache_read>0 即命中稳定前缀缓存）
         console.log('[CACHE] 输入', totalUsage.input_tokens, '| 写缓存', totalUsage.cache_creation_input_tokens || 0,
           '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens);
+        // bug修复：记住本轮真实 usage，供随后可能到来的工具回环短路时返回（否则回环 0 会覆盖显示）
+        rememberUsage(computeConvId(req), totalUsage);
         emitter.finish(result ? result.stop_reason : 'end_turn', totalUsage);
       } catch (streamErr) {
         console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);
@@ -965,6 +1042,8 @@ ${profile}
     }
     // 用累加后的 usage 覆盖 result.usage（Anthropic 路径直接返回 result）
     result.usage = { ...(result.usage || {}), ...nsUsage };
+    // bug修复：记住本轮真实 usage，供随后可能到来的工具回环短路时返回
+    rememberUsage(computeConvId(req), nsUsage);
 
     // 转换成 OpenAI 格式返回给 Kelivo
     const openaiResult = {
