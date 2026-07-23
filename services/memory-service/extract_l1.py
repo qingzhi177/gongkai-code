@@ -145,14 +145,33 @@ def get_embedding(text):
         print(f"Embedding error: {e}")
         return None
 
+def get_l0_ts(source_id):
+    """修复5：查 L0 原文时间，作为 L1 的时间戳。
+
+    L1 的 ts 应是对话发生时间，而非提取时间，否则 LLM 会把提取时刻
+    误当成事件发生时刻。查不到时 fallback 到当前时间。
+    """
+    if not source_id:
+        return None
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    try:
+        row = conn.execute('SELECT ts FROM l0_messages WHERE id=?', (source_id,)).fetchone()
+        return row[0] if row and row[0] else None
+    except Exception as e:
+        print(f"  查 L0 时间失败 (source_id={source_id}): {e}")
+        return None
+    finally:
+        conn.close()
+
 def save_l1(memory, conv_id, client, source_id):
+    ts = get_l0_ts(source_id) or datetime.now().isoformat()
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     try:
         c.execute(
-            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status) VALUES (?,?,?,?,?,?,?,?,?,?)',
-            (memory["content"], memory.get("quote", ""), source_id, conv_id, client, memory.get("event_type", "general"), 
-             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"), 'active')
+            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (memory["content"], memory.get("quote", ""), source_id, conv_id, client, memory.get("event_type", "general"),
+             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"), 'active', ts)
         )
         l1_id = c.lastrowid
         conn.commit()
@@ -163,7 +182,7 @@ def save_l1(memory, conv_id, client, source_id):
                 embeddings=[embedding],
                 documents=[memory["content"]],
                 metadatas=[{
-                    "ts": datetime.now().isoformat(),
+                    "ts": ts,
                     "event_type": memory.get("event_type", "general"),
                     "tags": json.dumps(memory.get("tags", []), ensure_ascii=False),
                     "quote": memory.get("quote", ""),
