@@ -80,6 +80,8 @@
                 <button class="btn" onclick="loadL1('fact')">事实</button>
                 <button class="btn" onclick="loadL1('event')">事件</button>
                 <button class="btn" onclick="loadL1('feel')">感受</button>
+                <button class="btn" onclick="loadFeel('ai_self')">感受·AI自述</button>
+                <button class="btn" onclick="loadFeel('conv')">感受·对话提取</button>
                 <button class="btn" onclick="loadL1('relationship')">关系</button>
                 <button class="btn" onclick="loadL1('core')">仅核心</button>
             </div>
@@ -241,6 +243,20 @@
             fetch(url).then(function(r) { return r.json(); }).then(function(d) {
                 var memories = d.memories || [];
                 if (type === 'core') memories = memories.filter(function(m) { return m.is_core; });
+                renderL1(memories);
+            });
+        }
+
+        // 修复2：feel 来源区分。拉全部 feel 后按 client 过滤：
+        // client='ai_self' 是 AI 主动调 feel 记录的；其他（对话提取）是从 L0 提取出来的。
+        function loadFeel(source) {
+            fetch(API + '/l1/list?limit=1000&event_type=feel').then(function(r) { return r.json(); }).then(function(d) {
+                var memories = d.memories || [];
+                if (source === 'ai_self') {
+                    memories = memories.filter(function(m) { return m.client === 'ai_self'; });
+                } else {
+                    memories = memories.filter(function(m) { return m.client !== 'ai_self'; });
+                }
                 renderL1(memories);
             });
         }

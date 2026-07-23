@@ -470,9 +470,11 @@ async def save_feel(req: FeelRequest):
     c = conn.cursor()
     try:
         # 存入 SQLite
+        # 修复2：显式写入 client='ai_self'、conv_id=''，与 ChromaDB metadata 对齐，
+        # 让 Dashboard 能按 client 区分「AI自述」和「对话提取」的 feel。
         c.execute(
-            'INSERT INTO l1_memories (content, quote, event_type, tags, valence, arousal, status) VALUES (?,?,?,?,?,?,?)',
-            (req.content, req.content, 'feel', '["感受"]', req.valence, req.arousal, 'active')
+            'INSERT INTO l1_memories (content, quote, conv_id, client, event_type, tags, valence, arousal, status) VALUES (?,?,?,?,?,?,?,?,?)',
+            (req.content, req.content, '', 'ai_self', 'feel', '["感受"]', req.valence, req.arousal, 'active')
         )
         l1_id = c.lastrowid
         conn.commit()
