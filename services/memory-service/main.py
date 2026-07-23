@@ -657,10 +657,16 @@ class UpdateL1Request(BaseModel):
     tags: Optional[str] = None
     is_core: Optional[int] = None
     event_type: Optional[str] = None
+    content: Optional[str] = None
 
 @app.put("/l1/{memory_id}")
 async def update_l1(memory_id: int, req: UpdateL1Request):
-    """编辑 L1 记忆（标签/核心标记/类型）"""
+    """编辑 L1 记忆（标签/核心标记/类型/内容）
+
+    修复4：支持修改 content。content 变化时，除更新 SQLite 外，
+    还要重新生成 embedding 并同步 ChromaDB 的向量和文档，
+    否则 recall 向量检索仍会命中旧内容。
+    """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     updates = []
@@ -674,12 +680,32 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
     if req.event_type is not None:
         updates.append("event_type=?")
         params.append(req.event_type)
+    if req.content is not None:
+        updates.append("content=?")
+        params.append(req.content)
     if not updates:
+        conn.close()
         return {"status": "error", "detail": "nothing to update"}
     params.append(memory_id)
     c.execute(f'UPDATE l1_memories SET {",".join(updates)} WHERE id=?', params)
     conn.commit()
     conn.close()
+
+    # content 变化时重新生成向量并同步 ChromaDB
+    if req.content is not None:
+        embedding = await get_embedding(req.content)
+        if embedding:
+            try:
+                l1_collection.update(
+                    ids=[f"l1_{memory_id}"],
+                    embeddings=[embedding],
+                    documents=[req.content]
+                )
+            except Exception as e:
+                print(f"ChromaDB 向量更新失败 l1_{memory_id}: {e}")
+                return {"status": "ok", "warning": f"SQLite已更新但向量同步失败: {e}"}
+        else:
+            return {"status": "ok", "warning": "SQLite已更新但embedding生成失败，向量未同步"}
     return {"status": "ok"}
 
 @app.delete("/l1/{memory_id}")

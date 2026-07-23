@@ -37,6 +37,12 @@
         .msg { padding: 8px; margin-bottom: 6px; border-radius: 6px; font-size: 13px; }
         .msg-user { background: #e3f2fd; }
         .msg-ai { background: #f1f8e9; }
+        .modal-mask { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.4); z-index: 1000; align-items: center; justify-content: center; }
+        .modal-mask.active { display: flex; }
+        .modal-box { background: white; border-radius: 12px; padding: 20px; width: 90%; max-width: 600px; max-height: 85vh; overflow-y: auto; }
+        .modal-box h3 { margin-bottom: 12px; }
+        .modal-box textarea { min-height: 200px; }
+        .modal-actions { text-align: right; margin-top: 6px; }
     </style>
 </head>
 <body>
@@ -137,6 +143,21 @@
                 <button class="btn" onclick="saveProvider()">保存</button>
                 <button class="btn" onclick="resetProviderForm()" style="background:#999;">清空</button>
                 <span id="config-form-status" style="margin-left:8px;"></span>
+            </div>
+        </div>
+    </div>
+
+    <!-- 修复4：L1 内容编辑弹窗 -->
+    <div id="editModal" class="modal-mask">
+        <div class="modal-box">
+            <h3>编辑记忆内容</h3>
+            <input type="hidden" id="edit-l1-id" value="">
+            <textarea id="edit-l1-content" placeholder="记忆内容"></textarea>
+            <div style="font-size:11px;color:#888;margin-bottom:8px;">保存后会重新生成向量，recall 检索将命中新内容。</div>
+            <div class="modal-actions">
+                <button class="btn" style="background:#999;" onclick="closeEditL1()">取消</button>
+                <button class="btn" onclick="saveEditL1()">保存</button>
+                <span id="edit-l1-status" style="margin-left:8px;font-size:12px;"></span>
             </div>
         </div>
     </div>
@@ -277,9 +298,13 @@
             });
         }
 
+        var l1Cache = {};
+
         function renderL1(memories) {
+            l1Cache = {};
             var html = '<p style="color:#666;margin-bottom:10px;">共 ' + memories.length + ' 条</p>';
             memories.forEach(function(m) {
+                l1Cache[m.id] = m.content;
                 html += '<div class="item">';
                 html += '<div class="item-content">';
                 if (m.is_core) html += '<span class="badge badge-core">核心</span>';
@@ -292,6 +317,7 @@
                 if (m.valence != null) html += ' | v' + m.valence + '/a' + (m.arousal||0);
                 html += '</div>';
                 html += '<div style="margin-top:6px;">';
+                html += '<button class="btn btn-small" onclick="editL1Content(' + m.id + ')">编辑内容</button> ';
                 html += '<button class="btn btn-small" onclick="toggleCore(' + m.id + ',' + (m.is_core||0) + ')">' + (m.is_core ? '取消核心' : '标记核心') + '</button> ';
                 html += '<button class="btn btn-small" onclick="editTags(' + m.id + ')">编辑标签</button> ';
                 html += '<button class="btn btn-small" onclick="changeType(' + m.id + ')">改类型</button> ';
@@ -299,6 +325,37 @@
                 html += '</div>';
             });
             document.getElementById('l1-list').innerHTML = html || '<p>暂无记忆</p>';
+        }
+
+        // 修复4：L1 内容编辑
+        function editL1Content(id) {
+            document.getElementById('edit-l1-id').value = id;
+            document.getElementById('edit-l1-content').value = l1Cache[id] || '';
+            document.getElementById('edit-l1-status').textContent = '';
+            document.getElementById('editModal').classList.add('active');
+            document.getElementById('edit-l1-content').focus();
+        }
+
+        function closeEditL1() {
+            document.getElementById('editModal').classList.remove('active');
+        }
+
+        function saveEditL1() {
+            var id = document.getElementById('edit-l1-id').value;
+            var content = document.getElementById('edit-l1-content').value.trim();
+            var statusEl = document.getElementById('edit-l1-status');
+            if (!content) { statusEl.textContent = '内容不能为空'; return; }
+            statusEl.textContent = '保存中，正在重建向量...';
+            fetch(API + '/l1/' + id, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: content})
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                if (d.warning) { statusEl.textContent = '⚠ ' + d.warning; return; }
+                statusEl.textContent = '已保存';
+                closeEditL1();
+                loadL1('all');
+            }).catch(function(e) { statusEl.textContent = '保存失败: ' + e; });
         }
 
         function toggleCore(id, cur) {
