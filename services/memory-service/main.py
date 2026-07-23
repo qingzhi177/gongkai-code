@@ -625,7 +625,7 @@ async def get_conversations(limit: int = 20, offset: int = 0):
     return {"conversations": convs}
 
 @app.get("/l1/list")
-async def get_l1_list(event_type: Optional[str] = None, limit: int = 50, offset: int = 0):
+async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offset: int = 0):
     """获取 L1 记忆列表"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()

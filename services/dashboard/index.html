@@ -238,7 +238,7 @@
         }
 
         function loadL1(type) {
-            var url = API + '/l1/list?limit=100';
+            var url = API + '/l1/list?limit=1000';
             if (type !== 'all' && type !== 'core') url += '&event_type=' + type;
             fetch(url).then(function(r) { return r.json(); }).then(function(d) {
                 var memories = d.memories || [];
