@@ -220,7 +220,7 @@
         }
 
         function loadConversations() {
-            fetch(API + '/l0/conversations').then(function(r) { return r.json(); }).then(function(d) {
+            fetch(API + '/l0/conversations?limit=500').then(function(r) { return r.json(); }).then(function(d) {
                 var html = '';
                 (d.conversations || []).forEach(function(c) {
                     html += '<div class="conv-item" onclick="loadL0Messages(\'' + c.conv_id + '\')">';

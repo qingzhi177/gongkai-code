@@ -393,6 +393,30 @@ async def search_memories(req: SearchRequest):
         return {"memories": [], "total": 0}
 
 
+def normalize_content(content):
+    """把消息 content 归一化成纯文本。
+
+    问题2 关键修复：Kelivo 会把历史消息用 Anthropic content 块数组发回
+    （如 [{"type":"thinking",...},{"type":"text","text":"..."}]）。
+    直接把 list 往 SQLite TEXT 列插会抛 'type list is not supported'，
+    导致整轮 save 事务 rollback、对话丢失。
+    这里只取 text 块拼成纯文本，忽略 thinking/tool_use/tool_result
+    （工具与思维链内容本就不该进 L0 记忆）。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type") == "text" and block.get("text"):
+                parts.append(block["text"])
+        return "\n".join(parts)
+    if content is None:
+        return ""
+    return str(content)
+
 @app.post("/save_conversation")
 async def save_conversation(req: SaveRequest):
     conn = sqlite3.connect(str(SQLITE_PATH))
@@ -401,7 +425,7 @@ async def save_conversation(req: SaveRequest):
     try:
         for idx, msg in enumerate(req.messages):
             role = msg.get("role", "")
-            content = msg.get("content", "")
+            content = normalize_content(msg.get("content", ""))
             if not content or role == "system":
                 continue
             c.execute('SELECT id, content FROM l0_messages WHERE conv_id=? AND msg_idx=? AND status=?',
@@ -605,7 +629,7 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     return {"messages": messages, "total": total}
 
 @app.get("/l0/conversations")
-async def get_conversations(limit: int = 20, offset: int = 0):
+async def get_conversations(limit: int = 500, offset: int = 0):
     """获取对话列表"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()

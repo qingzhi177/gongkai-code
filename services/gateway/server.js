@@ -23,13 +23,57 @@ function rememberUsage(convId, usage) {
   }
   lastUsageByConv.set(convId, { ...usage });
 }
-// 与下方保存对话时的 conv_id 计算保持一致，保证回环请求能命中缓存。
-function computeConvId(req) {
-  const client = req.headers['x-client-name'] || 'unknown';
+// 解析对话 ID：优先 body.conversation_id，其次 Kelivo 发的 x-conversation-id header
+// （问题2 Bug B：Kelivo 不发 body.conversation_id，但发 x-conversation-id header，
+//  且同一对话窗口内跨轮稳定。老代码只读 body，导致每轮用"首条user的MD5"生成 id，
+//  Kelivo 每轮只发当前消息 → 每轮 id 都不同 → 对话被打散成一堆单条）。
+// 都没有才 fallback 到首条 user 消息的 MD5（保底，理论上不会走到）。
+function resolveConvId(req) {
   if (req.body.conversation_id) return req.body.conversation_id;
+  const headerConvId = req.headers['x-conversation-id'];
+  if (headerConvId) return headerConvId;
+  const client = req.headers['x-client-name'] || 'kelivo';
   const firstUserMsg = (req.body.messages || []).find(m => m.role === 'user');
   const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
   return client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
+}
+
+// 与保存对话时的 conv_id 计算保持一致，保证回环请求能命中 usage 缓存。
+function computeConvId(req) {
+  return resolveConvId(req);
+}
+
+// 问题2：识别 Kelivo 的"标题生成"请求。Kelivo 每开新对话会额外发一个
+// LLM 请求，用固定英文模板让模型把对话概括成短标题。这类请求走同一 endpoint，
+// 不该存进 L0（否则模板 prompt + 标题会污染记忆、被 L1 提取、被 recall 搜到）。
+// 特征：user 消息里含 Kelivo 模板的固定英文句子。命中则跳过保存（标题照常返回）。
+function isTitleGenerationRequest(req) {
+  const msgs = req.body.messages || [];
+  for (const m of msgs) {
+    if (m.role !== 'user') continue;
+    const text = typeof m.content === 'string'
+      ? m.content
+      : Array.isArray(m.content)
+        ? m.content.filter(b => b && b.type === 'text').map(b => b.text).join(' ')
+        : '';
+    if (/summarize the conversation/i.test(text) && /into a short title/i.test(text)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 从上游结果中提取 AI 回复的纯文本（忽略 thinking/tool_use 块）。
+// 兼容流式(result.content 块数组)和非流式(可能是 OpenAI choices 结构)。
+function extractAssistantText(result) {
+  if (!result) return '';
+  if (Array.isArray(result.content)) {
+    return result.content.filter(c => c.type === 'text').map(c => c.text).join('');
+  }
+  if (result.choices && result.choices[0] && result.choices[0].message) {
+    return result.choices[0].message.content || '';
+  }
+  return '';
 }
 
 // 功能6：动态配置缓存。启动时和 /reload-config 时从记忆服务拉取当前供应商配置。
@@ -943,18 +987,20 @@ ${profile}
         emitter.finish('end_turn', totalUsage);
       }
 
-      // 异步保存对话到 L0（与非流式一致）
-      const client = req.headers['x-client-name'] || 'unknown';
-      let conv_id = req.body.conversation_id;
-      if (!conv_id) {
-        const firstUserMsg = req.body.messages.find(m => m.role === 'user');
-        const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
-        conv_id = client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
+      // 异步保存对话到 L0（与非流式一致）。问题2：标题生成请求不存记忆。
+      if (!isTitleGenerationRequest(req)) {
+        const client = req.headers['x-client-name'] || 'kelivo';
+        const conv_id = resolveConvId(req);
+        const originalMessages = req.body.messages.filter(m => m.role !== 'system');
+        // 问题2 Bug A：把本轮生成的 AI 回复 append 进去再存。
+        // Kelivo 每轮只发到当前 user 为止，不含刚生成的 AI 回复；不补的话
+        // 单轮对话的回复永远存不进 L0，多轮也会丢最后一条 AI 回复。
+        const aiText = extractAssistantText(result);
+        if (aiText) originalMessages.push({ role: 'assistant', content: aiText });
+        axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
+          conv_id, client, messages: originalMessages
+        }).catch(err => console.error('保存对话失败:', err.message));
       }
-      const originalMessages = req.body.messages.filter(m => m.role !== 'system');
-      axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
-        conv_id, client, messages: originalMessages
-      }).catch(err => console.error('保存对话失败:', err.message));
       return;
     }
 
@@ -1061,26 +1107,25 @@ ${profile}
       }]
     };
     
-    // 异步保存对话到 L0（生成稳定的 conv_id）
-    const client = req.headers['x-client-name'] || 'unknown';
-    let conv_id = req.body.conversation_id;
-    if (!conv_id) {
-      // 用第一条用户消息生成稳定的 conv_id（同一对话窗口不变）
-      const firstUserMsg = req.body.messages.find(m => m.role === 'user');
-      const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
-      conv_id = client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
+    // 异步保存对话到 L0（生成稳定的 conv_id）。问题2：标题生成请求不存记忆。
+    if (!isTitleGenerationRequest(req)) {
+      const client = req.headers['x-client-name'] || 'kelivo';
+      const conv_id = resolveConvId(req);
+
+      // 用原始 messages（去掉 system），不用 augmentedMessages
+      const originalMessages = req.body.messages.filter(m => m.role !== 'system');
+      // 问题2 Bug A：append 本轮 AI 回复（原因见流式分支同处注释）
+      const aiText = extractAssistantText(result);
+      if (aiText) originalMessages.push({ role: 'assistant', content: aiText });
+      console.log('[DEBUG] 准备保存对话:', conv_id, client, originalMessages.length, '条消息');
+
+      axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
+        conv_id: conv_id,
+        client: client,
+        messages: originalMessages
+      }).catch(err => console.error('保存对话失败:', err.message));
     }
 
-    // 用原始 messages（去掉 system），不用 augmentedMessages
-    const originalMessages = req.body.messages.filter(m => m.role !== 'system');
-    console.log('[DEBUG] 准备保存对话:', conv_id, client, originalMessages.length, '条消息');
-    
-    axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
-      conv_id: conv_id,
-      client: client,
-      messages: originalMessages
-    }).catch(err => console.error('保存对话失败:', err.message));    
-     
     // 根据请求来源决定返回格式
     if (req.body._anthropicFormat) {
       // Anthropic 格式进来的，直接返回原始响应
