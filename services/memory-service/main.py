@@ -743,13 +743,30 @@ async def delete_l0_message(msg_id: int):
 
 @app.delete("/l0/conversation/{conv_id}")
 async def delete_l0_conversation(conv_id: str):
-    """删除整个对话"""
+    """删除整个对话（修复6/8：联动清除 L1 + ChromaDB 向量）
+
+    原来只标记 L0 superseded，对应的 L1 记忆和向量还在，会被 recall 搜到。
+    现在同时软删该对话下的 L1，并从 ChromaDB 删掉对应向量。
+    """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
+    # 1. 查出该 conv_id 下所有 active L1 的 id（删向量要用）
+    c.execute("SELECT id FROM l1_memories WHERE conv_id=? AND status='active'", (conv_id,))
+    l1_ids = [row[0] for row in c.fetchall()]
+    # 2. 标记 L0 superseded
     c.execute('UPDATE l0_messages SET status=? WHERE conv_id=?', ('superseded', conv_id))
+    # 3. 标记 L1 superseded
+    c.execute("UPDATE l1_memories SET status='superseded' WHERE conv_id=? AND status='active'", (conv_id,))
     conn.commit()
     conn.close()
-    return {"status": "ok"}
+    # 4. 从 ChromaDB 删除对应向量
+    if l1_ids:
+        try:
+            l1_collection.delete(ids=[f"l1_{i}" for i in l1_ids])
+        except Exception as e:
+            print(f"ChromaDB 删除失败 (conv_id={conv_id}): {e}")
+            return {"status": "ok", "l1_removed": len(l1_ids), "warning": f"L1已软删但向量清除失败: {e}"}
+    return {"status": "ok", "l1_removed": len(l1_ids)}
 
 # ============ 功能6：供应商模型配置（CRUD + 加密） ============
 
