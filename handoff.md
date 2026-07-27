@@ -348,6 +348,37 @@ data/sqlite/memory.db
 ### L1 删除约定
 用 `status='superseded'` 软删除，不物理删行。ChromaDB 向量用 `l1_collection.delete(ids=[...])` 删。
 
+### 已知问题与约定
+
+1. **非流式工具透传（bug2）有意跳过**：Kelivo 非流式解析器会丢失正文，用户基本只用流式，故不修。
+2. **L1 时间戳当前是提取时间**：修复5 要改成用 L0 原文时间，让 LLM 时间认知准确。
+3. **删除操作当前不联动**：删 L0 对话后，对应 L1 和向量还在，会被 recall 搜到。修复6/7 要修。
+4. **Dashboard 配置页只管聊天模型**：Embedding/L1提取的 API Key 仍在 .env 里手动改，暂不做 Dashboard 配置。
+5. **ChromaDB 向量 ID 格式严格**：必须是 `l1_{数字}`，删除时拼错 ID 会静默失败。
+6. **L0 版本切换用 diff 检测**：内容变了插新行、旧行标 superseded，但 L1 没联动（修复7要修）。
+
+### 数据库 Schema 关键字段
+
+**l0_messages**:
+- `status`: 'active' | 'superseded'（版本切换、删除用）
+- `extracted`: 0 | 1（cron 用，1=已提取过 L1）
+- `source`: 'live' | 'import'（实时对话 vs 导入历史）
+
+**l1_memories**:
+- `status`: 'active' | 'superseded'
+- `source_msg_id`: 对应 L0 的第一条消息 id（用于追溯原文和联动删除）
+- `conv_id`: 所属对话（用于删除整个对话时联动）
+- `client`: 'ai_self' = AI 主动调 feel，其他 = 从对话提取
+
+### 测试要点
+
+修复后务必测试：
+- 修复3: Dashboard L1 列表能显示 1000 条
+- 修复4: 编辑 L1 内容后，recall 搜索能找到新内容（说明向量更新了）
+- 修复5: 新提取的 L1 时间戳 = 对应 L0 消息时间
+- 修复6: Dashboard 删除对话后，recall 搜不到该对话的记忆
+- 修复7: Kelivo 里编辑消息后，旧版内容 recall 搜不到
+
 ---
 
 ## 七、git 近期提交记录
@@ -362,4 +393,93 @@ f7415c3 修复1: L1 提取视角改为 AI 第一人称
 
 ---
 
-*本文件由 Claude Opus 4.8 生成于 2026-07-23*
+## 八、需求3收尾 + L0重复根治（2026-07-28 补记）
+
+> 07-23 的第三、五节待办（修复3~8）已全部完成，且额外做了单条删除联动、
+> L0 重复根治。以下为最新状态，与前文冲突处以本节为准。
+
+### 8.1 需求3 全部完成（修复1~8 ✅）
+
+| 修复 | 状态 | 落点 |
+|------|------|------|
+| 修复1 视角第一人称 | ✅ | extract_l1.py |
+| 修复2 feel 来源区分 | ✅ | main.py + index.html |
+| 修复3 L1 列表 limit | ✅ | main.py + index.html |
+| 修复4 L1 内容手动编辑 | ✅ | main.py + index.html |
+| 修复5 L1 时间戳用 L0 原文时间 | ✅ | extract_l1.py |
+| 修复6/8 删对话联动清 L1+向量 | ✅ | main.py `delete_l0_conversation` |
+| 修复7 L0 版本切换联动 L1 | ✅ | main.py（**非 server.js**，见下） |
+
+**修复7 关键纠正**：handoff 原方案（`WHERE source_msg_id=old_l0_id`）**不成立**。
+`source_msg_id` 是「cron 提取批次首条消息的 id」，同批多条 L1 共享它，不是单条
+消息 id。改用**批次级联动** `_cascade_l1_on_version_switch(c, conv_id, old_ids)`
+（main.py）：按 source_msg_id 把对话切成不重叠区间，定位被改消息所属批次 →
+作废整批 L1、该批 active L0 置 `extracted=0` 重提、删对应 ChromaDB 向量。
+触发点在 `save_conversation` 的版本切换处（旧行 superseded 且 `extracted=1` 才联动）。
+
+### 8.2 新功能：单条 L0 删除联动清 L1
+
+`delete_l0_message`（main.py）原来只标 L0 superseded，L1/向量残留会被 recall 搜到。
+现复用 `_cascade_l1_on_version_switch` 做同款批次级联动。接口 `DELETE /l0/message/{id}`
+和 Dashboard 删除按钮此前已存在，仅补联动。
+
+### 8.3 L0 重复存储根治（重点）
+
+**现象**：live 对话里同一句 assistant 存成多条 active（msg_idx 不同）。
+
+**根因**（加诊断日志坐实，推翻两个初始猜测）：
+- ❌ 非 conv_id 漂移（`x-conversation-id` header 全程稳定）
+- ❌ 非空格误判为主因（空格差异仅工具轮次拆块时次生）
+- ✅ **msg_idx 用「含空消息的原始数组下标」**。Kelivo 工具调用轮次会把一轮拆成
+  多条消息：`assistant[tool_use]`、`user[tool_result]` 归一化后**为空**但**占数组
+  下标**；空消息数量跨轮变化 → 真实消息 msg_idx 漂移 → dedup 按 `(conv,msg_idx)`
+  失配 → 重复 insert。加上同句 assistant 被拆块/重发。
+
+**根治**（server.js `cleanMessagesForSave`，保存前清洗）：
+1. 去 system
+2. 去归一化后为空的消息（工具/思维链轮次）
+3. 去相邻同 role 重复（`dedupKey` **空白不敏感**，合并工具轮次拆出的近似重复）
+
+配套：`toPlainText` 与 main.py `normalize_content` 对齐（块数组取 text 用 `\n` 拼），
+`extractAssistantText` 块拼接也改 `\n`，避免两侧归一化不一致误判版本切换。
+
+**存量处理**（两个一次性脚本，均 dry-run 默认、`--apply` 才写库）：
+- `scripts/dedup_l0_adjacent.py`：软删已有相邻重复（比较**空白不敏感**）。本轮清 5 条。
+- `scripts/reindex_l0_msgidx.py`：把活跃对话 active L0 的 msg_idx 重编号为连续，
+  对齐新网关（否则旧稀疏下标与新连续下标错位会再生重复）。已连续的对话自动跳过。
+
+**验证**：单测 + 集成测试（新对话跨轮）+ 3 轮真实 Kelivo 工具调用，全部零重复、
+idx 连续。工具轮次拆出的近似重复 assistant 被空白不敏感去重成功合并。
+
+### 8.4 关键约定补充
+
+- **msg_idx 语义**：现在是「网关清洗后干净序列的连续下标」，不再含空/工具消息。
+  改动任何影响消息序列的逻辑时，务必保证网关与记忆服务两侧归一化一致
+  （`toPlainText` ↔ `normalize_content`），否则会误判版本切换。
+- **source_msg_id 语义**：批次首条 id，非单条 id。任何"按来源联动 L1"的逻辑都要
+  走批次级 `_cascade_l1_on_version_switch`，别再用 `source_msg_id=单条id` 匹配。
+- **诊断日志**：本次排查用的 `dupDebugLog`(server.js)/`_dup_debug`(main.py) 写
+  `data/dup_debug.log`，定位后已全部移除。journald 需密码读不了，排查靠写文件。
+
+### 8.5 仍待办
+
+- **问题1（不急）**：历史孤儿 L1 —— 全库有约 17~20 条 active L1 的 `source_msg_id`
+  指向已 superseded 的 L0（溯源断裂）。**非重复、功能无影响**（批次级联动查 L1 的
+  source 集合、不查 L0 状态）。要清需逐条判断「所属批次是否整体消失」，是独立的
+  一次性任务，尚未做。
+
+---
+
+## 九、git 近期提交记录（截至 2026-07-28）
+
+```
+c71b215 根治L0重复: 网关保存前清洗消息序列 + 存量迁移
+1ec9409 清洗脚本: 删除L0相邻重复消息
+72183e8 新功能: 单条L0删除联动清理L1+向量(批次级)
+9aa5ed0 修复7: L0版本切换时批次级联动清理L1+向量
+125a4be 修复问题2+3: 对话保存健壮性 + 列表limit
+```
+
+---
+
+*本文件由 Claude Opus 4.8 生成于 2026-07-23，第八/九节补记于 2026-07-28。*
