@@ -837,13 +837,42 @@ async def update_l0_timestamp(msg_id: int, req: UpdateTimestampRequest):
 
 @app.delete("/l0/message/{msg_id}")
 async def delete_l0_message(msg_id: int):
-    """删除单条 L0 消息"""
+    """删除单条 L0 消息（联动清理 L1 + ChromaDB 向量，批次级）。
+
+    原来只标记 L0 superseded，其对应 L1 记忆和向量残留，recall 仍会搜到。
+    现复用修复7 的批次级联动：source_msg_id 是「提取批次首条消息 id」，
+    删掉的消息落在某批次内 → 作废整批 L1、该批其它 active 消息重提取(extracted=0)、
+    从 ChromaDB 删对应向量。只对已提取过(extracted=1)的消息联动。
+    """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    c.execute('UPDATE l0_messages SET status=? WHERE id=?', ('superseded', msg_id))
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
+    l1_ids_to_purge = []
+    try:
+        row = c.execute('SELECT conv_id, extracted, status FROM l0_messages WHERE id=?',
+                        (msg_id,)).fetchone()
+        if not row:
+            return {"status": "error", "detail": "message not found"}
+        conv_id, extracted, cur_status = row
+        # 标记该 L0 superseded
+        c.execute('UPDATE l0_messages SET status=? WHERE id=?', ('superseded', msg_id))
+        # 只有已提取过 L1 的消息才需要联动（extracted=0 的没进过批次，无 L1）
+        if extracted == 1 and cur_status == 'active':
+            l1_ids_to_purge = _cascade_l1_on_version_switch(c, conv_id, [msg_id])
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return {"status": "error", "detail": str(e)}
+    finally:
+        conn.close()
+    # SQLite 提交后再删向量：ChromaDB 失败不回滚（与修复6/7 一致）
+    if l1_ids_to_purge:
+        try:
+            l1_collection.delete(ids=[f"l1_{i}" for i in l1_ids_to_purge])
+        except Exception as e:
+            print(f"ChromaDB 单条删除清理失败 (msg_id={msg_id}): {e}")
+            return {"status": "ok", "l1_purged": len(l1_ids_to_purge),
+                    "warning": f"L1已软删但向量清除失败: {e}"}
+    return {"status": "ok", "l1_purged": len(l1_ids_to_purge)}
 
 @app.delete("/l0/conversation/{conv_id}")
 async def delete_l0_conversation(conv_id: str):
