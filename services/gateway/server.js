@@ -63,17 +63,69 @@ function isTitleGenerationRequest(req) {
   return false;
 }
 
+// 把消息 content 归一化成纯文本。必须与记忆服务 main.py 的 normalize_content
+// 完全一致（块数组只取 text 块、用 '\n' 拼），否则同一句话两侧归一化结果不同 →
+// dedup 误判成内容变化 → 触发无谓的版本切换。
+function toPlainText(content) {
+  if (typeof content === 'string') return content;
+  if (Array.isArray(content)) {
+    const parts = [];
+    for (const b of content) {
+      if (typeof b === 'string') parts.push(b);
+      else if (b && b.type === 'text' && b.text) parts.push(b.text);
+    }
+    return parts.join('\n');
+  }
+  if (content == null) return '';
+  return String(content);
+}
+
 // 从上游结果中提取 AI 回复的纯文本（忽略 thinking/tool_use 块）。
 // 兼容流式(result.content 块数组)和非流式(可能是 OpenAI choices 结构)。
 function extractAssistantText(result) {
   if (!result) return '';
   if (Array.isArray(result.content)) {
-    return result.content.filter(c => c.type === 'text').map(c => c.text).join('');
+    return result.content.filter(c => c.type === 'text').map(c => c.text).join('\n');
   }
   if (result.choices && result.choices[0] && result.choices[0].message) {
     return result.choices[0].message.content || '';
   }
   return '';
+}
+
+// L0 重复根治：保存前把 Kelivo 传回的消息序列清洗成干净对话流。
+//  1. 去 system
+//  2. 去归一化后为空的消息（工具轮次：tool_use-only assistant、tool_result user、
+//     纯 thinking），它们本不该进 L0，且空消息占 msg_idx 下标会导致下标漂移
+//  3. 去相邻的同 role 同内容重复（工具调用会把一轮 assistant 拆成多条、Kelivo
+//     还会重发同句），保留最早那条
+// 最后 append 本轮 aiText（若与末条 assistant 相同则不重复加）。
+// 清洗后 msg_idx 基于这个稳定的干净序列，dedup(按 conv_id+msg_idx) 不再失配。
+// 相邻同 role 去重的比较键：忽略所有空白字符。工具调用会把一轮 assistant
+// 拆成多个 text 块，Kelivo 重发时块间拼接的空白（\n）可能不一致，导致"同一句
+// 回复"两条只差空白 → 精确相等拦不住。相邻同 role 本就只在工具轮次出现，按
+// 空白不敏感合并是安全的。
+function dedupKey(s) {
+  return (s || '').replace(/\s+/g, '');
+}
+function cleanMessagesForSave(messages, aiText) {
+  const out = [];
+  for (const m of (messages || [])) {
+    if (!m || m.role === 'system') continue;
+    const text = toPlainText(m.content);
+    if (!text) continue;
+    const last = out[out.length - 1];
+    // 相邻同 role 且空白无关内容相同 → 视为重复，保留先到的那条
+    if (last && last.role === m.role && dedupKey(last.content) === dedupKey(text)) continue;
+    out.push({ role: m.role, content: text });
+  }
+  if (aiText) {
+    const last = out[out.length - 1];
+    if (!(last && last.role === 'assistant' && dedupKey(last.content) === dedupKey(aiText))) {
+      out.push({ role: 'assistant', content: aiText });
+    }
+  }
+  return out;
 }
 
 // 功能6：动态配置缓存。启动时和 /reload-config 时从记忆服务拉取当前供应商配置。
@@ -991,14 +1043,14 @@ ${profile}
       if (!isTitleGenerationRequest(req)) {
         const client = req.headers['x-client-name'] || 'kelivo';
         const conv_id = resolveConvId(req);
-        const originalMessages = req.body.messages.filter(m => m.role !== 'system');
         // 问题2 Bug A：把本轮生成的 AI 回复 append 进去再存。
         // Kelivo 每轮只发到当前 user 为止，不含刚生成的 AI 回复；不补的话
         // 单轮对话的回复永远存不进 L0，多轮也会丢最后一条 AI 回复。
+        // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
         const aiText = extractAssistantText(result);
-        if (aiText) originalMessages.push({ role: 'assistant', content: aiText });
+        const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
         axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
-          conv_id, client, messages: originalMessages
+          conv_id, client, messages: cleanedMessages
         }).catch(err => console.error('保存对话失败:', err.message));
       }
       return;
@@ -1112,17 +1164,15 @@ ${profile}
       const client = req.headers['x-client-name'] || 'kelivo';
       const conv_id = resolveConvId(req);
 
-      // 用原始 messages（去掉 system），不用 augmentedMessages
-      const originalMessages = req.body.messages.filter(m => m.role !== 'system');
       // 问题2 Bug A：append 本轮 AI 回复（原因见流式分支同处注释）
+      // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
       const aiText = extractAssistantText(result);
-      if (aiText) originalMessages.push({ role: 'assistant', content: aiText });
-      console.log('[DEBUG] 准备保存对话:', conv_id, client, originalMessages.length, '条消息');
+      const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
 
       axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
         conv_id: conv_id,
         client: client,
-        messages: originalMessages
+        messages: cleanedMessages
       }).catch(err => console.error('保存对话失败:', err.message));
     }
 
