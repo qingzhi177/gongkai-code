@@ -417,34 +417,114 @@ def normalize_content(content):
         return ""
     return str(content)
 
+def _cascade_l1_on_version_switch(c, conv_id, superseded_old_ids):
+    """修复7：旧 L0 版本切换时，联动作废其所在「提取批次」的 L1 并重置重提取。
+
+    在 save_conversation 的事务内调用（传入同一个 cursor c），只做 SQLite 侧改动，
+    返回需要从 ChromaDB 删除的 L1 id 列表（由调用方在 commit 后删向量）。
+
+    批次定位：source_msg_id 是批次首条消息 id，批次按 id 区间不重叠切分对话。
+    被改消息 old_id（已 extracted）所属批次的首 id = 该 conv active L1 中
+    source_msg_id <= old_id 的最大值；批次上界 next_sid = 大于它的最小 source_msg_id。
+    """
+    if not superseded_old_ids:
+        return []
+    # 该 conv 下所有 active L1 用到的批次首 id（升序、去重）
+    c.execute(
+        "SELECT DISTINCT source_msg_id FROM l1_memories "
+        "WHERE conv_id=? AND status='active' AND source_msg_id IS NOT NULL "
+        "ORDER BY source_msg_id ASC",
+        (conv_id,))
+    batch_sids = [row[0] for row in c.fetchall()]
+    if not batch_sids:
+        return []
+
+    affected_batches = set()   # 需要作废+重提的批次首 id
+    for old_id in superseded_old_ids:
+        # 找 <= old_id 的最大批次首 id（该消息所属批次）
+        candidates = [s for s in batch_sids if s <= old_id]
+        if candidates:
+            affected_batches.add(max(candidates))
+
+    l1_ids_to_purge = []
+    for batch_sid in affected_batches:
+        # 批次上界：下一个更大的批次首 id（没有则到对话末尾）
+        higher = [s for s in batch_sids if s > batch_sid]
+        next_sid = min(higher) if higher else None
+
+        # 收集这批 active L1 的 id（删向量用）
+        c.execute(
+            "SELECT id FROM l1_memories WHERE conv_id=? AND source_msg_id=? AND status='active'",
+            (conv_id, batch_sid))
+        l1_ids_to_purge.extend(row[0] for row in c.fetchall())
+        # 作废这批 L1
+        c.execute(
+            "UPDATE l1_memories SET status='superseded' "
+            "WHERE conv_id=? AND source_msg_id=? AND status='active'",
+            (conv_id, batch_sid))
+        # 让这批 id 区间内的 active L0 重提取（被改消息旧行已 superseded，不会命中）
+        if next_sid is not None:
+            c.execute(
+                "UPDATE l0_messages SET extracted=0 "
+                "WHERE conv_id=? AND status='active' AND id>=? AND id<?",
+                (conv_id, batch_sid, next_sid))
+        else:
+            c.execute(
+                "UPDATE l0_messages SET extracted=0 "
+                "WHERE conv_id=? AND status='active' AND id>=?",
+                (conv_id, batch_sid))
+    return l1_ids_to_purge
+
+
 @app.post("/save_conversation")
 async def save_conversation(req: SaveRequest):
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     saved = 0
+    superseded_old_ids = []   # 修复7：本轮因版本切换被 superseded 的旧 L0 id（含其 extracted 标志）
     try:
         for idx, msg in enumerate(req.messages):
             role = msg.get("role", "")
             content = normalize_content(msg.get("content", ""))
             if not content or role == "system":
                 continue
-            c.execute('SELECT id, content FROM l0_messages WHERE conv_id=? AND msg_idx=? AND status=?',
+            c.execute('SELECT id, content, extracted FROM l0_messages WHERE conv_id=? AND msg_idx=? AND status=?',
                       (req.conv_id, idx, 'active'))
             existing = c.fetchone()
             if existing:
                 if existing[1] == content:
                     continue
                 c.execute('UPDATE l0_messages SET status=? WHERE id=?', ('superseded', existing[0]))
+                # 修复7：只有已提取过 L1 的旧消息才需要联动清理（extracted=1）
+                if existing[2] == 1:
+                    superseded_old_ids.append(existing[0])
             c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) VALUES (?,?,?,?,?,?,?)',
                       (req.conv_id, idx, role, content, req.client, 'active', 0))
             saved += 1
+
+        # 修复7：L0 版本切换联动 L1（批次级）。
+        # source_msg_id 是「该次 cron 提取批次首条消息的 id」，同批多条 L1 共享它，
+        # 按 id 区间不重叠地切分整个对话。被改消息落在某批次内 → 作废整批 L1、
+        # 让该批次的其它 active 消息一并重提取（extracted=0），旧向量从 ChromaDB 删。
+        l1_ids_to_purge = _cascade_l1_on_version_switch(c, req.conv_id, superseded_old_ids)
+
         conn.commit()
-        return {"status": "ok", "saved": saved}
     except Exception as e:
         conn.rollback()
         return {"status": "error", "detail": str(e)}
     finally:
         conn.close()
+
+    # SQLite 已提交后再删向量：ChromaDB 失败不影响 L0/L1 的软删（与修复6 一致）
+    if l1_ids_to_purge:
+        try:
+            l1_collection.delete(ids=[f"l1_{i}" for i in l1_ids_to_purge])
+        except Exception as e:
+            print(f"ChromaDB 版本切换清理失败 (conv_id={req.conv_id}): {e}")
+            return {"status": "ok", "saved": saved,
+                    "l1_purged": len(l1_ids_to_purge),
+                    "warning": f"L1已软删但向量清除失败: {e}"}
+    return {"status": "ok", "saved": saved, "l1_purged": len(l1_ids_to_purge)}
 
 @app.get("/stats")
 async def stats():
