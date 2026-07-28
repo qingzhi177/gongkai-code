@@ -1,0 +1,9 @@
+token显示0的bug：
+stream模式的emitter.start()里usage硬编码为0，Kelivo从
+message_start.message.usage.input_tokens读输入token，所以显示0。
+修复：streamRound收到上游message_start事件拿到真实usage后，
+立刻通过emitter补发一个message_start覆盖前面的（把真实
+input_tokens/cache_creation/cache_read塞进去）。
+output_tokens已在message_delta里正确发，不用动。
+
+修完后测试Kelivo能否看到正确的token数，然后git commit。
