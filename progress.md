@@ -30,11 +30,17 @@ handoff 原方案不成立）。
 
 ---
 
-## ⏳ 仍待办
+### ✅ 问题1：孤儿 L1 清理（commit 5b04cf4）
 
-- **问题1（不急）**：历史孤儿 L1 约 17~20 条（active L1 的 source_msg_id 指向已
-  superseded 的 L0，溯源断裂）。非重复、功能无影响。需逐条判断"所属批次是否整体
-  消失"，独立一次性任务，尚未做。详见 handoff.md 8.5。
+`scripts/clean_orphan_l1.py` 清 17 条孤儿（active L1 且所属 conv 的 active L0=0）。
+关键避坑：判据排除 `client='ai_self'` 的自述记忆（conv_id 空、非孤儿）。软删可逆 +
+删向量。验证：剩余孤儿 0、ai_self 记忆 54 条完好未动。详见 handoff.md 8.5。
+
+---
+
+## ⏳ 目前无已知待办
+
+需求3（修复1~8）、单条 L0 删除、L0 重复根治、问题1 孤儿清理均已完成并验证。
 
 ---
 
