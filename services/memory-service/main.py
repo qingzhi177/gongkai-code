@@ -1035,6 +1035,33 @@ async def get_current_config():
         "model": active[1],
     }
 
+@app.get("/last_session")
+async def get_last_session(conv_id: Optional[str] = None):
+    """时间感知：返回最近一条 active L0 消息的时间戳（UTC）。
+
+    网关用它算距上次对话的间隔，注入"好久不见"式的会话间隔感知。
+    传 conv_id 时先查该对话最近一条；查不到（新开的对话窗口还没存过消息）
+    再退回全局最近一条——这样"隔了一周新开窗口"也能感知到间隔（问题2 的本意）。
+    不传 conv_id 直接查全局最近一条。
+    ts 是 SQLite 存的 UTC（CURRENT_TIMESTAMP，"YYYY-MM-DD HH:MM:SS"）。
+    """
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    try:
+        row = None
+        if conv_id:
+            row = c.execute(
+                "SELECT ts FROM l0_messages WHERE conv_id=? AND status='active' ORDER BY ts DESC LIMIT 1",
+                (conv_id,)
+            ).fetchone()
+        if not row:
+            row = c.execute(
+                "SELECT ts FROM l0_messages WHERE status='active' ORDER BY ts DESC LIMIT 1"
+            ).fetchone()
+    finally:
+        conn.close()
+    return {"last_ts": row[0] if row else None}
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "timestamp": datetime.now().isoformat()}

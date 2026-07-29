@@ -297,32 +297,77 @@ async function getProfile() {
   }
 }
 
-// 搜索记忆获取目录
-async function getMemoryMenu(userMessage) {
+// 时间感知：会话间隔感知阈值。小于这个小时数不注入间隔提示（连续对话不打断）。
+const SESSION_GAP_THRESHOLD_HOURS = 4;
+
+// 搜索记忆获取目录 + 时间感知头部
+// 头部两条动态信息（都注入 memoryMenu，不进 system 前缀，不影响 prompt caching）：
+//   1. 当前北京时间 —— 给 LLM 时间锚点，避免把历史记忆里的相对时间（"过了十一天"）
+//      误当成当前状态（问题1）。
+//   2. 会话间隔感知 —— 距上次对话多久，像朋友那样感知"好久不见"（问题2，阈值触发）。
+async function getMemoryMenu(userMessage, convId) {
+  // 1. 当前北京时间（UTC+8）。realNowMs 用真实 UTC epoch 算间隔，
+  //    shifted 仅用于拼北京时间显示串——setHours 会改 epoch，
+  //    若用 shifted.getTime() 算间隔会把每个间隔多算 8 小时。
+  const realNowMs = Date.now();
+  const shifted = new Date(realNowMs);
+  shifted.setHours(shifted.getHours() + 8);
+  const currentDateStr = shifted.toISOString().substring(0, 16).replace('T', ' ');
+
+  // 2. 距上次对话的间隔感知（阈值触发）
+  let sessionNote = '';
+  try {
+    const sessionRes = await axios.get(
+      `${MEMORY_SERVICE_URL}/last_session?conv_id=${encodeURIComponent(convId || '')}`,
+      { timeout: 3000 }
+    );
+    const lastTs = sessionRes.data.last_ts;
+    if (lastTs) {
+      // SQLite 存的是 UTC（"YYYY-MM-DD HH:MM:SS"）。空格换 T 再补 Z 才能被稳定解析成 UTC。
+      const lastDate = new Date(lastTs.replace(' ', 'T') + 'Z');
+      const gapHours = (realNowMs - lastDate.getTime()) / (1000 * 60 * 60);
+      if (gapHours >= SESSION_GAP_THRESHOLD_HOURS && gapHours < 24) {
+        sessionNote = `距上次对话约${Math.round(gapHours)}小时`;
+      } else if (gapHours >= 24 && gapHours < 24 * 7) {
+        sessionNote = `距上次对话约${Math.round(gapHours / 24)}天`;
+      } else if (gapHours >= 24 * 7) {
+        sessionNote = `距上次对话约${Math.round(gapHours / 24)}天（有段时间没见）`;
+      }
+      // < 阈值：不注入，连续对话不打断
+    }
+  } catch (e) {
+    // 查不到上次时间时静默跳过，不影响主流程
+  }
+
+  // 3. 构建头部（时间锚点 + 可选的间隔感知）
+  let header = `[当前时间：${currentDateStr}（北京时间）]`;
+  if (sessionNote) header += `\n[${sessionNote}]`;
+
+  // 4. 相关记忆检索。检索失败不影响时间锚点——仍返回头部。
+  let memories = [];
   try {
     const res = await axios.post(`${MEMORY_SERVICE_URL}/search`, {
       query: userMessage,
       mode: "semantic",
       n: 8
     });
-    
-    const memories = res.data.memories || [];
-    if (memories.length === 0) return '';
-    
-    let menu = '\n[相关记忆目录]\n';
-    for (const m of memories) {
-      const meta = m.metadata || {};
-      const core = meta.is_core ? '⭐ ' : '- ';
-      const date = meta.ts ? meta.ts.substring(0, 10) : '';
-      const type = meta.event_type || '';
-      const summary = m.l1_summary || m.content || '';
-      menu += `${core}[${date} ${type}] ${summary.substring(0, 60)}\n`;
-    }
-    return menu;
+    memories = res.data.memories || [];
   } catch (e) {
     console.error('记忆检索失败:', e.message);
-    return '';
   }
+
+  if (memories.length === 0) return header + '\n';
+
+  let menu = header + '\n[相关记忆目录]\n';
+  for (const m of memories) {
+    const meta = m.metadata || {};
+    const core = meta.is_core ? '⭐ ' : '- ';
+    const date = meta.ts ? meta.ts.substring(0, 10) : '';
+    const type = meta.event_type || '';
+    const summary = m.l1_summary || m.content || '';
+    menu += `${core}[${date} ${type}] ${summary.substring(0, 60)}\n`;
+  }
+  return menu;
 }
 
 // 执行工具调用
@@ -887,11 +932,13 @@ app.post('/v1/chat/completions', async (req, res) => {
     // 获取用户最新消息
     const lastUserMsg = [...messages].reverse().find(m => m.role === 'user');
     const userContent = lastUserMsg ? lastUserMsg.content : '';
-    
-    // 获取画像和记忆目录
+
+    // 时间感知：memoryMenu 头部要按 conv 算会话间隔，传入稳定的 conv_id
+    const convIdForMenu = resolveConvId(req);
+    // 获取画像和记忆目录（含时间锚点 + 会话间隔感知）
     const [profile, memoryMenu] = await Promise.all([
       getProfile(),
-      getMemoryMenu(userContent)
+      getMemoryMenu(userContent, convIdForMenu)
     ]);
     // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
     // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
@@ -921,7 +968,8 @@ ${profile}
       for (let i = augmentedMessages.length - 1; i >= 0; i--) {
         if (augmentedMessages[i].role !== 'user') continue;
         const m = augmentedMessages[i];
-        const menuText = `[相关记忆目录]${memoryMenu}\n\n`;
+        // memoryMenu 已自带头部（当前时间 / 会话间隔 / 相关记忆目录），直接注入，不再包一层
+        const menuText = `${memoryMenu}\n\n`;
         if (typeof m.content === 'string') {
           m.content = menuText + m.content;
         } else if (Array.isArray(m.content)) {
