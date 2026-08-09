@@ -1,4 +1,4 @@
-# Memory System v1.4
+# Memory System v1.5
 
 AI 长期记忆系统，基于 Paramecium 架构。
 
@@ -26,6 +26,17 @@ AI 长期记忆系统，基于 Paramecium 架构。
 - 工具格式归一：OpenAI 格式工具自动转 Anthropic 原生格式，兼容新版 API
 
 ## 更新日志
+- v1.5 — 重构 L1 删除/重提取：统一硬删 + 单条重提取
+  - L1 统一硬删（SQLite DELETE + ChromaDB delete）：修复原来只标 superseded
+    从不删向量、已删记忆仍被 /search 命中的问题（ai_self 感受删不掉最明显）
+  - 覆盖 delete_l1 / 批次联动 / delete_l0_conversation / delete_l0_message；
+    L0 仍保持软删（superseded）
+  - 新增 POST /l1/{id}/reextract：有 L0 关联的 L1 基于原文重新提炼→生成新 L1
+    →硬删旧 L1，新 L1 沿用旧 source_msg_id（批次锚点）/conv_id/client；
+    提取失败则旧记忆保留；ai_self（无 L0 关联）自然被拒
+  - update_l1 加存在性校验（已删 id 返 404）；/l1/list 加 has_source 字段；
+    /search 加 SQLite active 兜底校验（双保险，防残留向量）
+  - 看板：有关联的 L1 显示「重提取」按钮，ai_self 不显示
 - v1.4 — 时间感知：时间锚点 + 会话间隔感知
   - 问题1 时间锚点：每轮在 memoryMenu 头部注入「当前时间（北京时间）」，
     让 LLM 正确理解历史记忆里的相对时间是过去事件，而非当前状态
