@@ -1062,9 +1062,13 @@ ${profile}
           for (const toolUse of toolUseBlocks) {
             emitter.toolUseCard(toolUse.id, toolUse.name, toolUse.input);
             const toolResult = await executeTool(toolUse.name, toolUse.input);
-            // bug修复：卡片是 tool_use 块 → Kelivo 会创建 loading 工具块，且因为它没有该工具的
-            // onToolCall 而永不解除，hasLoadingTool 恒真 → 阻断 token 归属（显示 0 的根因）。
+            // 卡片是 tool_use 块 → Kelivo 会创建 loading 工具块，且因为它没有该工具的 onToolCall
+            // 而永不解除，hasLoadingTool 恒真 → 阻断 token 归属（显示 0 的根因）。
             // 补发一个 tool_use_id 匹配的结果块解除该 loading（Kelivo 唯一会解析成 toolResults 的流块）。
+            // Bug3：曾试过删掉这行、靠 Kelivo 本地路径解除 loading，但实测本地路径不解除（卡 loading/token 恒 0），
+            // 故保留。原污染问题（web_search_tool_result 被硬编码成 search_web、按 tool_use_id 覆盖真实工具名，
+            // 导致重进窗口工具卡片变"联网搜索"）已在 Kelivo 侧修复：解析 web_search_tool_result 时按
+            // tool_use_id 取回真实工具名（如 recall），不再污染持久化事件。
             emitter.toolResolve(toolUse.id, toolResult);
             toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
           }
