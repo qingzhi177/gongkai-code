@@ -1,4 +1,4 @@
-# Memory System v1.3
+# Memory System v1.4
 
 AI 长期记忆系统，基于 Paramecium 架构。
 
@@ -26,6 +26,17 @@ AI 长期记忆系统，基于 Paramecium 架构。
 - 工具格式归一：OpenAI 格式工具自动转 Anthropic 原生格式，兼容新版 API
 
 ## 更新日志
+- v1.4 — 时间感知：时间锚点 + 会话间隔感知
+  - 问题1 时间锚点：每轮在 memoryMenu 头部注入「当前时间（北京时间）」，
+    让 LLM 正确理解历史记忆里的相对时间是过去事件，而非当前状态
+  - 问题2 会话间隔感知：注入「距上次对话约N小时/天」（阈值 4 小时触发，
+    连续对话不打断）；memory-service 新增 GET /last_session 接口
+  - 时间感知信息注入 memoryMenu（不进 system 前缀），不影响 prompt caching
+  - L1 提取规则：不再写相对时间描述（「过了十一天」），时间感知交给系统注入
+  - 附带修复：会话间隔计算的 8 小时偏移（间隔用真实 UTC epoch，+8 仅用于显示串）
+  - Bug3 排查结论：工具卡片重进窗口变「联网搜索」的污染源在 kelivo 侧
+    （web_search_tool_result 被硬编码成 search_web），已于 kelivo 侧按
+    tool_use_id 取回真实工具名修复；网关侧保留 toolResolve（负责解除 loading）
 - v1.3 — 第二阶段：Token usage 透传、上下文缓存优化、Dashboard 多供应商配置、联网搜索
   - 功能4 Token usage 透传（流式/非流式，跨轮累加）
   - 功能5 Prompt caching（稳定 system 前缀带缓存断点，memoryMenu 移出 system）
