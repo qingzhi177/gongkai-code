@@ -321,6 +321,8 @@
                 html += '<button class="btn btn-small" onclick="toggleCore(' + m.id + ',' + (m.is_core||0) + ')">' + (m.is_core ? '取消核心' : '标记核心') + '</button> ';
                 html += '<button class="btn btn-small" onclick="editTags(' + m.id + ')">编辑标签</button> ';
                 html += '<button class="btn btn-small" onclick="changeType(' + m.id + ')">改类型</button> ';
+                // 重构：有 L0 关联（has_source）才可重提取；ai_self 感受无关联，不显示
+                if (m.has_source) html += '<button class="btn btn-small" style="background:#34c759;" onclick="reextractL1(' + m.id + ')">重提取</button> ';
                 html += '<button class="btn btn-small btn-danger" onclick="deleteL1(' + m.id + ')">删除</button>';
                 html += '</div>';
             });
@@ -382,6 +384,22 @@
         function deleteL1(id) {
             if (!confirm('确定删除？')) return;
             fetch(API + '/l1/' + id, { method: 'DELETE' }).then(function() { loadL1('all'); });
+        }
+
+        // 重构：单条重提取。基于关联 L0 原文重新提炼 → 生成新 L1 → 硬删旧 L1。
+        function reextractL1(id) {
+            if (!confirm('基于原文重新提取这条记忆？旧记忆会被替换。')) return;
+            fetch(API + '/l1/' + id + '/reextract', { method: 'POST' })
+                .then(function(r) { return r.json().then(function(d){ return {ok: r.ok, d: d}; }); })
+                .then(function(res) {
+                    if (!res.ok || res.d.status === 'error') {
+                        alert('重提取失败：' + (res.d.detail || '未知错误'));
+                        return;
+                    }
+                    if (res.d.warning) alert('已重提取（有警告）：' + res.d.warning);
+                    loadL1('all');
+                })
+                .catch(function(e) { alert('重提取失败：' + e); });
         }
 
         function loadProfile() {

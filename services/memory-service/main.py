@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from typing import List, Optional
 import chromadb
@@ -314,6 +315,18 @@ async def search_memories(req: SearchRequest):
             # 获取 L1 内容和元数据
             l1_id_str = mid.replace("l1_", "")
 
+            # 重构：active 兜底校验（双保险）。L1 已改硬删，但若 ChromaDB 删向量失败
+            # 留下残留向量，仅靠向量检索仍可能命中。这里用 SQLite 核对该 L1 是否 active，
+            # 不是（已删/不存在）就跳过，保证删掉的记忆一定搜不出来。
+            try:
+                _row = conn.execute(
+                    "SELECT status FROM l1_memories WHERE id=?", (l1_id_str,)
+                ).fetchone()
+            except Exception:
+                _row = None
+            if not _row or _row[0] != 'active':
+                continue
+
             # 从 ChromaDB 获取元数据
             try:
                 chroma_result = l1_collection.get(ids=[mid], include=["documents", "metadatas"])
@@ -457,9 +470,9 @@ def _cascade_l1_on_version_switch(c, conv_id, superseded_old_ids):
             "SELECT id FROM l1_memories WHERE conv_id=? AND source_msg_id=? AND status='active'",
             (conv_id, batch_sid))
         l1_ids_to_purge.extend(row[0] for row in c.fetchall())
-        # 作废这批 L1
+        # 硬删这批 L1（重构：L1 统一硬删；批次定位逻辑不变，仍返回 id 列表给调用方删向量）
         c.execute(
-            "UPDATE l1_memories SET status='superseded' "
+            "DELETE FROM l1_memories "
             "WHERE conv_id=? AND source_msg_id=? AND status='active'",
             (conv_id, batch_sid))
         # 让这批 id 区间内的 active L0 重提取（被改消息旧行已 superseded，不会命中）
@@ -735,12 +748,12 @@ async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offse
     c = conn.cursor()
     if event_type:
         c.execute(
-            'SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client FROM l1_memories WHERE status=? AND event_type=? ORDER BY ts DESC LIMIT ? OFFSET ?',
+            'SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client, source_msg_id FROM l1_memories WHERE status=? AND event_type=? ORDER BY ts DESC LIMIT ? OFFSET ?',
             ('active', event_type, limit, offset)
         )
     else:
         c.execute(
-            'SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client FROM l1_memories WHERE status=? ORDER BY ts DESC LIMIT ? OFFSET ?',
+            'SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client, source_msg_id FROM l1_memories WHERE status=? ORDER BY ts DESC LIMIT ? OFFSET ?',
             ('active', limit, offset)
         )
     rows = c.fetchall()
@@ -753,7 +766,9 @@ async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offse
             "id": row[0], "content": row[1], "quote": row[2],
             "event_type": row[3], "tags": row[4], "valence": row[5],
             "arousal": row[6], "is_core": row[7], "access_count": row[8],
-            "ts": row[9], "client": row[10]
+            "ts": row[9], "client": row[10],
+            # 重构：有关联 L0（source_msg_id 非空）才可重提取；ai_self 的为 NULL → False
+            "has_source": row[11] is not None
         })
     return {"memories": memories, "total": total}
 
@@ -770,9 +785,16 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
     修复4：支持修改 content。content 变化时，除更新 SQLite 外，
     还要重新生成 embedding 并同步 ChromaDB 的向量和文档，
     否则 recall 向量检索仍会命中旧内容。
+
+    重构：L1 改硬删后，编辑前先校验该 id 存在且 status='active'，
+    否则返回 404（防止对已删 id 编辑还返回 ok）。
     """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
+    exists = c.execute("SELECT status FROM l1_memories WHERE id=?", (memory_id,)).fetchone()
+    if not exists or exists[0] != 'active':
+        conn.close()
+        return JSONResponse(status_code=404, content={"status": "error", "detail": "L1 记忆不存在或已删除"})
     updates = []
     params = []
     if req.tags is not None:
@@ -814,13 +836,153 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
 
 @app.delete("/l1/{memory_id}")
 async def delete_l1(memory_id: int):
-    """删除 L1 记忆（标记为 superseded）"""
+    """硬删 L1 记忆：SQLite DELETE + ChromaDB delete。
+
+    重构：原来只标记 superseded，向量从不删 → 已删记忆仍被 /search 向量检索命中。
+    ai_self 感受（conv_id=''、source_msg_id=NULL）只有这条删除路径，问题最明显。
+    现改硬删。SQLite 先提交，再删向量；ChromaDB 失败返回 warning 不回滚
+    （与 /search 的 active 兜底校验配合，残留向量也搜不出来）。
+    """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    c.execute('UPDATE l1_memories SET status=? WHERE id=?', ('superseded', memory_id))
+    c.execute('DELETE FROM l1_memories WHERE id=?', (memory_id,))
     conn.commit()
     conn.close()
+    try:
+        l1_collection.delete(ids=[f"l1_{memory_id}"])
+    except Exception as e:
+        print(f"ChromaDB 删除失败 l1_{memory_id}: {e}")
+        return {"status": "ok", "warning": f"SQLite已删但向量清除失败: {e}"}
     return {"status": "ok"}
+
+@app.post("/l1/{memory_id}/reextract")
+async def reextract_l1(memory_id: int):
+    """单条重提取：有 L0 关联的 L1 基于原文重新提炼 → 生成新 L1 → 硬删旧 L1。
+
+    约束（不允许"旧删了新没生成"的中间态）：
+    - 先校验 + 调 DeepSeek 提取，提取失败/为空 → 直接返回 error，旧 L1 原样保留。
+    - 成功拿到新记忆后，SQLite 事务内「插新 + 删旧」一起提交，再写/删 ChromaDB。
+    新 L1 必须沿用旧 L1 的 source_msg_id（批次锚点，绝不能丢）、conv_id、client；
+    ts 用 L0 原文时间；quote/event_type/tags/valence/arousal 用新提取结果。
+    ai_self（source_msg_id=NULL）会被 source_msg_id 校验自然拒绝。
+    """
+    # 复用 cron 提取管线的 prompt 和 DeepSeek 调用（懒加载，避免 import 时的连接副作用）
+    from extract_l1 import EXTRACT_PROMPT, call_deepseek
+
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    try:
+        row = c.execute(
+            "SELECT content, source_msg_id, conv_id, client, status FROM l1_memories WHERE id=?",
+            (memory_id,)
+        ).fetchone()
+        if not row:
+            conn.close()
+            return JSONResponse(status_code=404, content={"status": "error", "detail": "L1 记忆不存在"})
+        old_content, source_id, conv_id, client, status = row
+        if status != 'active':
+            conn.close()
+            return JSONResponse(status_code=404, content={"status": "error", "detail": "L1 记忆已删除"})
+        if not source_id:
+            conn.close()
+            return JSONResponse(status_code=400,
+                                content={"status": "error", "detail": "该记忆无 L0 关联（如 ai_self 感受），不能重提取，只能编辑或删除"})
+
+        # 取 L0 上下文（参考 get_l0_context：source_msg_id 前后各几条 active 消息），用 [你]/[我] 标注
+        ctx_rows = c.execute(
+            "SELECT role, content, ts FROM l0_messages "
+            "WHERE conv_id=? AND status='active' AND id BETWEEN ? AND ? ORDER BY id ASC",
+            (conv_id, max(0, source_id - 3), source_id + 5)
+        ).fetchall()
+        # 新 L1 的时间戳：用 source_msg_id 那条 L0 的原文时间（对话发生时间，非提取时间）
+        src_ts_row = c.execute("SELECT ts FROM l0_messages WHERE id=?", (source_id,)).fetchone()
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=500, content={"status": "error", "detail": f"读取失败: {e}"})
+
+    if not ctx_rows:
+        conn.close()
+        return JSONResponse(status_code=400, content={"status": "error", "detail": "找不到关联的 L0 原文（可能已删除）"})
+
+    # 拼提取文本（与 extract_l1 的格式一致：[你]/[我]），并附带旧记忆要求只提炼这一条
+    convo = ""
+    for role, content, _ts in ctx_rows:
+        prefix = "你" if role == "user" else "我"
+        convo += f"[{prefix}] {content}\n"
+    reextract_hint = (
+        f"\n（重提取任务：请只基于以上对话原文，重新提炼下面这条旧记忆对应的内容，"
+        f"严格只输出一条记忆。旧记忆内容：{old_content}）\n"
+    )
+    # call_deepseek 内部会拼上 EXTRACT_PROMPT；这里传"对话 + 重提取说明"作为正文
+    try:
+        memories = call_deepseek(convo + reextract_hint)
+    except Exception as e:
+        conn.close()
+        return JSONResponse(status_code=502, content={"status": "error", "detail": f"DeepSeek 提取失败: {e}"})
+    if not memories:
+        conn.close()
+        return JSONResponse(status_code=422,
+                            content={"status": "error", "detail": "重提取未产生记忆，旧记忆已保留（未删除）"})
+    new_mem = memories[0]  # 只取一条
+
+    new_ts = (src_ts_row[0] if src_ts_row and src_ts_row[0] else datetime.now().isoformat())
+    tags_json = json.dumps(new_mem.get("tags", []), ensure_ascii=False)
+
+    # SQLite 事务：插新 + 删旧一起提交（原子），成功后再写/删 ChromaDB
+    try:
+        c.execute(
+            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status, ts) '
+            'VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            (new_mem["content"], new_mem.get("quote", ""), source_id, conv_id, client,
+             new_mem.get("event_type", "general"), tags_json,
+             new_mem.get("valence"), new_mem.get("arousal"), 'active', new_ts)
+        )
+        new_id = c.lastrowid
+        c.execute('DELETE FROM l1_memories WHERE id=?', (memory_id,))
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        return JSONResponse(status_code=500, content={"status": "error", "detail": f"落库失败，旧记忆已保留: {e}"})
+    finally:
+        conn.close()
+
+    # ChromaDB：写新向量 + 删旧向量。失败不回滚 SQLite（与 active 兜底校验配合），返回 warning。
+    warning = None
+    embedding = await get_embedding(new_mem["content"])
+    if embedding:
+        try:
+            l1_collection.add(
+                ids=[f"l1_{new_id}"],
+                embeddings=[embedding],
+                documents=[new_mem["content"]],
+                metadatas=[{
+                    "ts": new_ts,
+                    "event_type": new_mem.get("event_type", "general"),
+                    "tags": tags_json,
+                    "quote": new_mem.get("quote", ""),
+                    "conv_id": conv_id,
+                    "client": client,
+                    "is_core": 0,
+                    "valence": new_mem.get("valence") or 0,
+                    "arousal": new_mem.get("arousal") or 0
+                }]
+            )
+        except Exception as e:
+            warning = f"新 L1 已入库但向量写入失败: {e}"
+    else:
+        warning = "新 L1 已入库但 embedding 生成失败，向量未写入"
+    try:
+        l1_collection.delete(ids=[f"l1_{memory_id}"])
+    except Exception as e:
+        warning = (warning + "; " if warning else "") + f"旧向量清除失败: {e}"
+
+    resp = {"status": "ok", "new_id": new_id, "old_id": memory_id,
+            "content": new_mem["content"], "quote": new_mem.get("quote", ""),
+            "event_type": new_mem.get("event_type", "general"), "source_msg_id": source_id}
+    if warning:
+        resp["warning"] = warning
+    return resp
 
 class UpdateTimestampRequest(BaseModel):
     ts: str
@@ -878,18 +1040,18 @@ async def delete_l0_message(msg_id: int):
 async def delete_l0_conversation(conv_id: str):
     """删除整个对话（修复6/8：联动清除 L1 + ChromaDB 向量）
 
-    原来只标记 L0 superseded，对应的 L1 记忆和向量还在，会被 recall 搜到。
-    现在同时软删该对话下的 L1，并从 ChromaDB 删掉对应向量。
+    重构：L1 从软删（superseded）改为硬删（DELETE）。L0 仍保持软删。
+    先收集该对话下 active L1 的 id，DELETE 后再删对应向量。
     """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     # 1. 查出该 conv_id 下所有 active L1 的 id（删向量要用）
     c.execute("SELECT id FROM l1_memories WHERE conv_id=? AND status='active'", (conv_id,))
     l1_ids = [row[0] for row in c.fetchall()]
-    # 2. 标记 L0 superseded
+    # 2. 标记 L0 superseded（L0 仍软删）
     c.execute('UPDATE l0_messages SET status=? WHERE conv_id=?', ('superseded', conv_id))
-    # 3. 标记 L1 superseded
-    c.execute("UPDATE l1_memories SET status='superseded' WHERE conv_id=? AND status='active'", (conv_id,))
+    # 3. 硬删该对话下的 active L1
+    c.execute("DELETE FROM l1_memories WHERE conv_id=? AND status='active'", (conv_id,))
     conn.commit()
     conn.close()
     # 4. 从 ChromaDB 删除对应向量
@@ -898,7 +1060,7 @@ async def delete_l0_conversation(conv_id: str):
             l1_collection.delete(ids=[f"l1_{i}" for i in l1_ids])
         except Exception as e:
             print(f"ChromaDB 删除失败 (conv_id={conv_id}): {e}")
-            return {"status": "ok", "l1_removed": len(l1_ids), "warning": f"L1已软删但向量清除失败: {e}"}
+            return {"status": "ok", "l1_removed": len(l1_ids), "warning": f"L1已硬删但向量清除失败: {e}"}
     return {"status": "ok", "l1_removed": len(l1_ids)}
 
 # ============ 功能6：供应商模型配置（CRUD + 加密） ============
