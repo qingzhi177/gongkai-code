@@ -255,7 +255,14 @@
                 <button class="btn" onclick="generateNarrative()">生成/更新叙事</button>
                 <button class="btn" onclick="editNarrative()" style="background:#28a745;">编辑</button>
                 <button class="btn" onclick="loadNarrativeHistory()" style="background:#6c757d;">查看历史</button>
+                <button class="btn" onclick="toggleNarrativeObservatory()" style="background:#17a2b8;">Observatory</button>
                 <span id="narrative-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div id="narrative-observatory" style="display:none;margin-bottom:15px;padding:12px;background:#f8f9fa;border-radius:6px;font-size:13px;">
+                <div style="margin-bottom:8px;"><strong>更新原因：</strong><span id="observatory-reason">-</span></div>
+                <div style="margin-bottom:8px;"><strong>演化模式：</strong><span id="observatory-mode">-</span></div>
+                <div style="margin-bottom:8px;"><strong>消费记忆数：</strong><span id="observatory-l1-count">-</span></div>
+                <div><strong>来源记忆 ID：</strong><span id="observatory-l1-ids" style="font-family:monospace;font-size:12px;">-</span></div>
             </div>
             <div class="narrative-content" id="narrative-content">
                 暂无内容
@@ -268,7 +275,13 @@
             <div style="margin:15px 0;">
                 <button class="btn" onclick="generateSummary()">生成摘要</button>
                 <button class="btn" onclick="editSummary()" style="background:#28a745;">编辑</button>
+                <button class="btn" onclick="toggleSummaryObservatory()" style="background:#17a2b8;">Observatory</button>
                 <span id="summary-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div id="summary-observatory" style="display:none;margin-bottom:15px;padding:12px;background:#f8f9fa;border-radius:6px;font-size:13px;">
+                <div style="margin-bottom:8px;"><strong>自动更新：</strong><span id="observatory-auto-status">-</span></div>
+                <div style="margin-bottom:8px;"><strong>下次更新预计：</strong><span id="observatory-next-update">-</span></div>
+                <div><strong>阈值进度：</strong><span id="observatory-threshold-progress">-</span></div>
             </div>
             <div class="summary-content" id="summary-content" style="margin-bottom:20px;">
                 暂无摘要
@@ -916,12 +929,36 @@
                         '<strong>最后更新：</strong>' + formatTime(d.ts) + ' · ' +
                         '<strong>触发方式：</strong>' + (d.trigger_type === 'manual' ? '手动' : '自动');
                     document.getElementById('narrative-content').textContent = d.content;
+
+                    // 填充 Observatory 数据
+                    if (d.trigger_details) {
+                        try {
+                            var details = JSON.parse(d.trigger_details);
+                            document.getElementById('observatory-reason').textContent = details.reason || '-';
+                            document.getElementById('observatory-mode').textContent =
+                                details.mode === 'full' ? '全量生成' :
+                                details.mode === 'incremental' ? '增量演化' : '-';
+                            document.getElementById('observatory-l1-count').textContent = details.l1_count || 0;
+                            if (details.l1_ids && details.l1_ids.length > 0) {
+                                document.getElementById('observatory-l1-ids').textContent = details.l1_ids.join(', ');
+                            } else {
+                                document.getElementById('observatory-l1-ids').textContent = '-';
+                            }
+                        } catch (e) {
+                            console.error('Parse trigger_details failed:', e);
+                        }
+                    }
                 } else {
                     currentNarrativeId = null;
                     document.getElementById('narrative-meta').textContent = '暂无叙事';
                     document.getElementById('narrative-content').textContent = '点击"生成/更新叙事"按钮开始创建共同经历叙事。';
                 }
             });
+        }
+
+        function toggleNarrativeObservatory() {
+            var elem = document.getElementById('narrative-observatory');
+            elem.style.display = elem.style.display === 'none' ? 'block' : 'none';
         }
 
         function generateNarrative() {
@@ -1036,6 +1073,45 @@
                 document.getElementById('summary-max-turns').value = d.summary_max_turns;
                 document.getElementById('summary-max-tokens').value = d.summary_max_tokens;
             });
+
+            // 加载 Observatory 数据
+            loadSummaryObservatory();
+        }
+
+        function loadSummaryObservatory() {
+            fetch(API + '/auto/status').then(function(r) { return r.json(); }).then(function(d) {
+                var summaryData = d.summary || {};
+                var config = d.config || {};
+
+                // 自动更新状态
+                var autoEnabled = config.auto_update_enabled === 1;
+                document.getElementById('observatory-auto-status').textContent = autoEnabled ? '已启用' : '已禁用';
+                document.getElementById('observatory-auto-status').style.color = autoEnabled ? '#28a745' : '#999';
+
+                // 下次更新预计
+                if (d.next_check_at) {
+                    document.getElementById('observatory-next-update').textContent = '定时检查 ' + formatTime(d.next_check_at);
+                } else {
+                    document.getElementById('observatory-next-update').textContent = '-';
+                }
+
+                // 阈值进度
+                var newL0 = summaryData.new_l0 || 0;
+                var thresholdTurns = config.check_threshold_turns || 50;
+                var progress = Math.floor((newL0 / thresholdTurns) * 100);
+                document.getElementById('observatory-threshold-progress').innerHTML =
+                    newL0 + ' / ' + thresholdTurns + ' 轮对话 (' + progress + '%)';
+            }).catch(function(e) {
+                console.error('Load summary observatory failed:', e);
+            });
+        }
+
+        function toggleSummaryObservatory() {
+            var elem = document.getElementById('summary-observatory');
+            elem.style.display = elem.style.display === 'none' ? 'block' : 'none';
+            if (elem.style.display === 'block') {
+                loadSummaryObservatory();
+            }
         }
 
         function editSummary() {

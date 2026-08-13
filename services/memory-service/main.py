@@ -1328,7 +1328,7 @@ async def get_current_narrative():
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     row = c.execute(
-        "SELECT id, content, version, trigger_type, ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+        "SELECT id, content, version, trigger_type, trigger_details, ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
     ).fetchone()
     conn.close()
     if not row:
@@ -1339,7 +1339,8 @@ async def get_current_narrative():
         "content": row[1],
         "version": row[2],
         "trigger_type": row[3],
-        "ts": row[4]
+        "trigger_details": row[4],
+        "ts": row[5]
     }
 
 @app.get("/narrative/history")
