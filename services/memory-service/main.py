@@ -14,10 +14,47 @@ import jieba
 from rank_bm25 import BM25Okapi
 from cryptography.fernet import Fernet
 import json
+import asyncio
+from contextlib import asynccontextmanager
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 load_dotenv()
 
-app = FastAPI(title="Memory Service")
+scheduler = AsyncIOScheduler()
+
+# 自动检查间隔（分钟）。可用环境变量覆盖，便于测试时缩短。
+AUTO_CHECK_INTERVAL_MIN = float(os.getenv("AUTO_CHECK_INTERVAL_MIN", 10))
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """启动时挂载自动检查任务，关闭时停止调度器。
+
+    FastAPI 0.138 已废弃 @app.on_event，改用 lifespan。
+    """
+    scheduler.add_job(
+        check_and_update_summary,
+        IntervalTrigger(minutes=AUTO_CHECK_INTERVAL_MIN),
+        id="check_summary",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.add_job(
+        check_and_update_narrative,
+        IntervalTrigger(minutes=AUTO_CHECK_INTERVAL_MIN),
+        id="check_narrative",
+        max_instances=1,
+        coalesce=True,
+    )
+    scheduler.start()
+    print(f"[SCHEDULER] 自动检查任务已启动（间隔 {AUTO_CHECK_INTERVAL_MIN} 分钟）")
+    try:
+        yield
+    finally:
+        scheduler.shutdown(wait=False)
+        print("[SCHEDULER] 自动检查任务已停止")
+
+app = FastAPI(title="Memory Service", lifespan=lifespan)
 
 # 功能6：配置加密。CONFIG_SECRET_KEY 用于加密存储 API Key（Fernet 对称加密）。
 _config_secret = os.getenv("CONFIG_SECRET_KEY")
@@ -145,6 +182,16 @@ def init_db():
         enabled INTEGER DEFAULT 1,
         ts DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
+    # 配置行必须存在，否则自动检查读不到配置会静默跳过
+    c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
+    # 增量水位线：记录生成时已消费到的最大 id。
+    # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
+    # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
+    for table, col in (("shared_narrative", "last_l1_id"), ("recent_summary", "last_l0_id")):
+        cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
+        if col not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0")
+            print(f"[MIGRATE] {table}.{col} 已添加")
     conn.commit()
     conn.close()
 
@@ -1337,6 +1384,11 @@ async def generate_narrative(req: NarrativeGenerateRequest):
             "SELECT content, quote, ts FROM l1_memories WHERE status='active' AND arousal >= 0.5 ORDER BY ts DESC LIMIT 30"
         ).fetchall()
 
+        # 水位线取当前最大重要 L1 id（同 summary，避免 ts 截断导致反复触发）
+        new_watermark = c.execute(
+            f"SELECT COALESCE(MAX(id), 0) FROM l1_memories WHERE {IMPORTANT_L1_WHERE}"
+        ).fetchone()[0]
+
         conn.close()
 
         # 3. 获取 narrative 模型配置
@@ -1366,8 +1418,9 @@ async def generate_narrative(req: NarrativeGenerateRequest):
 
         # 插入新版本
         c.execute(
-            "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status) VALUES (?, ?, ?, ?, 'active')",
-            (new_narrative, new_version, req.trigger_type, json.dumps({"timestamp": datetime.now().isoformat()}))
+            "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) VALUES (?, ?, ?, ?, 'active', ?)",
+            (new_narrative, new_version, req.trigger_type,
+             json.dumps({"timestamp": datetime.now().isoformat()}), new_watermark)
         )
 
         conn.commit()
@@ -1437,6 +1490,12 @@ async def generate_summary():
             (max_turns,)
         ).fetchall()
 
+        # 水位线取「当前最大 l0 id」而非入选消息的最大 id：入选是按 ts 截断的，
+        # 若只记入选范围，那些 id 更大但 ts 更早的消息会永远算作增量，导致反复触发。
+        new_watermark = c.execute(
+            "SELECT COALESCE(MAX(id), 0) FROM l0_messages WHERE status='active'"
+        ).fetchone()[0]
+
         conn.close()
 
         if not messages:
@@ -1467,8 +1526,8 @@ async def generate_summary():
         period_end = messages[0][2] if messages else None
 
         c.execute(
-            "INSERT INTO recent_summary (content, period_start, period_end, msg_count, status) VALUES (?, ?, ?, ?, 'active')",
-            (summary_content, period_start, period_end, len(messages))
+            "INSERT INTO recent_summary (content, period_start, period_end, msg_count, status, last_l0_id) VALUES (?, ?, ?, ?, 'active', ?)",
+            (summary_content, period_start, period_end, len(messages), new_watermark)
         )
 
         conn.commit()
@@ -1549,8 +1608,123 @@ async def update_summary_config(req: SummaryConfigUpdate):
     conn.close()
     return {"status": "ok"}
 
-# ========== 继续标记 ==========
-# CONTINUATION_MARKER_1
+# ============ 自动检查与触发 ============
+
+# 「重要记忆」判定：is_core 由人工/后续流程标记，arousal 由提取时的提示词
+# 要求「情感浓度高的对话标注 arousal >= 0.6」，两者取并集。
+IMPORTANT_L1_WHERE = "status='active' AND (is_core=1 OR arousal >= 0.6)"
+
+# 生成期间串行化，避免上一轮 LLM 还没返回就被下一轮检查重复触发
+_auto_lock = asyncio.Lock()
+
+def read_auto_config():
+    """读取自动更新配置。每轮现读，改配置无需重启服务。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1 FROM narrative_config WHERE id=1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"enabled": row[0], "threshold_turns": row[1], "threshold_l1": row[2]}
+
+def get_summary_pending():
+    """返回（上次摘要水位线, 距上次摘要新增的消息数）。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT last_l0_id FROM recent_summary WHERE status='active' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    watermark = (row[0] or 0) if row else 0
+    new_count = c.execute(
+        "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND id > ?", (watermark,)
+    ).fetchone()[0]
+    conn.close()
+    return watermark, new_count
+
+def get_narrative_pending():
+    """返回（上次叙事水位线, 距上次叙事新增的重要 L1 数）。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT last_l1_id FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    watermark = (row[0] or 0) if row else 0
+    new_count = c.execute(
+        f"SELECT COUNT(*) FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ?", (watermark,)
+    ).fetchone()[0]
+    conn.close()
+    return watermark, new_count
+
+async def check_and_update_summary():
+    """达到轮数阈值时自动滚动 Recent Summary。"""
+    try:
+        config = read_auto_config()
+        if not config or config["enabled"] != 1:
+            return
+        watermark, new_count = get_summary_pending()
+        threshold = config["threshold_turns"]
+        if new_count < threshold:
+            print(f"[AUTO] Summary 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）", flush=True)
+            return
+        async with _auto_lock:
+            print(f"[AUTO] 触发 Summary 更新：新增 {new_count} 条消息（阈值 {threshold}）", flush=True)
+            result = await generate_summary()
+            print(f"[AUTO] Summary 结果：{result.get('status')} {result.get('message', '')}")
+    except Exception as e:
+        print(f"[AUTO] Summary 检查异常：{e}", flush=True)
+
+async def check_and_update_narrative():
+    """达到重要 L1 阈值时自动演化 Shared Narrative。"""
+    try:
+        config = read_auto_config()
+        if not config or config["enabled"] != 1:
+            return
+        watermark, new_count = get_narrative_pending()
+        threshold = config["threshold_l1"]
+        if new_count < threshold:
+            print(f"[AUTO] Narrative 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）", flush=True)
+            return
+        async with _auto_lock:
+            print(f"[AUTO] 触发 Narrative 更新：新增 {new_count} 条重要记忆（阈值 {threshold}）", flush=True)
+            result = await generate_narrative(NarrativeGenerateRequest(trigger_type="auto"))
+            print(f"[AUTO] Narrative 结果：{result.get('status')} {result.get('message', '')}")
+    except Exception as e:
+        print(f"[AUTO] Narrative 检查异常：{e}", flush=True)
+
+@app.get("/auto/status")
+async def get_auto_status():
+    """自动更新状态：当前进度、距阈值差多少、下次检查时间。"""
+    config = read_auto_config() or {"enabled": 0, "threshold_turns": 0, "threshold_l1": 0}
+    s_watermark, s_new = get_summary_pending()
+    n_watermark, n_new = get_narrative_pending()
+    job = scheduler.get_job("check_summary")
+    next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
+    return {
+        "enabled": config["enabled"],
+        "interval_minutes": AUTO_CHECK_INTERVAL_MIN,
+        "next_check": next_run,
+        "summary": {
+            "last_l0_id": s_watermark,
+            "new_messages": s_new,
+            "threshold": config["threshold_turns"],
+            "remaining": max(0, config["threshold_turns"] - s_new),
+        },
+        "narrative": {
+            "last_l1_id": n_watermark,
+            "new_important_l1": n_new,
+            "threshold": config["threshold_l1"],
+            "remaining": max(0, config["threshold_l1"] - n_new),
+        },
+    }
+
+@app.post("/auto/check_now")
+async def trigger_auto_check():
+    """立即跑一次检查，测试用（不绕过阈值判断）。"""
+    await check_and_update_summary()
+    await check_and_update_narrative()
+    return {"status": "ok", "message": "检查已执行，详见服务日志"}
 
 # ============ L1 Extraction Status API ============
 
@@ -1779,26 +1953,64 @@ async def build_narrative_prompt(existing_narrative: str, core_memories: list, r
 
 请生成更新后的叙事（markdown格式）："""
 
-    # 构建记忆列表
+    # 构建记忆列表（带时间戳，构成时间线骨架）
     memory_text = "### 核心记忆\n"
     for m in core_memories:
-        memory_text += f"- {m[0]}\n"
+        ts_date = m[2][:10] if m[2] else "未知时间"
+        memory_text += f"- [{ts_date}] {m[0]}\n"
         if m[1]:
             memory_text += f"  > {m[1]}\n"
 
     memory_text += "\n### 最近记忆\n"
     for m in recent_memories[:20]:  # 限制数量
-        memory_text += f"- {m[0]}\n"
+        ts_date = m[2][:10] if m[2] else "未知时间"
+        memory_text += f"- [{ts_date}] {m[0]}\n"
 
-    prompt = template.replace("{existing}", existing_narrative or "（首次生成）")
-    prompt = prompt.replace("{memories}", memory_text)
+    existing_text = existing_narrative or "（首次生成）"
+
+    # 模板含占位符则替换；否则把数据段追加到模板后 —— 用户手写的
+    # Narrative生成提示词.md 没有占位符，只靠 replace 会让 LLM 拿不到记忆，
+    # 回复「请把对话内容发给我」。
+    if "{existing}" in template and "{memories}" in template:
+        prompt = template.replace("{existing}", existing_text)
+        prompt = prompt.replace("{memories}", memory_text)
+    else:
+        prompt = (
+            f"{template}\n\n---\n\n## 现有叙事\n{existing_text}\n\n"
+            f"## 新增记忆\n{memory_text}\n\n"
+            "请直接输出更新后的完整叙事（markdown 格式），不要输出任何说明或询问。"
+        )
 
     return prompt
 
 async def call_llm_for_narrative(config: dict, prompt: str) -> str:
     """调用 LLM 生成 Narrative"""
+    return await call_llm(config, prompt, max_tokens=4000)
+
+async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
+    """通用 LLM 调用。claude 系列走 Anthropic 原生 /messages（与网关约定一致，
+    部分中转的令牌不开放 OpenAI 兼容端点），其余走 /chat/completions。"""
     try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=300.0) as client:
+            if config['model'].startswith("claude"):
+                response = await client.post(
+                    f"{config['base_url']}/messages",
+                    headers={
+                        "x-api-key": config['api_key'],
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": config['model'],
+                        "messages": [{"role": "user", "content": prompt}],
+                        "max_tokens": max_tokens
+                    }
+                )
+                response.raise_for_status()
+                return "".join(
+                    block.get("text", "") for block in response.json()["content"]
+                    if block.get("type") == "text"
+                )
             response = await client.post(
                 f"{config['base_url']}/chat/completions",
                 headers={
@@ -1808,11 +2020,14 @@ async def call_llm_for_narrative(config: dict, prompt: str) -> str:
                 json={
                     "model": config['model'],
                     "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 4000
+                    "max_tokens": max_tokens
                 }
             )
             response.raise_for_status()
             return response.json()["choices"][0]["message"]["content"]
+    except httpx.HTTPStatusError as e:
+        print(f"LLM call error: {e} body={e.response.text[:300]}")
+        return None
     except Exception as e:
         print(f"LLM call error: {e}")
         return None
@@ -1840,25 +2055,7 @@ def build_summary_prompt(messages: list) -> str:
 
 async def call_llm_for_summary(config: dict, prompt: str) -> str:
     """调用 LLM 生成 Summary"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(
-                f"{config['base_url']}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config['api_key']}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": config['model'],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": 1000
-                }
-            )
-            response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
-    except Exception as e:
-        print(f"LLM call error: {e}")
-        return None
+    return await call_llm(config, prompt, max_tokens=1000)
 
 # Dashboard 静态文件路由
 DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
