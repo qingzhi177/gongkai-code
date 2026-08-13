@@ -1362,42 +1362,54 @@ async def get_narrative_history(limit: int = 10):
 class NarrativeGenerateRequest(BaseModel):
     trigger_type: str = "manual"
     force: bool = False
+    reason: Optional[str] = None
+
+# 单次演化最多消费的重要记忆条数。超出的留给下一轮（水位线只推进到
+# 本次实际消费的最大 id），避免一次生成 prompt 过长。
+NARRATIVE_BATCH_LIMIT = 60
 
 @app.post("/narrative/generate")
 async def generate_narrative(req: NarrativeGenerateRequest):
-    """生成 Shared Narrative"""
+    """生成/增量演化 Shared Narrative。
+
+    更新检查周期.md：existing narrative + new important memories = updated
+    narrative。已有叙事时只消费水位线之后的新增重要记忆，往后续写；
+    没有新增则跳过（force=true 强制用全部重要记忆重写）。
+    """
     try:
-        # 1. 获取现有 narrative
+        # 1. 获取现有 narrative 及其水位线
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
         existing = c.execute(
-            "SELECT content FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+            "SELECT content, last_l1_id FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
         ).fetchone()
         existing_narrative = existing[0] if existing else ""
+        watermark = (existing[1] or 0) if existing else 0
 
-        # 2. 获取重要的 L1 记忆（核心记忆 + 最近的高唤醒记忆）
-        core_memories = c.execute(
-            "SELECT content, quote, ts FROM l1_memories WHERE status='active' AND is_core=1 ORDER BY ts DESC LIMIT 20"
+        full_rewrite = req.force or not existing_narrative
+        if full_rewrite:
+            watermark = 0
+            existing_narrative = "" if req.force else existing_narrative
+
+        # 2. 只取上次生成后新增的重要记忆，按 id 正序（≈提取顺序）
+        new_memories = c.execute(
+            f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
+            (watermark, NARRATIVE_BATCH_LIMIT)
         ).fetchall()
-
-        recent_memories = c.execute(
-            "SELECT content, quote, ts FROM l1_memories WHERE status='active' AND arousal >= 0.5 ORDER BY ts DESC LIMIT 30"
-        ).fetchall()
-
-        # 水位线取当前最大重要 L1 id（同 summary，避免 ts 截断导致反复触发）
-        new_watermark = c.execute(
-            f"SELECT COALESCE(MAX(id), 0) FROM l1_memories WHERE {IMPORTANT_L1_WHERE}"
-        ).fetchone()[0]
-
         conn.close()
+
+        if not new_memories:
+            return {"status": "skipped", "message": "上次生成后没有新增重要记忆，无需更新"}
+
+        consumed_ids = [m[0] for m in new_memories]
 
         # 3. 获取 narrative 模型配置
         config = await get_model_config("narrative")
         if not config["configured"]:
             return {"status": "error", "message": "Narrative 模型未配置"}
 
-        # 4. 构建提示词
-        prompt = await build_narrative_prompt(existing_narrative, core_memories, recent_memories)
+        # 4. 构建提示词（增量演化 or 首次/强制全量生成）
+        prompt = await build_narrative_prompt(existing_narrative, new_memories)
 
         # 5. 调用 LLM 生成
         new_narrative = await call_llm_for_narrative(config, prompt)
@@ -1416,11 +1428,21 @@ async def generate_narrative(req: NarrativeGenerateRequest):
         last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
         new_version = last_version + 1
 
+        # 溯源信息：为何更新、基于哪些记忆（Dashboard Observatory 数据源）
+        trigger_details = json.dumps({
+            "timestamp": datetime.now().isoformat(),
+            "reason": req.reason or ("强制全量重写" if req.force else
+                                     "首次生成" if not existing else
+                                     f"新增 {len(consumed_ids)} 条重要记忆"),
+            "mode": "full" if full_rewrite else "incremental",
+            "l1_ids": consumed_ids,
+            "l1_count": len(consumed_ids),
+        }, ensure_ascii=False)
+
         # 插入新版本
         c.execute(
             "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) VALUES (?, ?, ?, ?, 'active', ?)",
-            (new_narrative, new_version, req.trigger_type,
-             json.dumps({"timestamp": datetime.now().isoformat()}), new_watermark)
+            (new_narrative, new_version, req.trigger_type, trigger_details, consumed_ids[-1])
         )
 
         conn.commit()
@@ -1431,6 +1453,8 @@ async def generate_narrative(req: NarrativeGenerateRequest):
             "status": "ok",
             "id": new_id,
             "version": new_version,
+            "mode": "full" if full_rewrite else "incremental",
+            "consumed_l1": len(consumed_ids),
             "content": new_narrative
         }
 
@@ -1688,7 +1712,10 @@ async def check_and_update_narrative():
             return
         async with _auto_lock:
             print(f"[AUTO] 触发 Narrative 更新：新增 {new_count} 条重要记忆（阈值 {threshold}）", flush=True)
-            result = await generate_narrative(NarrativeGenerateRequest(trigger_type="auto"))
+            result = await generate_narrative(NarrativeGenerateRequest(
+                trigger_type="auto",
+                reason=f"自动检查：新增 {new_count} 条重要记忆，达到阈值 {threshold}"
+            ))
             print(f"[AUTO] Narrative 结果：{result.get('status')} {result.get('message', '')}")
     except Exception as e:
         print(f"[AUTO] Narrative 检查异常：{e}", flush=True)
@@ -1932,54 +1959,61 @@ async def update_model_config(purpose: str, req: ModelConfigUpdate):
 
 # ============ Helper Functions ============
 
-async def build_narrative_prompt(existing_narrative: str, core_memories: list, recent_memories: list) -> str:
-    """构建 Narrative 生成提示词"""
-    # 读取提示词模板
+async def build_narrative_prompt(existing_narrative: str, new_memories: list) -> str:
+    """构建 Narrative 生成提示词。
+
+    new_memories: [(id, content, quote, ts), ...] 按提取顺序（≈时间顺序）。
+    已有叙事 → 增量演化（现有全文保留，只续写新增）；否则从头生成。
+    """
+    # 读取提示词模板（叙事风格与内容准则）
     prompt_file = Path(__file__).parent.parent.parent / "Narrative生成提示词.md"
     try:
         with open(prompt_file, 'r', encoding='utf-8') as f:
             template = f.read()
     except:
         template = """你是一段亲密关系的记忆守护者。维护一份连续的共同经历叙事。
-
-## 任务
-基于现有叙事和新记忆，更新叙事内容。保留时间锚点、情感转折点、共同经历。
-
-## 现有叙事
-{existing}
-
-## 新增记忆
-{memories}
-
-请生成更新后的叙事（markdown格式）："""
+按时间顺序分章节书写，保留时间锚点、情感转折点、共同经历、关系演化，
+重要的原话用引号保留。温暖但不矫饰、连贯流动。"""
 
     # 构建记忆列表（带时间戳，构成时间线骨架）
-    memory_text = "### 核心记忆\n"
-    for m in core_memories:
-        ts_date = m[2][:10] if m[2] else "未知时间"
-        memory_text += f"- [{ts_date}] {m[0]}\n"
-        if m[1]:
-            memory_text += f"  > {m[1]}\n"
+    memory_text = ""
+    for m in new_memories:
+        ts_date = m[3][:10] if m[3] else "未知时间"
+        memory_text += f"- [{ts_date}] {m[1]}\n"
+        if m[2]:
+            memory_text += f"  > {m[2]}\n"
 
-    memory_text += "\n### 最近记忆\n"
-    for m in recent_memories[:20]:  # 限制数量
-        ts_date = m[2][:10] if m[2] else "未知时间"
-        memory_text += f"- [{ts_date}] {m[0]}\n"
+    if existing_narrative:
+        # 增量演化：现有叙事是已经写下的历史，只往后写，不重写
+        task_text = (
+            "## 本次任务：增量演化\n"
+            "现有叙事是这本书已经写下的部分，新增记忆是上次书写之后新发生的经历。\n\n"
+            "**硬性约束**：\n"
+            "- 现有叙事的全部内容**原样保留**——不重写、不删改、不压缩、不换措辞\n"
+            "- 只根据「新增记忆」续写：在时间线对应位置插入新章节，或在末尾续写新篇章\n"
+            "- 新增内容严格基于新增记忆，不虚构任何未记录的经历\n"
+            "- 与现有叙事的称呼、语气、章节格式保持一致，体现关系的延续与成长\n"
+            "- 若某条新增记忆只是琐碎日常、不构成值得书写的经历，可以不写入\n\n"
+            f"## 现有叙事\n{existing_narrative}\n\n"
+            f"## 新增记忆（按时间排序）\n{memory_text}\n"
+            "请输出更新后的**完整叙事**（现有叙事原文 + 新增部分），markdown 格式，"
+            "不要输出任何说明、前言或询问。"
+        )
+    else:
+        task_text = (
+            "## 本次任务：首次生成\n"
+            "根据以下记忆，按时间顺序书写这份共同经历叙事的开篇。\n\n"
+            f"## 记忆（按时间排序）\n{memory_text}\n"
+            "请直接输出叙事正文（markdown 格式），不要输出任何说明、前言或询问。"
+        )
 
-    existing_text = existing_narrative or "（首次生成）"
-
-    # 模板含占位符则替换；否则把数据段追加到模板后 —— 用户手写的
-    # Narrative生成提示词.md 没有占位符，只靠 replace 会让 LLM 拿不到记忆，
-    # 回复「请把对话内容发给我」。
+    # 模板含占位符则替换；否则把任务段追加到模板后（用户手写的
+    # Narrative生成提示词.md 没有占位符，只靠 replace 会让 LLM 拿不到数据）
     if "{existing}" in template and "{memories}" in template:
-        prompt = template.replace("{existing}", existing_text)
+        prompt = template.replace("{existing}", existing_narrative or "（首次生成）")
         prompt = prompt.replace("{memories}", memory_text)
     else:
-        prompt = (
-            f"{template}\n\n---\n\n## 现有叙事\n{existing_text}\n\n"
-            f"## 新增记忆\n{memory_text}\n\n"
-            "请直接输出更新后的完整叙事（markdown 格式），不要输出任何说明或询问。"
-        )
+        prompt = f"{template}\n\n---\n\n{task_text}"
 
     return prompt
 

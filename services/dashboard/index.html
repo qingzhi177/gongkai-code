@@ -905,7 +905,7 @@
             fetch(API + '/narrative/generate', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({trigger_type: 'manual', force: true})
+                body: JSON.stringify({trigger_type: 'manual', reason: 'Dashboard 手动触发'})
             })
             .then(function(r) { return r.json(); })
             .then(function(d) {
@@ -913,6 +913,9 @@
                     status.textContent = '生成成功！';
                     status.style.color = '#28a745';
                     loadNarrative();
+                } else if (d.status === 'skipped') {
+                    status.textContent = d.message || '没有新增重要记忆，无需更新';
+                    status.style.color = '#666';
                 } else {
                     status.textContent = '失败：' + (d.message || '未知');
                     status.style.color = '#dc3545';
