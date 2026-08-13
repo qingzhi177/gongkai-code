@@ -105,6 +105,45 @@ def init_db():
         provider_id INTEGER,
         model TEXT
     )''')
+    # Shared Narrative 表
+    c.execute('''CREATE TABLE IF NOT EXISTS shared_narrative (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL,
+        version INTEGER DEFAULT 1,
+        trigger_type TEXT,
+        trigger_details TEXT,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'active'
+    )''')
+    # Recent Summary 表
+    c.execute('''CREATE TABLE IF NOT EXISTS recent_summary (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        content TEXT NOT NULL,
+        period_start DATETIME,
+        period_end DATETIME,
+        msg_count INTEGER,
+        token_count INTEGER,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        status TEXT DEFAULT 'active'
+    )''')
+    # Narrative 配置表（更新检查策略）
+    c.execute('''CREATE TABLE IF NOT EXISTS narrative_config (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        auto_update_enabled INTEGER DEFAULT 1,
+        check_threshold_turns INTEGER DEFAULT 50,
+        check_threshold_l1 INTEGER DEFAULT 10,
+        summary_max_turns INTEGER DEFAULT 100,
+        summary_max_tokens INTEGER DEFAULT 50000
+    )''')
+    # 模型配置表（不同模块独立配置模型）
+    c.execute('''CREATE TABLE IF NOT EXISTS model_configs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        purpose TEXT UNIQUE NOT NULL,
+        provider_id INTEGER,
+        model_name TEXT,
+        enabled INTEGER DEFAULT 1,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
     conn.commit()
     conn.close()
 
@@ -1233,6 +1272,593 @@ async def test_embedding():
     embedding = await get_embedding("test")
     return {"status": "ok", "dimension": len(embedding)} if embedding else {"status": "error"}
 
+# ============ Shared Narrative API ============
+
+@app.get("/narrative/current")
+async def get_current_narrative():
+    """获取当前活跃的 Shared Narrative"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id, content, version, trigger_type, ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "id": row[0],
+        "content": row[1],
+        "version": row[2],
+        "trigger_type": row[3],
+        "ts": row[4]
+    }
+
+@app.get("/narrative/history")
+async def get_narrative_history(limit: int = 10):
+    """获取历史版本"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, version, trigger_type, ts, status FROM shared_narrative ORDER BY version DESC LIMIT ?",
+        (limit,)
+    ).fetchall()
+    conn.close()
+    return {
+        "history": [
+            {"id": r[0], "version": r[1], "trigger_type": r[2], "ts": r[3], "status": r[4]}
+            for r in rows
+        ]
+    }
+
+class NarrativeGenerateRequest(BaseModel):
+    trigger_type: str = "manual"
+    force: bool = False
+
+@app.post("/narrative/generate")
+async def generate_narrative(req: NarrativeGenerateRequest):
+    """生成 Shared Narrative"""
+    try:
+        # 1. 获取现有 narrative
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+        existing = c.execute(
+            "SELECT content FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        existing_narrative = existing[0] if existing else ""
+
+        # 2. 获取重要的 L1 记忆（核心记忆 + 最近的高唤醒记忆）
+        core_memories = c.execute(
+            "SELECT content, quote, ts FROM l1_memories WHERE status='active' AND is_core=1 ORDER BY ts DESC LIMIT 20"
+        ).fetchall()
+
+        recent_memories = c.execute(
+            "SELECT content, quote, ts FROM l1_memories WHERE status='active' AND arousal >= 0.5 ORDER BY ts DESC LIMIT 30"
+        ).fetchall()
+
+        conn.close()
+
+        # 3. 获取 narrative 模型配置
+        config = await get_model_config("narrative")
+        if not config["configured"]:
+            return {"status": "error", "message": "Narrative 模型未配置"}
+
+        # 4. 构建提示词
+        prompt = await build_narrative_prompt(existing_narrative, core_memories, recent_memories)
+
+        # 5. 调用 LLM 生成
+        new_narrative = await call_llm_for_narrative(config, prompt)
+
+        if not new_narrative:
+            return {"status": "error", "message": "生成失败"}
+
+        # 6. 保存新版本
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+
+        # 标记旧版本为 superseded
+        c.execute("UPDATE shared_narrative SET status='superseded' WHERE status='active'")
+
+        # 获取新版本号
+        last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
+        new_version = last_version + 1
+
+        # 插入新版本
+        c.execute(
+            "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status) VALUES (?, ?, ?, ?, 'active')",
+            (new_narrative, new_version, req.trigger_type, json.dumps({"timestamp": datetime.now().isoformat()}))
+        )
+
+        conn.commit()
+        new_id = c.lastrowid
+        conn.close()
+
+        return {
+            "status": "ok",
+            "id": new_id,
+            "version": new_version,
+            "content": new_narrative
+        }
+
+    except Exception as e:
+        print(f"Narrative generation error: {e}")
+        return {"status": "error", "message": str(e)}
+
+class NarrativeUpdateRequest(BaseModel):
+    content: str
+
+@app.put("/narrative/{narrative_id}")
+async def update_narrative(narrative_id: int, req: NarrativeUpdateRequest):
+    """编辑 Narrative 内容"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    c.execute("UPDATE shared_narrative SET content=? WHERE id=?", (req.content, narrative_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# ============ Recent Summary API ============
+
+@app.get("/summary/current")
+async def get_current_summary():
+    """获取当前 Recent Summary"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT id, content, period_start, period_end, msg_count, ts FROM recent_summary WHERE status='active' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"exists": False}
+    return {
+        "exists": True,
+        "id": row[0],
+        "content": row[1],
+        "period_start": row[2],
+        "period_end": row[3],
+        "msg_count": row[4],
+        "ts": row[5]
+    }
+
+@app.post("/summary/generate")
+async def generate_summary():
+    """生成 Recent Summary"""
+    try:
+        # 获取配置
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+        config_row = c.execute("SELECT summary_max_turns, summary_max_tokens FROM narrative_config WHERE id=1").fetchone()
+        max_turns = config_row[0] if config_row else 100
+
+        # 获取最近的对话消息
+        messages = c.execute(
+            "SELECT role, content, ts FROM l0_messages WHERE status='active' ORDER BY ts DESC LIMIT ?",
+            (max_turns,)
+        ).fetchall()
+
+        conn.close()
+
+        if not messages:
+            return {"status": "error", "message": "没有足够的对话内容"}
+
+        # 获取 summary 模型配置
+        model_config = await get_model_config("summary")
+        if not model_config["configured"]:
+            return {"status": "error", "message": "Summary 模型未配置"}
+
+        # 构建摘要提示词
+        prompt = build_summary_prompt(messages)
+
+        # 调用 LLM 生成摘要
+        summary_content = await call_llm_for_summary(model_config, prompt)
+
+        if not summary_content:
+            return {"status": "error", "message": "生成失败"}
+
+        # 保存摘要
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+
+        # 标记旧摘要为 superseded
+        c.execute("UPDATE recent_summary SET status='superseded' WHERE status='active'")
+
+        period_start = messages[-1][2] if messages else None
+        period_end = messages[0][2] if messages else None
+
+        c.execute(
+            "INSERT INTO recent_summary (content, period_start, period_end, msg_count, status) VALUES (?, ?, ?, ?, 'active')",
+            (summary_content, period_start, period_end, len(messages))
+        )
+
+        conn.commit()
+        new_id = c.lastrowid
+        conn.close()
+
+        return {"status": "ok", "id": new_id, "content": summary_content}
+
+    except Exception as e:
+        print(f"Summary generation error: {e}")
+        return {"status": "error", "message": str(e)}
+
+@app.get("/summary/config")
+async def get_summary_config():
+    """获取摘要配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute("SELECT * FROM narrative_config WHERE id=1").fetchone()
+    conn.close()
+
+    if not row:
+        # 返回默认值
+        return {
+            "auto_update_enabled": 1,
+            "check_threshold_turns": 50,
+            "check_threshold_l1": 10,
+            "summary_max_turns": 100,
+            "summary_max_tokens": 50000
+        }
+
+    return {
+        "auto_update_enabled": row[1],
+        "check_threshold_turns": row[2],
+        "check_threshold_l1": row[3],
+        "summary_max_turns": row[4],
+        "summary_max_tokens": row[5]
+    }
+
+class SummaryConfigUpdate(BaseModel):
+    auto_update_enabled: Optional[int] = None
+    check_threshold_turns: Optional[int] = None
+    check_threshold_l1: Optional[int] = None
+    summary_max_turns: Optional[int] = None
+    summary_max_tokens: Optional[int] = None
+
+@app.put("/summary/config")
+async def update_summary_config(req: SummaryConfigUpdate):
+    """更新摘要配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # 确保配置行存在
+    c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
+
+    updates = []
+    params = []
+    if req.auto_update_enabled is not None:
+        updates.append("auto_update_enabled=?")
+        params.append(req.auto_update_enabled)
+    if req.check_threshold_turns is not None:
+        updates.append("check_threshold_turns=?")
+        params.append(req.check_threshold_turns)
+    if req.check_threshold_l1 is not None:
+        updates.append("check_threshold_l1=?")
+        params.append(req.check_threshold_l1)
+    if req.summary_max_turns is not None:
+        updates.append("summary_max_turns=?")
+        params.append(req.summary_max_turns)
+    if req.summary_max_tokens is not None:
+        updates.append("summary_max_tokens=?")
+        params.append(req.summary_max_tokens)
+
+    if updates:
+        params.append(1)
+        c.execute(f"UPDATE narrative_config SET {', '.join(updates)} WHERE id=?", params)
+
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# ========== 继续标记 ==========
+# CONTINUATION_MARKER_1
+
+# ============ L1 Extraction Status API ============
+
+@app.get("/l1/extraction_status")
+async def get_extraction_status():
+    """获取 L1 提取状态"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # 统计总消息数
+    total = c.execute("SELECT COUNT(*) FROM l0_messages WHERE status='active'").fetchone()[0]
+
+    # 统计已提取消息数
+    extracted = c.execute("SELECT COUNT(*) FROM l0_messages WHERE status='active' AND extracted=1").fetchone()[0]
+
+    # 待提取
+    pending = total - extracted
+
+    # 获取批次信息（按日期分组）
+    batches = c.execute("""
+        SELECT
+            DATE(ts) as date,
+            MIN(id) as start_id,
+            MAX(id) as end_id,
+            COUNT(*) as count,
+            SUM(extracted) as extracted_count
+        FROM l0_messages
+        WHERE status='active'
+        GROUP BY DATE(ts)
+        ORDER BY date DESC
+        LIMIT 20
+    """).fetchall()
+
+    conn.close()
+
+    batch_list = []
+    for b in batches:
+        status = "extracted" if b[4] == b[3] else "partial" if b[4] > 0 else "pending"
+        batch_list.append({
+            "date": b[0],
+            "msg_range": f"{b[1]}-{b[2]}",
+            "total": b[3],
+            "extracted": b[4],
+            "status": status
+        })
+
+    return {
+        "total_messages": total,
+        "extracted_messages": extracted,
+        "pending_messages": pending,
+        "batches": batch_list
+    }
+
+@app.post("/l1/extract_now")
+async def extract_now():
+    """手动触发 L1 提取（调用 extract_l1.py）"""
+    try:
+        import subprocess
+        script_path = Path(__file__).parent / "extract_l1.py"
+        venv_python = Path(__file__).parent / "venv" / "bin" / "python"
+
+        # 在后台运行提取脚本
+        subprocess.Popen([str(venv_python), str(script_path)])
+
+        return {"status": "ok", "message": "提取任务已启动"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+# ============ Pipeline Status API ============
+
+@app.get("/pipeline/status")
+async def get_pipeline_status():
+    """获取整个记忆管线状态"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # L0 统计
+    l0_total = c.execute("SELECT COUNT(*) FROM l0_messages WHERE status='active'").fetchone()[0]
+
+    # L1 统计
+    l1_extracted = c.execute("SELECT COUNT(*) FROM l0_messages WHERE status='active' AND extracted=1").fetchone()[0]
+    l1_total = c.execute("SELECT COUNT(*) FROM l1_memories WHERE status='active'").fetchone()[0]
+    l1_percent = int((l1_extracted / l0_total * 100)) if l0_total > 0 else 0
+
+    # Embedding 统计（从 ChromaDB 获取）
+    try:
+        embedding_count = l1_collection.count()
+        last_l1 = c.execute("SELECT ts FROM l1_memories WHERE status='active' ORDER BY ts DESC LIMIT 1").fetchone()
+        embedding_last_update = last_l1[0] if last_l1 else None
+    except:
+        embedding_count = 0
+        embedding_last_update = None
+
+    # Narrative 统计
+    narrative = c.execute("SELECT version, ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1").fetchone()
+    narrative_version = narrative[0] if narrative else 0
+    narrative_last_update = narrative[1] if narrative else None
+
+    conn.close()
+
+    return {
+        "l0": {"total": l0_total, "percent": 100},
+        "l1": {"extracted": l1_extracted, "total": l1_total, "pending": l0_total - l1_extracted, "percent": l1_percent},
+        "embedding": {"count": embedding_count, "last_update": embedding_last_update},
+        "narrative": {"version": narrative_version, "last_update": narrative_last_update, "pending": False}
+    }
+
+# ============ Model Config API (扩展) ============
+
+async def get_model_config(purpose: str):
+    """获取指定模块的模型配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # 先查 model_configs 表
+    config = c.execute(
+        "SELECT provider_id, model_name FROM model_configs WHERE purpose=? AND enabled=1",
+        (purpose,)
+    ).fetchone()
+
+    if not config:
+        conn.close()
+        return {"configured": False}
+
+    # 查供应商信息
+    provider = c.execute(
+        "SELECT name, base_url, api_key_enc FROM providers WHERE id=?",
+        (config[0],)
+    ).fetchone()
+
+    conn.close()
+
+    if not provider:
+        return {"configured": False}
+
+    return {
+        "configured": True,
+        "provider_name": provider[0],
+        "base_url": provider[1],
+        "api_key": decrypt_secret(provider[2]),
+        "model": config[1]
+    }
+
+@app.get("/config/models")
+async def get_all_model_configs():
+    """获取所有模块的模型配置"""
+    purposes = ["chat", "l1_extract", "embedding", "narrative", "summary"]
+    configs = {}
+
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    for purpose in purposes:
+        row = c.execute(
+            """SELECT mc.provider_id, mc.model_name, p.name
+               FROM model_configs mc
+               LEFT JOIN providers p ON mc.provider_id = p.id
+               WHERE mc.purpose=? AND mc.enabled=1""",
+            (purpose,)
+        ).fetchone()
+
+        if row:
+            configs[purpose] = {
+                "provider_id": row[0],
+                "provider_name": row[2],
+                "model": row[1]
+            }
+        else:
+            configs[purpose] = None
+
+    conn.close()
+    return {"configs": configs}
+
+class ModelConfigUpdate(BaseModel):
+    provider_id: int
+    model_name: str
+
+@app.put("/config/models/{purpose}")
+async def update_model_config(purpose: str, req: ModelConfigUpdate):
+    """更新指定模块的模型配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # 检查供应商是否存在
+    exists = c.execute("SELECT id FROM providers WHERE id=?", (req.provider_id,)).fetchone()
+    if not exists:
+        conn.close()
+        return {"status": "error", "message": "供应商不存在"}
+
+    # 插入或更新配置
+    c.execute(
+        """INSERT INTO model_configs (purpose, provider_id, model_name, enabled)
+           VALUES (?, ?, ?, 1)
+           ON CONFLICT(purpose) DO UPDATE SET
+           provider_id=excluded.provider_id,
+           model_name=excluded.model_name,
+           ts=CURRENT_TIMESTAMP""",
+        (purpose, req.provider_id, req.model_name)
+    )
+
+    conn.commit()
+    conn.close()
+
+    return {"status": "ok"}
+
+# ============ Helper Functions ============
+
+async def build_narrative_prompt(existing_narrative: str, core_memories: list, recent_memories: list) -> str:
+    """构建 Narrative 生成提示词"""
+    # 读取提示词模板
+    prompt_file = Path(__file__).parent.parent.parent / "Narrative生成提示词.md"
+    try:
+        with open(prompt_file, 'r', encoding='utf-8') as f:
+            template = f.read()
+    except:
+        template = """你是一段亲密关系的记忆守护者。维护一份连续的共同经历叙事。
+
+## 任务
+基于现有叙事和新记忆，更新叙事内容。保留时间锚点、情感转折点、共同经历。
+
+## 现有叙事
+{existing}
+
+## 新增记忆
+{memories}
+
+请生成更新后的叙事（markdown格式）："""
+
+    # 构建记忆列表
+    memory_text = "### 核心记忆\n"
+    for m in core_memories:
+        memory_text += f"- {m[0]}\n"
+        if m[1]:
+            memory_text += f"  > {m[1]}\n"
+
+    memory_text += "\n### 最近记忆\n"
+    for m in recent_memories[:20]:  # 限制数量
+        memory_text += f"- {m[0]}\n"
+
+    prompt = template.replace("{existing}", existing_narrative or "（首次生成）")
+    prompt = prompt.replace("{memories}", memory_text)
+
+    return prompt
+
+async def call_llm_for_narrative(config: dict, prompt: str) -> str:
+    """调用 LLM 生成 Narrative"""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{config['base_url']}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config['api_key']}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": config['model'],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 4000
+                }
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"LLM call error: {e}")
+        return None
+
+def build_summary_prompt(messages: list) -> str:
+    """构建 Summary 提示词"""
+    msg_text = ""
+    for msg in reversed(messages[-100:]):  # 最近100条，倒序
+        role = "用户" if msg[0] == "user" else "AI"
+        msg_text += f"{role}: {msg[1][:500]}\n\n"
+
+    prompt = f"""请为以下对话生成一份简洁的近期摘要（300字以内）：
+
+{msg_text}
+
+摘要要求：
+- 提取关键事件和话题
+- 保留时间顺序
+- 突出重要信息
+- 简洁明了
+
+摘要："""
+
+    return prompt
+
+async def call_llm_for_summary(config: dict, prompt: str) -> str:
+    """调用 LLM 生成 Summary"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{config['base_url']}/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {config['api_key']}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": config['model'],
+                    "messages": [{"role": "user", "content": prompt}],
+                    "max_tokens": 1000
+                }
+            )
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        print(f"LLM call error: {e}")
+        return None
+
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0", port=8001)
+    uvicorn.run(app, host="0.0.0.0", port=8001)
