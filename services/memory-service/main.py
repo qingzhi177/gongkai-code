@@ -1498,6 +1498,73 @@ async def get_current_summary():
         "ts": row[5]
     }
 
+@app.get("/summary/config")
+async def get_summary_config():
+    """获取摘要配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    row = c.execute(
+        "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1, summary_max_turns, summary_max_tokens FROM narrative_config WHERE id=1"
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {
+            "auto_update_enabled": 1,
+            "check_threshold_turns": 50,
+            "check_threshold_l1": 10,
+            "summary_max_turns": 100,
+            "summary_max_tokens": 50000
+        }
+    return {
+        "auto_update_enabled": row[0],
+        "check_threshold_turns": row[1],
+        "check_threshold_l1": row[2],
+        "summary_max_turns": row[3],
+        "summary_max_tokens": row[4]
+    }
+
+class SummaryConfigUpdate(BaseModel):
+    auto_update_enabled: Optional[int] = None
+    check_threshold_turns: Optional[int] = None
+    check_threshold_l1: Optional[int] = None
+    summary_max_turns: Optional[int] = None
+    summary_max_tokens: Optional[int] = None
+
+@app.put("/summary/config")
+async def update_summary_config(req: SummaryConfigUpdate):
+    """更新摘要配置"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    # 确保配置行存在
+    c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
+
+    updates = []
+    params = []
+    if req.auto_update_enabled is not None:
+        updates.append("auto_update_enabled=?")
+        params.append(req.auto_update_enabled)
+    if req.check_threshold_turns is not None:
+        updates.append("check_threshold_turns=?")
+        params.append(req.check_threshold_turns)
+    if req.check_threshold_l1 is not None:
+        updates.append("check_threshold_l1=?")
+        params.append(req.check_threshold_l1)
+    if req.summary_max_turns is not None:
+        updates.append("summary_max_turns=?")
+        params.append(req.summary_max_turns)
+    if req.summary_max_tokens is not None:
+        updates.append("summary_max_tokens=?")
+        params.append(req.summary_max_tokens)
+
+    if updates:
+        params.append(1)
+        c.execute(f"UPDATE narrative_config SET {', '.join(updates)} WHERE id=?", params)
+
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 class SummaryUpdateRequest(BaseModel):
     content: str
 
@@ -1576,74 +1643,6 @@ async def generate_summary():
     except Exception as e:
         print(f"Summary generation error: {e}")
         return {"status": "error", "message": str(e)}
-
-@app.get("/summary/config")
-async def get_summary_config():
-    """获取摘要配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
-    c = conn.cursor()
-    row = c.execute("SELECT * FROM narrative_config WHERE id=1").fetchone()
-    conn.close()
-
-    if not row:
-        # 返回默认值
-        return {
-            "auto_update_enabled": 1,
-            "check_threshold_turns": 50,
-            "check_threshold_l1": 10,
-            "summary_max_turns": 100,
-            "summary_max_tokens": 50000
-        }
-
-    return {
-        "auto_update_enabled": row[1],
-        "check_threshold_turns": row[2],
-        "check_threshold_l1": row[3],
-        "summary_max_turns": row[4],
-        "summary_max_tokens": row[5]
-    }
-
-class SummaryConfigUpdate(BaseModel):
-    auto_update_enabled: Optional[int] = None
-    check_threshold_turns: Optional[int] = None
-    check_threshold_l1: Optional[int] = None
-    summary_max_turns: Optional[int] = None
-    summary_max_tokens: Optional[int] = None
-
-@app.put("/summary/config")
-async def update_summary_config(req: SummaryConfigUpdate):
-    """更新摘要配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
-    c = conn.cursor()
-
-    # 确保配置行存在
-    c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
-
-    updates = []
-    params = []
-    if req.auto_update_enabled is not None:
-        updates.append("auto_update_enabled=?")
-        params.append(req.auto_update_enabled)
-    if req.check_threshold_turns is not None:
-        updates.append("check_threshold_turns=?")
-        params.append(req.check_threshold_turns)
-    if req.check_threshold_l1 is not None:
-        updates.append("check_threshold_l1=?")
-        params.append(req.check_threshold_l1)
-    if req.summary_max_turns is not None:
-        updates.append("summary_max_turns=?")
-        params.append(req.summary_max_turns)
-    if req.summary_max_tokens is not None:
-        updates.append("summary_max_tokens=?")
-        params.append(req.summary_max_tokens)
-
-    if updates:
-        params.append(1)
-        c.execute(f"UPDATE narrative_config SET {', '.join(updates)} WHERE id=?", params)
-
-    conn.commit()
-    conn.close()
-    return {"status": "ok"}
 
 # ============ 自动检查与触发 ============
 
