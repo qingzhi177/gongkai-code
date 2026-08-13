@@ -1798,6 +1798,52 @@ async def get_auto_logs(lines: int = 100):
     except Exception as e:
         return {"logs": [], "error": str(e)}
 
+# ============ Admin API: 危险操作 ============
+
+@app.post("/admin/purge_all")
+async def purge_all_data(confirmation: dict):
+    """
+    硬清除所有数据（L0/L1/向量/Narrative/Summary/Profile）
+    警告：此操作不可逆！需要前端传递 {"confirmation": "CONFIRM DELETE"}
+    """
+    if confirmation.get("confirmation") != "CONFIRM DELETE":
+        return {"status": "error", "message": "确认文本不正确"}
+
+    try:
+        logger.warning("开始硬清除所有数据...")
+
+        # 1. 清空 SQLite
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+        c.execute("DELETE FROM l0_messages")
+        c.execute("DELETE FROM l1_memories")
+        c.execute("DELETE FROM shared_narrative")
+        c.execute("DELETE FROM recent_summary")
+        c.execute("DELETE FROM user_profile")
+        c.execute("DELETE FROM ai_profile")
+        c.execute("VACUUM")
+        conn.commit()
+        conn.close()
+        logger.info("SQLite 数据库已清空")
+
+        # 2. 清空 ChromaDB（重建 collection）
+        try:
+            chroma_client.delete_collection(name="memories")
+            logger.info("ChromaDB collection 已删除")
+        except Exception as e:
+            logger.warning(f"删除 ChromaDB collection 失败（可能不存在）: {e}")
+
+        # 重建空 collection
+        chroma_client.get_or_create_collection(name="memories")
+        logger.info("ChromaDB collection 已重建")
+
+        logger.warning("所有数据已硬清除完成")
+        return {"status": "ok", "message": "所有数据已清空，可以重新导入对话"}
+
+    except Exception as e:
+        logger.error(f"硬清除失败: {e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
 # ============ L1 Extraction Status API ============
 
 @app.get("/l1/extraction_status")

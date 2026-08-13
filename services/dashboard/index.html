@@ -333,6 +333,19 @@
                 <button class="btn" onclick="saveSummaryConfig()">保存配置</button>
                 <span id="summary-config-status" style="margin-left:10px;font-size:12px;"></span>
             </div>
+
+            <!-- 危险操作区域 -->
+            <div style="margin-top:40px;padding:20px;background:#fff3cd;border:2px solid #ffc107;border-radius:8px;">
+                <h4 style="color:#856404;margin-top:0;">⚠️ 危险操作</h4>
+                <p style="font-size:13px;color:#856404;margin-bottom:15px;">
+                    以下操作不可逆，将永久删除所有数据（L0原文、L1记忆、向量库、Narrative、Summary、Profile）。<br>
+                    清空后需要重新导入对话数据。
+                </p>
+                <button class="btn" onclick="confirmPurgeAll()" style="background:#dc3545;color:white;font-weight:bold;">
+                    🗑️ 清空所有数据
+                </button>
+                <span id="purge-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
         </div>
 
         <!-- System Logs 页面 -->
@@ -1514,6 +1527,61 @@
                     status.textContent = '❌ 请求失败: ' + e.message;
                     status.style.color = '#dc3545';
                 });
+        }
+
+        // ============ Admin 危险操作 ============
+        function confirmPurgeAll() {
+            var confirmation = prompt(
+                '⚠️ 警告：此操作将永久删除所有数据！\n\n' +
+                '包括：\n' +
+                '- L0 原文对话\n' +
+                '- L1 提取记忆\n' +
+                '- ChromaDB 向量库\n' +
+                '- Shared Narrative 共同经历叙事\n' +
+                '- Recent Summary 近期摘要\n' +
+                '- User Profile 用户画像\n' +
+                '- AI Profile AI画像\n\n' +
+                '此操作不可逆！\n\n' +
+                '如果确认清空，请输入：CONFIRM DELETE'
+            );
+
+            if (confirmation === 'CONFIRM DELETE') {
+                executePurgeAll();
+            } else if (confirmation !== null) {
+                alert('确认文本不正确，操作已取消');
+            }
+        }
+
+        function executePurgeAll() {
+            var status = document.getElementById('purge-status');
+            status.textContent = '🔄 正在清空所有数据...';
+            status.style.color = '#dc3545';
+            status.style.fontWeight = 'bold';
+
+            fetch(API + '/admin/purge_all', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({confirmation: 'CONFIRM DELETE'})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    status.textContent = '✅ 所有数据已清空！页面将在 3 秒后刷新...';
+                    status.style.color = '#28a745';
+                    setTimeout(function() {
+                        location.reload();
+                    }, 3000);
+                } else {
+                    status.textContent = '❌ 清空失败：' + (d.message || '未知错误');
+                    status.style.color = '#dc3545';
+                    status.style.fontWeight = 'normal';
+                }
+            })
+            .catch(function(e) {
+                status.textContent = '❌ 请求失败：' + e.message;
+                status.style.color = '#dc3545';
+                status.style.fontWeight = 'normal';
+            });
         }
 
         loadStats();
