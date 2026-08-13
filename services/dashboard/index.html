@@ -43,7 +43,34 @@
         .modal-box h3 { margin-bottom: 12px; }
         .modal-box textarea { min-height: 200px; }
         .modal-actions { text-align: right; margin-top: 6px; }
+        /* Pipeline 月相样式 */
+        .pipeline-stage { margin: 20px 0; text-align: center; }
+        .moon-container { display: inline-block; position: relative; width: 120px; height: 120px; }
+        .moon-phase { width: 100%; height: 100%; border-radius: 50%; background: #1a1a1a; position: relative; overflow: hidden; box-shadow: 0 0 15px rgba(0,0,0,0.3); }
+        .moon-light { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; background: #e8e8d0; }
+        .moon-texture { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.1) 0%, transparent 50%); opacity: 0.3; }
+        .pipeline-label { margin-top: 10px; font-weight: bold; font-size: 14px; }
+        .pipeline-detail { font-size: 12px; color: #666; margin-top: 4px; }
+        /* Extraction 表格样式 */
+        .extraction-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .extraction-table th, .extraction-table td { padding: 10px; text-align: left; border-bottom: 1px solid #eee; font-size: 13px; }
+        .extraction-table th { background: #f5f5f5; font-weight: bold; }
+        .status-badge { padding: 3px 8px; border-radius: 12px; font-size: 11px; display: inline-block; }
+        .status-extracted { background: #d4edda; color: #155724; }
+        .status-pending { background: #fff3cd; color: #856404; }
+        .status-partial { background: #cce5ff; color: #004085; }
+        /* Narrative 样式 */
+        .narrative-content { background: #fafafa; padding: 20px; border-radius: 8px; line-height: 1.8; font-size: 14px; white-space: pre-wrap; max-height: 500px; overflow-y: auto; }
+        .narrative-meta { background: #f0f0f0; padding: 12px; border-radius: 6px; margin-bottom: 15px; font-size: 12px; color: #666; }
+        /* Summary 样式 */
+        .summary-content { background: #fafafa; padding: 15px; border-radius: 8px; line-height: 1.6; font-size: 13px; }
+        .config-section { margin-bottom: 25px; padding: 15px; background: #f9f9f9; border-radius: 8px; }
+        .config-section h4 { margin-bottom: 10px; font-size: 14px; }
+        .config-field { margin-bottom: 10px; }
+        .config-field label { display: inline-block; width: 150px; font-size: 13px; }
+        .config-field select, .config-field input { padding: 6px 10px; border: 1px solid #ddd; border-radius: 4px; font-size: 13px; }
     </style>
+
 </head>
 <body>
     <div class="container">
@@ -53,6 +80,10 @@
             <button class="tab" onclick="showPanel('l0')">L0原文</button>
             <button class="tab" onclick="showPanel('l1')">L1记忆</button>
             <button class="tab" onclick="showPanel('profile')">画像</button>
+            <button class="tab" onclick="showPanel('pipeline')">记忆管线</button>
+            <button class="tab" onclick="showPanel('extraction')">记忆提取</button>
+            <button class="tab" onclick="showPanel('narrative')">共同经历</button>
+            <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
         </div>
@@ -144,6 +175,132 @@
                 <button class="btn" onclick="resetProviderForm()" style="background:#999;">清空</button>
                 <span id="config-form-status" style="margin-left:8px;"></span>
             </div>
+
+            <h3 style="margin-top:30px;">模块模型配置</h3>
+            <div id="model-configs" style="margin-top:15px;"></div>
+        </div>
+
+        <!-- Pipeline 页面 -->
+        <div id="pipeline" class="panel">
+            <h3 style="text-align:center;margin-bottom:30px;">记忆管线状态</h3>
+            <div style="display:flex;justify-content:space-around;flex-wrap:wrap;">
+                <div class="pipeline-stage">
+                    <div class="moon-container">
+                        <canvas id="moon-l0" width="120" height="120"></canvas>
+                    </div>
+                    <div class="pipeline-label">L0 对话原文</div>
+                    <div class="pipeline-detail" id="pipeline-l0-detail">-</div>
+                </div>
+                <div class="pipeline-stage">
+                    <div class="moon-container">
+                        <canvas id="moon-l1" width="120" height="120"></canvas>
+                    </div>
+                    <div class="pipeline-label">L1 记忆提取</div>
+                    <div class="pipeline-detail" id="pipeline-l1-detail">-</div>
+                </div>
+                <div class="pipeline-stage">
+                    <div class="moon-container">
+                        <canvas id="moon-embedding" width="120" height="120"></canvas>
+                    </div>
+                    <div class="pipeline-label">向量嵌入</div>
+                    <div class="pipeline-detail" id="pipeline-embedding-detail">-</div>
+                </div>
+                <div class="pipeline-stage">
+                    <div class="moon-container">
+                        <canvas id="moon-narrative" width="120" height="120"></canvas>
+                    </div>
+                    <div class="pipeline-label">共同经历叙事</div>
+                    <div class="pipeline-detail" id="pipeline-narrative-detail">-</div>
+                </div>
+            </div>
+            <div style="text-align:center;margin-top:30px;">
+                <button class="btn" onclick="loadPipeline()">刷新状态</button>
+            </div>
+        </div>
+
+        <!-- Extraction 页面 -->
+        <div id="extraction" class="panel">
+            <h3>L1 提取状态</h3>
+            <div class="stat-grid" style="margin-top:15px;">
+                <div class="stat-card"><div class="number" id="extract-total">-</div><div class="label">总消息数</div></div>
+                <div class="stat-card"><div class="number" id="extract-done">-</div><div class="label">已提取</div></div>
+                <div class="stat-card"><div class="number" id="extract-pending">-</div><div class="label">待提取</div></div>
+            </div>
+            <div style="margin:20px 0;">
+                <button class="btn" onclick="triggerExtract()">立即提取</button>
+                <span id="extract-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <h3>批次列表</h3>
+            <table class="extraction-table">
+                <thead>
+                    <tr>
+                        <th>日期</th>
+                        <th>消息范围</th>
+                        <th>总数</th>
+                        <th>已提取</th>
+                        <th>状态</th>
+                    </tr>
+                </thead>
+                <tbody id="extraction-batches"></tbody>
+            </table>
+        </div>
+
+        <!-- Narrative 页面 -->
+        <div id="narrative" class="panel">
+            <h3>共同经历叙事</h3>
+            <div class="narrative-meta" id="narrative-meta">
+                暂无叙事
+            </div>
+            <div style="margin-bottom:15px;">
+                <button class="btn" onclick="generateNarrative()">生成/更新叙事</button>
+                <button class="btn" onclick="editNarrative()" style="background:#28a745;">编辑</button>
+                <button class="btn" onclick="loadNarrativeHistory()" style="background:#6c757d;">查看历史</button>
+                <span id="narrative-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div class="narrative-content" id="narrative-content">
+                暂无内容
+            </div>
+        </div>
+
+        <!-- Summary 页面 -->
+        <div id="summary" class="panel">
+            <h3>近期摘要</h3>
+            <div style="margin:15px 0;">
+                <button class="btn" onclick="generateSummary()">生成摘要</button>
+                <span id="summary-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div class="summary-content" id="summary-content" style="margin-bottom:20px;">
+                暂无摘要
+            </div>
+
+            <h3 style="margin-top:30px;">摘要配置</h3>
+            <div class="config-section">
+                <div class="config-field">
+                    <label>自动更新：</label>
+                    <select id="summary-auto-enabled">
+                        <option value="1">启用</option>
+                        <option value="0">禁用</option>
+                    </select>
+                </div>
+                <div class="config-field">
+                    <label>检查阈值（轮数）：</label>
+                    <input type="number" id="summary-threshold-turns" style="width:100px;" value="50">
+                </div>
+                <div class="config-field">
+                    <label>检查阈值（L1数）：</label>
+                    <input type="number" id="summary-threshold-l1" style="width:100px;" value="10">
+                </div>
+                <div class="config-field">
+                    <label>最大轮数：</label>
+                    <input type="number" id="summary-max-turns" style="width:100px;" value="100">
+                </div>
+                <div class="config-field">
+                    <label>最大Token：</label>
+                    <input type="number" id="summary-max-tokens" style="width:100px;" value="50000">
+                </div>
+                <button class="btn" onclick="saveSummaryConfig()">保存配置</button>
+                <span id="summary-config-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
         </div>
     </div>
 
@@ -193,6 +350,10 @@
             if (name === 'l1') loadL1('all');
             if (name === 'profile') loadProfile();
             if (name === 'config') loadConfig();
+            if (name === 'pipeline') loadPipeline();
+            if (name === 'extraction') loadExtraction();
+            if (name === 'narrative') loadNarrative();
+            if (name === 'summary') loadSummary();
         }
 
         function loadStats() {
@@ -325,6 +486,7 @@
                 if (m.has_source) html += '<button class="btn btn-small" style="background:#34c759;" onclick="reextractL1(' + m.id + ')">重提取</button> ';
                 html += '<button class="btn btn-small btn-danger" onclick="deleteL1(' + m.id + ')">删除</button>';
                 html += '</div>';
+                html += '</div>';  // 闭合 item
             });
             document.getElementById('l1-list').innerHTML = html || '<p>暂无记忆</p>';
         }
@@ -503,57 +665,6 @@
         var configProviders = [];   // 缓存供应商列表
         var configActive = null;    // { provider_id, model }
 
-        function loadConfig() {
-            fetch(API + '/config/providers').then(function(r) { return r.json(); }).then(function(d) {
-                configProviders = d.providers || [];
-                configActive = d.active || null;
-                renderProviderList();
-                renderActiveSelectors();
-            });
-        }
-
-        function renderProviderList() {
-            if (configProviders.length === 0) {
-                document.getElementById('config-provider-list').innerHTML = '<span style="color:#888;">暂无供应商，请在下方添加</span>';
-                return;
-            }
-            var html = '';
-            configProviders.forEach(function(p) {
-                var models = (p.models || []).join(', ') || '（无）';
-                html += '<div style="border:1px solid #ddd;border-radius:8px;padding:10px;margin-bottom:8px;">';
-                html += '<b>' + escapeHtml(p.name) + '</b>';
-                html += '<span style="color:#888;font-size:12px;margin-left:8px;">key: ' + (p.has_key ? '***（已设置）' : '未设置') + '</span>';
-                html += '<div style="color:#666;font-size:12px;margin:4px 0;">' + escapeHtml(p.base_url) + '</div>';
-                html += '<div style="color:#666;font-size:12px;">模型: ' + escapeHtml(models) + '</div>';
-                html += '<div style="margin-top:6px;">';
-                html += '<button class="btn" style="font-size:12px;padding:4px 10px;" onclick="editProvider(' + p.id + ')">编辑</button>';
-                html += '<button class="btn" style="font-size:12px;padding:4px 10px;background:#e74c3c;" onclick="deleteProvider(' + p.id + ')">删除</button>';
-                html += '</div></div>';
-            });
-            document.getElementById('config-provider-list').innerHTML = html;
-        }
-
-        function renderActiveSelectors() {
-            var provSel = document.getElementById('config-active-provider');
-            var provHtml = '<option value="">— 选择供应商 —</option>';
-            configProviders.forEach(function(p) {
-                var sel = (configActive && configActive.provider_id === p.id) ? ' selected' : '';
-                provHtml += '<option value="' + p.id + '"' + sel + '>' + escapeHtml(p.name) + '</option>';
-            });
-            provSel.innerHTML = provHtml;
-            onActiveProviderChange();
-
-            // 当前使用提示
-            if (configActive && configActive.provider_id) {
-                var cur = configProviders.filter(function(p){ return p.id === configActive.provider_id; })[0];
-                document.getElementById('config-active').textContent = cur
-                    ? ('当前：' + cur.name + ' / ' + configActive.model)
-                    : '当前选中的供应商已被删除，请重新选择';
-            } else {
-                document.getElementById('config-active').textContent = '未配置（网关回退到 .env）';
-            }
-        }
-
         // 供应商下拉变化时，刷新该供应商的模型下拉
         function onActiveProviderChange() {
             var pid = parseInt(document.getElementById('config-active-provider').value, 10);
@@ -649,6 +760,411 @@
         function escapeHtml(s) {
             return String(s == null ? '' : s).replace(/[&<>"']/g, function(c) {
                 return { '&':'&amp;', '<':'&lt;', '>':'&gt;', '"':'&quot;', "'":'&#39;' }[c];
+            });
+        }
+
+        // ============ Pipeline 相关函数 ============
+        function loadPipeline() {
+            fetch(API + '/pipeline/status').then(function(r) { return r.json(); }).then(function(d) {
+                // 更新详情文本
+                document.getElementById('pipeline-l0-detail').textContent = d.l0.total + ' 条 (100%)';
+                document.getElementById('pipeline-l1-detail').textContent = d.l1.extracted + '/' + d.l0.total + ' (' + d.l1.percent + '%)';
+                document.getElementById('pipeline-embedding-detail').textContent = d.embedding.count + ' 条向量';
+                document.getElementById('pipeline-narrative-detail').textContent = 'v' + d.narrative.version + (d.narrative.last_update ? ' · ' + formatTime(d.narrative.last_update) : '');
+
+                // 绘制月相
+                drawMoonPhase('moon-l0', d.l0.percent);
+                drawMoonPhase('moon-l1', d.l1.percent);
+                drawMoonPhase('moon-embedding', d.embedding.count > 0 ? 100 : 0);
+                drawMoonPhase('moon-narrative', d.narrative.version > 0 ? 80 : 0);
+            });
+        }
+
+        function drawMoonPhase(canvasId, percent) {
+            var canvas = document.getElementById(canvasId);
+            if (!canvas) return;
+            var ctx = canvas.getContext('2d');
+            var centerX = 60, centerY = 60, radius = 55;
+
+            // 清空画布
+            ctx.clearRect(0, 0, 120, 120);
+
+            // 背景（暗面）
+            ctx.fillStyle = '#1a1a1a';
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 根据进度计算月相
+            // 0%=新月（全暗）, 50%=上弦月, 100%=满月（全亮）
+            var phase = percent / 100;
+
+            // 亮面
+            ctx.fillStyle = '#e8e8d0';
+            ctx.beginPath();
+
+            if (phase <= 0.5) {
+                // 上弦月阶段 (0-50%)：右侧逐渐变亮
+                var offset = (1 - phase * 2) * radius;
+                ctx.arc(centerX, centerY, radius, -Math.PI/2, Math.PI/2);
+                ctx.ellipse(centerX, centerY, offset, radius, 0, Math.PI/2, -Math.PI/2, true);
+            } else {
+                // 满月阶段 (50-100%)：左侧逐渐变亮
+                var offset = ((phase - 0.5) * 2) * radius;
+                ctx.arc(centerX, centerY, radius, Math.PI/2, -Math.PI/2);
+                ctx.ellipse(centerX, centerY, offset, radius, 0, -Math.PI/2, Math.PI/2, true);
+            }
+            ctx.fill();
+
+            // 纹理效果（噪点）
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
+            for (var i = 0; i < 50; i++) {
+                var angle = Math.random() * Math.PI * 2;
+                var r = Math.random() * radius * 0.8;
+                var x = centerX + Math.cos(angle) * r;
+                var y = centerY + Math.sin(angle) * r;
+                ctx.beginPath();
+                ctx.arc(x, y, Math.random() * 2, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // 百分比文字
+            ctx.fillStyle = percent > 50 ? '#333' : '#fff';
+            ctx.font = 'bold 18px -apple-system, sans-serif';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'middle';
+            ctx.fillText(percent + '%', centerX, centerY);
+        }
+
+        // ============ Extraction 相关函数 ============
+        function loadExtraction() {
+            fetch(API + '/l1/extraction_status').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('extract-total').textContent = d.total_messages;
+                document.getElementById('extract-done').textContent = d.extracted_messages;
+                document.getElementById('extract-pending').textContent = d.pending_messages;
+
+                var html = '';
+                (d.batches || []).forEach(function(b) {
+                    var statusClass = b.status === 'extracted' ? 'status-extracted' : (b.status === 'partial' ? 'status-partial' : 'status-pending');
+                    var statusText = b.status === 'extracted' ? '已提取' : (b.status === 'partial' ? '部分完成' : '待提取');
+                    html += '<tr>';
+                    html += '<td>' + b.date + '</td>';
+                    html += '<td>' + b.msg_range + '</td>';
+                    html += '<td>' + b.total + '</td>';
+                    html += '<td>' + (b.extracted || 0) + '</td>';
+                    html += '<td><span class="status-badge ' + statusClass + '">' + statusText + '</span></td>';
+                    html += '</tr>';
+                });
+                document.getElementById('extraction-batches').innerHTML = html || '<tr><td colspan="5" style="text-align:center;color:#888;">暂无数据</td></tr>';
+            });
+        }
+
+        function triggerExtract() {
+            var status = document.getElementById('extract-status');
+            status.textContent = '启动中...';
+            status.style.color = '#666';
+            fetch(API + '/l1/extract_now', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.status === 'ok') {
+                        status.textContent = '提取任务已启动，请稍后刷新查看进度';
+                        status.style.color = '#28a745';
+                        setTimeout(loadExtraction, 3000);
+                    } else {
+                        status.textContent = '失败：' + (d.message || '未知');
+                        status.style.color = '#dc3545';
+                    }
+                });
+        }
+
+        // ============ Narrative 相关函数 ============
+        var currentNarrativeId = null;
+
+        function loadNarrative() {
+            fetch(API + '/narrative/current').then(function(r) { return r.json(); }).then(function(d) {
+                if (d.exists) {
+                    currentNarrativeId = d.id;
+                    document.getElementById('narrative-meta').innerHTML =
+                        '<strong>版本：</strong>v' + d.version + ' · ' +
+                        '<strong>最后更新：</strong>' + formatTime(d.ts) + ' · ' +
+                        '<strong>触发方式：</strong>' + (d.trigger_type === 'manual' ? '手动' : '自动');
+                    document.getElementById('narrative-content').textContent = d.content;
+                } else {
+                    currentNarrativeId = null;
+                    document.getElementById('narrative-meta').textContent = '暂无叙事';
+                    document.getElementById('narrative-content').textContent = '点击"生成/更新叙事"按钮开始创建共同经历叙事。';
+                }
+            });
+        }
+
+        function generateNarrative() {
+            var status = document.getElementById('narrative-status');
+            status.textContent = '生成中，请稍候（可能需要30-60秒）...';
+            status.style.color = '#666';
+
+            fetch(API + '/narrative/generate', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({trigger_type: 'manual', force: true})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    status.textContent = '生成成功！';
+                    status.style.color = '#28a745';
+                    loadNarrative();
+                } else {
+                    status.textContent = '失败：' + (d.message || '未知');
+                    status.style.color = '#dc3545';
+                }
+            })
+            .catch(function(e) {
+                status.textContent = '请求失败：' + e.message;
+                status.style.color = '#dc3545';
+            });
+        }
+
+        function editNarrative() {
+            if (!currentNarrativeId) {
+                alert('暂无叙事内容可编辑');
+                return;
+            }
+            var content = document.getElementById('narrative-content').textContent;
+            var newContent = prompt('编辑叙事内容：', content);
+            if (newContent === null || newContent === content) return;
+
+            fetch(API + '/narrative/' + currentNarrativeId, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: newContent})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    alert('保存成功');
+                    loadNarrative();
+                } else {
+                    alert('保存失败：' + (d.message || '未知'));
+                }
+            });
+        }
+
+        function loadNarrativeHistory() {
+            fetch(API + '/narrative/history?limit=10')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    var html = '历史版本：\n\n';
+                    (d.history || []).forEach(function(h) {
+                        html += 'v' + h.version + ' - ' + formatTime(h.ts) + ' (' + h.status + ')\n';
+                    });
+                    alert(html || '暂无历史版本');
+                });
+        }
+
+        // ============ Summary 相关函数 ============
+        function loadSummary() {
+            // 加载当前摘要
+            fetch(API + '/summary/current').then(function(r) { return r.json(); }).then(function(d) {
+                if (d.exists) {
+                    var meta = '时间段：' + formatTime(d.period_start) + ' ~ ' + formatTime(d.period_end) + ' · 消息数：' + d.msg_count;
+                    document.getElementById('summary-content').innerHTML = '<div style="font-size:11px;color:#888;margin-bottom:10px;">' + meta + '</div>' + escapeHtml(d.content).replace(/\n/g, '<br>');
+                } else {
+                    document.getElementById('summary-content').textContent = '暂无摘要';
+                }
+            });
+
+            // 加载配置
+            fetch(API + '/summary/config').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('summary-auto-enabled').value = d.auto_update_enabled;
+                document.getElementById('summary-threshold-turns').value = d.check_threshold_turns;
+                document.getElementById('summary-threshold-l1').value = d.check_threshold_l1;
+                document.getElementById('summary-max-turns').value = d.summary_max_turns;
+                document.getElementById('summary-max-tokens').value = d.summary_max_tokens;
+            });
+        }
+
+        function generateSummary() {
+            var status = document.getElementById('summary-status');
+            status.textContent = '生成中...';
+            status.style.color = '#666';
+
+            fetch(API + '/summary/generate', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.status === 'ok') {
+                        status.textContent = '生成成功！';
+                        status.style.color = '#28a745';
+                        loadSummary();
+                    } else {
+                        status.textContent = '失败：' + (d.message || '未知');
+                        status.style.color = '#dc3545';
+                    }
+                });
+        }
+
+        function saveSummaryConfig() {
+            var status = document.getElementById('summary-config-status');
+            status.textContent = '保存中...';
+
+            var data = {
+                auto_update_enabled: parseInt(document.getElementById('summary-auto-enabled').value),
+                check_threshold_turns: parseInt(document.getElementById('summary-threshold-turns').value),
+                check_threshold_l1: parseInt(document.getElementById('summary-threshold-l1').value),
+                summary_max_turns: parseInt(document.getElementById('summary-max-turns').value),
+                summary_max_tokens: parseInt(document.getElementById('summary-max-tokens').value)
+            };
+
+            fetch(API + '/summary/config', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    status.textContent = '保存成功';
+                    status.style.color = '#28a745';
+                } else {
+                    status.textContent = '失败';
+                    status.style.color = '#dc3545';
+                }
+            });
+        }
+
+        // ============ Config 扩展：模块配置 ============
+        function loadConfig() {
+            // 原有的供应商配置加载
+            fetch(API + '/config/providers').then(function(r) { return r.json(); }).then(function(d) {
+                configProviders = d.providers || [];
+                configActive = d.active || null;
+
+                // 原有逻辑保持不变...
+                var activeText = '未配置';
+                if (configActive && configActive.provider_id && configProviders.length > 0) {
+                    var ap = configProviders.filter(function(p) { return p.id === configActive.provider_id; })[0];
+                    if (ap) activeText = ap.name + ' / ' + configActive.model;
+                }
+                document.getElementById('config-active').textContent = '当前主聊天模型：' + activeText;
+
+                var providerSelect = document.getElementById('config-active-provider');
+                providerSelect.innerHTML = '<option value="">选择供应商</option>';
+                configProviders.forEach(function(p) {
+                    var opt = document.createElement('option');
+                    opt.value = p.id;
+                    opt.textContent = p.name;
+                    if (configActive && p.id === configActive.provider_id) opt.selected = true;
+                    providerSelect.appendChild(opt);
+                });
+                onActiveProviderChange();
+
+                var listHtml = '';
+                configProviders.forEach(function(p) {
+                    listHtml += '<div style="padding:10px;background:#f9f9f9;border-radius:6px;margin-bottom:8px;">';
+                    listHtml += '<strong>' + p.name + '</strong><br>';
+                    listHtml += '<span style="font-size:11px;color:#666;">' + p.base_url + '</span><br>';
+                    listHtml += '<span style="font-size:11px;color:#888;">模型：' + (p.models || []).join(', ') + '</span><br>';
+                    listHtml += '<button class="btn btn-small" onclick="editProvider(' + p.id + ')">编辑</button> ';
+                    listHtml += '<button class="btn btn-small btn-danger" onclick="deleteProvider(' + p.id + ')">删除</button>';
+                    listHtml += '</div>';
+                });
+                document.getElementById('config-provider-list').innerHTML = listHtml || '<p style="color:#888;">暂无供应商</p>';
+            });
+
+            // 新增：加载模块配置
+            loadModelConfigs();
+        }
+
+        function loadModelConfigs() {
+            fetch(API + '/config/models').then(function(r) { return r.json(); }).then(function(d) {
+                var configs = d.configs || {};
+                var purposes = [
+                    {key: 'chat', label: '主聊天模型'},
+                    {key: 'l1_extract', label: 'L1 记忆提取'},
+                    {key: 'embedding', label: '向量嵌入'},
+                    {key: 'narrative', label: '共同经历叙事'},
+                    {key: 'summary', label: '近期摘要'}
+                ];
+
+                var html = '';
+                purposes.forEach(function(p) {
+                    var cfg = configs[p.key];
+                    html += '<div class="config-section">';
+                    html += '<h4>' + p.label + '</h4>';
+                    html += '<div class="config-field">';
+                    html += '<label>供应商：</label>';
+                    html += '<select id="model-' + p.key + '-provider" onchange="onModelProviderChange(\'' + p.key + '\')">';
+                    html += '<option value="">未配置</option>';
+                    configProviders.forEach(function(prov) {
+                        var selected = cfg && cfg.provider_id === prov.id ? 'selected' : '';
+                        html += '<option value="' + prov.id + '" ' + selected + '>' + prov.name + '</option>';
+                    });
+                    html += '</select>';
+                    html += '</div>';
+                    html += '<div class="config-field">';
+                    html += '<label>模型：</label>';
+                    html += '<select id="model-' + p.key + '-model" style="width:250px;"></select>';
+                    html += '</div>';
+                    html += '<button class="btn btn-small" onclick="saveModelConfig(\'' + p.key + '\')">保存</button>';
+                    html += '<span id="model-' + p.key + '-status" style="margin-left:8px;font-size:11px;"></span>';
+                    html += '</div>';
+                });
+                document.getElementById('model-configs').innerHTML = html;
+
+                // 初始化模型下拉框
+                purposes.forEach(function(p) {
+                    onModelProviderChange(p.key);
+                });
+            });
+        }
+
+        function onModelProviderChange(purpose) {
+            var providerSelect = document.getElementById('model-' + purpose + '-provider');
+            var modelSelect = document.getElementById('model-' + purpose + '-model');
+            var providerId = parseInt(providerSelect.value);
+
+            modelSelect.innerHTML = '<option value="">选择模型</option>';
+
+            if (!providerId) return;
+
+            var provider = configProviders.filter(function(p) { return p.id === providerId; })[0];
+            if (provider && provider.models) {
+                provider.models.forEach(function(m) {
+                    var opt = document.createElement('option');
+                    opt.value = m;
+                    opt.textContent = m;
+                    modelSelect.appendChild(opt);
+                });
+            }
+        }
+
+        function saveModelConfig(purpose) {
+            var providerId = parseInt(document.getElementById('model-' + purpose + '-provider').value);
+            var model = document.getElementById('model-' + purpose + '-model').value;
+            var status = document.getElementById('model-' + purpose + '-status');
+
+            if (!providerId || !model) {
+                status.textContent = '请选择供应商和模型';
+                status.style.color = '#dc3545';
+                return;
+            }
+
+            status.textContent = '保存中...';
+            status.style.color = '#666';
+
+            fetch(API + '/config/models/' + purpose, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({provider_id: providerId, model_name: model})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    status.textContent = '已保存';
+                    status.style.color = '#28a745';
+                } else {
+                    status.textContent = '失败：' + (d.message || '未知');
+                    status.style.color = '#dc3545';
+                }
             });
         }
 

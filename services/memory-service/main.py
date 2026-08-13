@@ -1,5 +1,6 @@
 from fastapi import FastAPI
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
 import chromadb
@@ -1858,6 +1859,29 @@ async def call_llm_for_summary(config: dict, prompt: str) -> str:
     except Exception as e:
         print(f"LLM call error: {e}")
         return None
+
+# Dashboard 静态文件路由
+DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
+
+@app.get("/")
+async def root():
+    """根路径重定向到 dashboard"""
+    index_file = DASHBOARD_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return JSONResponse({"message": "Memory Service API", "dashboard": "/dashboard/"})
+
+@app.get("/dashboard/")
+async def dashboard():
+    """Dashboard 主页"""
+    index_file = DASHBOARD_DIR / "index.html"
+    if index_file.exists():
+        return FileResponse(index_file)
+    return JSONResponse({"error": "Dashboard not found"}, status_code=404)
+
+# 挂载静态文件目录（CSS/JS 等资源）
+if DASHBOARD_DIR.exists():
+    app.mount("/dashboard/static", StaticFiles(directory=str(DASHBOARD_DIR)), name="dashboard_static")
 
 if __name__ == "__main__":
     import uvicorn

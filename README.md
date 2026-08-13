@@ -1,4 +1,4 @@
-# Memory System v1.5
+# Memory System v1.6
 
 AI 长期记忆系统，基于 Paramecium 架构。
 
@@ -26,6 +26,26 @@ AI 长期记忆系统，基于 Paramecium 架构。
 - 工具格式归一：OpenAI 格式工具自动转 Anthropic 原生格式，兼容新版 API
 
 ## 更新日志
+- v1.6 — Shared Narrative + Dashboard 扩展 + 更新检查周期
+  - Shared Narrative：月相式记忆总结，读取所有 L1 memories 生成整体叙事
+    - 新增 narrative.db：存储 narrative 内容、生成时间、使用的模型配置
+    - POST /narrative/generate：生成新 narrative（支持强制重新生成）
+    - GET /narrative/latest：获取最新 narrative
+    - GET /narrative/history：查看历史 narrative 列表
+    - DELETE /narrative/{id}：删除指定 narrative
+    - Dashboard 新增 Narrative 页面：显示月相进度条、生成按钮、历史记录
+  - Dashboard 配置扩展：Provider 多模型管理 + Narrative 独立配置
+    - Provider 管理：新增/编辑/删除多个 API 供应商配置
+    - 每个 provider 支持多个模型列表（如 claude-opus-4-6, claude-opus-4-7）
+    - Narrative 专用模型配置：独立于主对话模型，可选择更强大的模型生成总结
+    - API Key 加密存储：使用 Fernet 对称加密保护敏感信息（CONFIG_SECRET_KEY）
+    - Dashboard 显示 provider 列表、激活状态、测试连接功能
+  - 更新检查周期：识别长期未更新的 L1 memories
+    - GET /updates/check：检查超过指定周期未更新的 memories
+    - POST /updates/mark：标记 memory 为已更新
+    - GET/PUT /updates/config：配置更新检查周期（默认 30 天）
+    - Dashboard 新增更新检查页面：显示待更新列表、一键标记、批量操作
+  - Narrative 生成提示词：月相比喻 + 重要性评分（⚫⚪）+ 时间线叙事
 - v1.5 — 重构 L1 删除/重提取：统一硬删 + 单条重提取
   - L1 统一硬删（SQLite DELETE + ChromaDB delete）：修复原来只标 superseded
     从不删向量、已删记忆仍被 /search 命中的问题（ai_self 感受删不掉最明显）
