@@ -103,6 +103,7 @@
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
+            <button class="tab" onclick="showPanel('logs')">系统日志</button>
         </div>
 
         <div id="overview" class="panel active">
@@ -333,6 +334,19 @@
                 <span id="summary-config-status" style="margin-left:10px;font-size:12px;"></span>
             </div>
         </div>
+
+        <!-- System Logs 页面 -->
+        <div id="logs" class="panel">
+            <h3>系统日志</h3>
+            <div style="margin-bottom:15px;">
+                <button class="btn" onclick="loadLogs()">刷新日志</button>
+                <button class="btn" onclick="testAutoCheck()" style="background:#17a2b8;">手动触发检查</button>
+                <span id="logs-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div id="logs-content" style="background:#f8f9fa;padding:12px;border-radius:6px;font-family:monospace;font-size:12px;line-height:1.6;max-height:600px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">
+                暂无日志
+            </div>
+        </div>
     </div>
 
     <!-- 修复4：L1 内容编辑弹窗 -->
@@ -407,6 +421,7 @@
             if (name === 'l1') loadL1('all');
             if (name === 'profile') loadProfile();
             if (name === 'config') loadConfig();
+            if (name === 'logs') loadLogs();
             if (name === 'pipeline') loadPipeline();
             if (name === 'extraction') loadExtraction();
             if (name === 'narrative') loadNarrative();
@@ -1458,6 +1473,48 @@
                     status.style.color = '#dc3545';
                 }
             });
+        }
+
+        // ============ System Logs 相关函数 ============
+        function loadLogs() {
+            var content = document.getElementById('logs-content');
+            content.textContent = '加载中...';
+
+            fetch(API + '/auto/logs?lines=200')
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.logs && d.logs.length > 0) {
+                        content.textContent = d.logs.join('\n');
+                        // 自动滚动到底部
+                        content.scrollTop = content.scrollHeight;
+                    } else {
+                        content.textContent = '暂无日志';
+                    }
+                })
+                .catch(function(e) {
+                    content.textContent = '加载失败: ' + e.message;
+                });
+        }
+
+        function testAutoCheck() {
+            var status = document.getElementById('logs-status');
+            status.textContent = '触发检查中...';
+            status.style.color = '#666';
+
+            fetch(API + '/auto/check_now', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    status.textContent = '✅ 检查完成，查看日志了解结果';
+                    status.style.color = '#28a745';
+                    setTimeout(function() {
+                        loadLogs();
+                        status.textContent = '';
+                    }, 1500);
+                })
+                .catch(function(e) {
+                    status.textContent = '❌ 请求失败: ' + e.message;
+                    status.style.color = '#dc3545';
+                });
         }
 
         loadStats();

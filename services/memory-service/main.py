@@ -18,8 +18,24 @@ import asyncio
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
+import logging
 
 load_dotenv()
+
+# 配置日志
+LOG_DIR = Path(__file__).parent.parent.parent / "data" / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+AUTO_TRIGGER_LOG = LOG_DIR / "auto_trigger.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(AUTO_TRIGGER_LOG, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
 
@@ -1703,14 +1719,14 @@ async def check_and_update_summary():
         watermark, new_count = get_summary_pending()
         threshold = config["threshold_turns"]
         if new_count < threshold:
-            print(f"[AUTO] Summary 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）", flush=True)
+            logger.info(f"Summary 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）")
             return
         async with _auto_lock:
-            print(f"[AUTO] 触发 Summary 更新：新增 {new_count} 条消息（阈值 {threshold}）", flush=True)
+            logger.info(f"触发 Summary 更新：新增 {new_count} 条消息（阈值 {threshold}）")
             result = await generate_summary()
-            print(f"[AUTO] Summary 结果：{result.get('status')} {result.get('message', '')}")
+            logger.info(f"Summary 结果：{result.get('status')} {result.get('message', '')}")
     except Exception as e:
-        print(f"[AUTO] Summary 检查异常：{e}", flush=True)
+        logger.error(f"Summary 检查异常：{e}", exc_info=True)
 
 async def check_and_update_narrative():
     """达到重要 L1 阈值时自动演化 Shared Narrative。"""
@@ -1721,17 +1737,17 @@ async def check_and_update_narrative():
         watermark, new_count = get_narrative_pending()
         threshold = config["threshold_l1"]
         if new_count < threshold:
-            print(f"[AUTO] Narrative 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）", flush=True)
+            logger.info(f"Narrative 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）")
             return
         async with _auto_lock:
-            print(f"[AUTO] 触发 Narrative 更新：新增 {new_count} 条重要记忆（阈值 {threshold}）", flush=True)
+            logger.info(f"触发 Narrative 更新：新增 {new_count} 条重要记忆（阈值 {threshold}）")
             result = await generate_narrative(NarrativeGenerateRequest(
                 trigger_type="auto",
                 reason=f"自动检查：新增 {new_count} 条重要记忆，达到阈值 {threshold}"
             ))
-            print(f"[AUTO] Narrative 结果：{result.get('status')} {result.get('message', '')}")
+            logger.info(f"Narrative 结果：{result.get('status')} {result.get('message', '')}")
     except Exception as e:
-        print(f"[AUTO] Narrative 检查异常：{e}", flush=True)
+        logger.error(f"Narrative 检查异常：{e}", exc_info=True)
 
 @app.get("/auto/status")
 async def get_auto_status():
@@ -1765,6 +1781,22 @@ async def trigger_auto_check():
     await check_and_update_summary()
     await check_and_update_narrative()
     return {"status": "ok", "message": "检查已执行，详见服务日志"}
+
+@app.get("/auto/logs")
+async def get_auto_logs(lines: int = 100):
+    """读取最近的自动触发日志"""
+    try:
+        if not AUTO_TRIGGER_LOG.exists():
+            return {"logs": []}
+
+        # 读取最后 N 行
+        with open(AUTO_TRIGGER_LOG, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+            recent_lines = all_lines[-lines:] if len(all_lines) > lines else all_lines
+
+        return {"logs": [line.strip() for line in recent_lines]}
+    except Exception as e:
+        return {"logs": [], "error": str(e)}
 
 # ============ L1 Extraction Status API ============
 
