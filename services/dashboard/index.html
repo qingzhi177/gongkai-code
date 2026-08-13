@@ -267,6 +267,7 @@
             <h3>近期摘要</h3>
             <div style="margin:15px 0;">
                 <button class="btn" onclick="generateSummary()">生成摘要</button>
+                <button class="btn" onclick="editSummary()" style="background:#28a745;">编辑</button>
                 <span id="summary-status" style="margin-left:10px;font-size:12px;"></span>
             </div>
             <div class="summary-content" id="summary-content" style="margin-bottom:20px;">
@@ -315,6 +316,32 @@
                 <button class="btn" style="background:#999;" onclick="closeEditL1()">取消</button>
                 <button class="btn" onclick="saveEditL1()">保存</button>
                 <span id="edit-l1-status" style="margin-left:8px;font-size:12px;"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="editNarrativeModal" class="modal-mask">
+        <div class="modal-box" style="width:90%;max-width:900px;">
+            <h3>编辑共同经历叙事</h3>
+            <textarea id="edit-narrative-content" placeholder="叙事内容" style="min-height:400px;font-family:inherit;line-height:1.6;"></textarea>
+            <div style="font-size:11px;color:#888;margin-bottom:8px;">直接编辑当前版本，保存后将创建新版本（旧版本保留为 superseded）。</div>
+            <div class="modal-actions">
+                <button class="btn" style="background:#999;" onclick="closeEditNarrative()">取消</button>
+                <button class="btn" onclick="saveEditNarrative()">保存</button>
+                <span id="edit-narrative-status" style="margin-left:8px;font-size:12px;"></span>
+            </div>
+        </div>
+    </div>
+
+    <div id="editSummaryModal" class="modal-mask">
+        <div class="modal-box" style="width:80%;max-width:700px;">
+            <h3>编辑近期摘要</h3>
+            <textarea id="edit-summary-content" placeholder="摘要内容" style="min-height:300px;font-family:inherit;line-height:1.6;"></textarea>
+            <div style="font-size:11px;color:#888;margin-bottom:8px;">直接编辑当前摘要，保存后即时生效。</div>
+            <div class="modal-actions">
+                <button class="btn" style="background:#999;" onclick="closeEditSummary()">取消</button>
+                <button class="btn" onclick="saveEditSummary()">保存</button>
+                <span id="edit-summary-status" style="margin-left:8px;font-size:12px;"></span>
             </div>
         </div>
     </div>
@@ -933,22 +960,43 @@
                 return;
             }
             var content = document.getElementById('narrative-content').textContent;
-            var newContent = prompt('编辑叙事内容：', content);
-            if (newContent === null || newContent === content) return;
+            document.getElementById('edit-narrative-content').value = content;
+            document.getElementById('edit-narrative-status').textContent = '';
+            document.getElementById('editNarrativeModal').classList.add('active');
+            document.getElementById('edit-narrative-content').focus();
+        }
 
+        function closeEditNarrative() {
+            document.getElementById('editNarrativeModal').classList.remove('active');
+        }
+
+        function saveEditNarrative() {
+            var content = document.getElementById('edit-narrative-content').value.trim();
+            var statusEl = document.getElementById('edit-narrative-status');
+            if (!content) {
+                statusEl.textContent = '内容不能为空';
+                return;
+            }
+            statusEl.textContent = '保存中...';
             fetch(API + '/narrative/' + currentNarrativeId, {
                 method: 'PUT',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({content: newContent})
+                body: JSON.stringify({content: content})
             })
             .then(function(r) { return r.json(); })
             .then(function(d) {
                 if (d.status === 'ok') {
-                    alert('保存成功');
-                    loadNarrative();
+                    statusEl.textContent = '已保存';
+                    setTimeout(function() {
+                        closeEditNarrative();
+                        loadNarrative();
+                    }, 800);
                 } else {
-                    alert('保存失败：' + (d.message || '未知'));
+                    statusEl.textContent = '保存失败：' + (d.message || '未知');
                 }
+            })
+            .catch(function(e) {
+                statusEl.textContent = '保存失败: ' + e.message;
             });
         }
 
@@ -965,13 +1013,17 @@
         }
 
         // ============ Summary 相关函数 ============
+        var currentSummaryId = null;
+
         function loadSummary() {
             // 加载当前摘要
             fetch(API + '/summary/current').then(function(r) { return r.json(); }).then(function(d) {
                 if (d.exists) {
+                    currentSummaryId = d.id;
                     var meta = '时间段：' + formatTime(d.period_start) + ' ~ ' + formatTime(d.period_end) + ' · 消息数：' + d.msg_count;
                     document.getElementById('summary-content').innerHTML = '<div style="font-size:11px;color:#888;margin-bottom:10px;">' + meta + '</div>' + escapeHtml(d.content).replace(/\n/g, '<br>');
                 } else {
+                    currentSummaryId = null;
                     document.getElementById('summary-content').textContent = '暂无摘要';
                 }
             });
@@ -983,6 +1035,55 @@
                 document.getElementById('summary-threshold-l1').value = d.check_threshold_l1;
                 document.getElementById('summary-max-turns').value = d.summary_max_turns;
                 document.getElementById('summary-max-tokens').value = d.summary_max_tokens;
+            });
+        }
+
+        function editSummary() {
+            if (!currentSummaryId) {
+                alert('暂无摘要内容可编辑');
+                return;
+            }
+            fetch(API + '/summary/current').then(function(r) { return r.json(); }).then(function(d) {
+                if (d.exists) {
+                    document.getElementById('edit-summary-content').value = d.content;
+                    document.getElementById('edit-summary-status').textContent = '';
+                    document.getElementById('editSummaryModal').classList.add('active');
+                    document.getElementById('edit-summary-content').focus();
+                }
+            });
+        }
+
+        function closeEditSummary() {
+            document.getElementById('editSummaryModal').classList.remove('active');
+        }
+
+        function saveEditSummary() {
+            var content = document.getElementById('edit-summary-content').value.trim();
+            var statusEl = document.getElementById('edit-summary-status');
+            if (!content) {
+                statusEl.textContent = '内容不能为空';
+                return;
+            }
+            statusEl.textContent = '保存中...';
+            fetch(API + '/summary/' + currentSummaryId, {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({content: content})
+            })
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'ok') {
+                    statusEl.textContent = '已保存';
+                    setTimeout(function() {
+                        closeEditSummary();
+                        loadSummary();
+                    }, 800);
+                } else {
+                    statusEl.textContent = '保存失败：' + (d.message || '未知');
+                }
+            })
+            .catch(function(e) {
+                statusEl.textContent = '保存失败: ' + e.message;
             });
         }
 

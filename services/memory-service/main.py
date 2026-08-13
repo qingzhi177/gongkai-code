@@ -1498,6 +1498,19 @@ async def get_current_summary():
         "ts": row[5]
     }
 
+class SummaryUpdateRequest(BaseModel):
+    content: str
+
+@app.put("/summary/{summary_id}")
+async def update_summary(summary_id: int, req: SummaryUpdateRequest):
+    """编辑 Summary 内容"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    c.execute("UPDATE recent_summary SET content=? WHERE id=?", (req.content, summary_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
 @app.post("/summary/generate")
 async def generate_summary():
     """生成 Recent Summary"""
