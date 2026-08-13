@@ -46,10 +46,27 @@
         /* Pipeline 月相样式 */
         .pipeline-stage { margin: 20px 0; text-align: center; }
         .moon-container { display: inline-block; position: relative; width: 120px; height: 120px; }
-        .moon-phase { width: 100%; height: 100%; border-radius: 50%; background: #1a1a1a; position: relative; overflow: hidden; box-shadow: 0 0 15px rgba(0,0,0,0.3); }
+        .moon-phase {
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            background: radial-gradient(circle at 50% 50%, #2a2a2a 0%, #0a0a0a 100%);
+            position: relative;
+            overflow: hidden;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.5), inset 0 -2px 10px rgba(0,0,0,0.3);
+        }
         .moon-light { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 50%; background: #e8e8d0; }
-        .moon-texture { position: absolute; top: 0; left: 0; width: 100%; height: 100%; background: radial-gradient(circle at 30% 30%, rgba(255,255,255,0.1) 0%, transparent 50%); opacity: 0.3; }
-        .pipeline-label { margin-top: 10px; font-weight: bold; font-size: 14px; }
+        .moon-percentage {
+            position: absolute;
+            bottom: -25px;
+            left: 50%;
+            transform: translateX(-50%);
+            font-size: 12px;
+            font-weight: bold;
+            color: #666;
+            white-space: nowrap;
+        }
+        .pipeline-label { margin-top: 35px; font-weight: bold; font-size: 14px; }
         .pipeline-detail { font-size: 12px; color: #666; margin-top: 4px; }
         /* Extraction 表格样式 */
         .extraction-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
@@ -829,8 +846,11 @@
             // 清空画布
             ctx.clearRect(0, 0, 120, 120);
 
-            // 背景（暗面）
-            ctx.fillStyle = '#1a1a1a';
+            // 背景（暗面）- 径向渐变增加立体感
+            var darkGradient = ctx.createRadialGradient(centerX, centerY, 0, centerX, centerY, radius);
+            darkGradient.addColorStop(0, '#2a2a2a');
+            darkGradient.addColorStop(1, '#0a0a0a');
+            ctx.fillStyle = darkGradient;
             ctx.beginPath();
             ctx.arc(centerX, centerY, radius, 0, Math.PI * 2);
             ctx.fill();
@@ -839,8 +859,12 @@
             // 0%=新月（全暗）, 50%=上弦月, 100%=满月（全亮）
             var phase = percent / 100;
 
-            // 亮面
-            ctx.fillStyle = '#e8e8d0';
+            // 亮面 - 使用渐变模拟光照
+            var lightGradient = ctx.createRadialGradient(centerX - 10, centerY - 10, 0, centerX, centerY, radius);
+            lightGradient.addColorStop(0, '#faf8f0');
+            lightGradient.addColorStop(0.6, '#e8e8d0');
+            lightGradient.addColorStop(1, '#c8c8b0');
+            ctx.fillStyle = lightGradient;
             ctx.beginPath();
 
             if (phase <= 0.5) {
@@ -856,24 +880,53 @@
             }
             ctx.fill();
 
-            // 纹理效果（噪点）
-            ctx.fillStyle = 'rgba(255, 255, 255, 0.1)';
-            for (var i = 0; i < 50; i++) {
-                var angle = Math.random() * Math.PI * 2;
-                var r = Math.random() * radius * 0.8;
-                var x = centerX + Math.cos(angle) * r;
-                var y = centerY + Math.sin(angle) * r;
-                ctx.beginPath();
-                ctx.arc(x, y, Math.random() * 2, 0, Math.PI * 2);
-                ctx.fill();
-            }
+            // 月海效果（陨石坑纹理）- 只在亮面绘制
+            ctx.save();
+            ctx.clip(); // 限制在亮面区域
+            ctx.globalAlpha = 0.15;
 
-            // 百分比文字
-            ctx.fillStyle = percent > 50 ? '#333' : '#fff';
-            ctx.font = 'bold 18px -apple-system, sans-serif';
-            ctx.textAlign = 'center';
-            ctx.textBaseline = 'middle';
-            ctx.fillText(percent + '%', centerX, centerY);
+            // 绘制几个主要陨石坑
+            var craters = [
+                {x: 35, y: 40, r: 8},
+                {x: 70, y: 50, r: 6},
+                {x: 50, y: 70, r: 5},
+                {x: 65, y: 35, r: 4},
+                {x: 45, y: 55, r: 7}
+            ];
+
+            craters.forEach(function(crater) {
+                var craterGradient = ctx.createRadialGradient(crater.x, crater.y, 0, crater.x, crater.y, crater.r);
+                craterGradient.addColorStop(0, 'rgba(80, 80, 70, 0.8)');
+                craterGradient.addColorStop(0.7, 'rgba(100, 100, 90, 0.3)');
+                craterGradient.addColorStop(1, 'rgba(120, 120, 110, 0)');
+                ctx.fillStyle = craterGradient;
+                ctx.beginPath();
+                ctx.arc(crater.x, crater.y, crater.r, 0, Math.PI * 2);
+                ctx.fill();
+            });
+
+            ctx.restore();
+
+            // 边缘光晕柔化
+            ctx.globalCompositeOperation = 'source-over';
+            var haloGradient = ctx.createRadialGradient(centerX, centerY, radius - 2, centerX, centerY, radius + 3);
+            haloGradient.addColorStop(0, 'rgba(255, 255, 255, 0)');
+            haloGradient.addColorStop(0.8, 'rgba(200, 200, 180, 0.1)');
+            haloGradient.addColorStop(1, 'rgba(150, 150, 130, 0)');
+            ctx.fillStyle = haloGradient;
+            ctx.beginPath();
+            ctx.arc(centerX, centerY, radius + 3, 0, Math.PI * 2);
+            ctx.fill();
+
+            // 显示百分比文字（在 canvas 下方）
+            var container = canvas.parentElement;
+            var percentText = container.querySelector('.moon-percentage');
+            if (!percentText) {
+                percentText = document.createElement('div');
+                percentText.className = 'moon-percentage';
+                container.appendChild(percentText);
+            }
+            percentText.textContent = Math.round(percent) + '%';
         }
 
         // ============ Extraction 相关函数 ============
