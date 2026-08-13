@@ -821,20 +821,39 @@
         }
 
         // ============ Pipeline 相关函数 ============
-        function loadPipeline() {
-            fetch(API + '/pipeline/status').then(function(r) { return r.json(); }).then(function(d) {
-                // 更新详情文本
-                document.getElementById('pipeline-l0-detail').textContent = d.l0.total + ' 条 (100%)';
-                document.getElementById('pipeline-l1-detail').textContent = d.l1.extracted + '/' + d.l0.total + ' (' + d.l1.percent + '%)';
-                document.getElementById('pipeline-embedding-detail').textContent = d.embedding.count + ' 条向量';
-                document.getElementById('pipeline-narrative-detail').textContent = 'v' + d.narrative.version + (d.narrative.last_update ? ' · ' + formatTime(d.narrative.last_update) : '');
+        // Pipeline 缓存（减少频繁查询）
+        var pipelineCache = null;
+        var pipelineCacheTime = 0;
+        var PIPELINE_CACHE_TTL = 30000; // 30 秒缓存
 
-                // 绘制月相
-                drawMoonPhase('moon-l0', d.l0.percent);
-                drawMoonPhase('moon-l1', d.l1.percent);
-                drawMoonPhase('moon-embedding', d.embedding.count > 0 ? 100 : 0);
-                drawMoonPhase('moon-narrative', d.narrative.version > 0 ? 80 : 0);
+        function loadPipeline(forceRefresh) {
+            var now = Date.now();
+
+            // 如果缓存有效且不是强制刷新，直接使用缓存
+            if (!forceRefresh && pipelineCache && (now - pipelineCacheTime < PIPELINE_CACHE_TTL)) {
+                renderPipeline(pipelineCache);
+                return;
+            }
+
+            fetch(API + '/pipeline/status').then(function(r) { return r.json(); }).then(function(d) {
+                pipelineCache = d;
+                pipelineCacheTime = now;
+                renderPipeline(d);
             });
+        }
+
+        function renderPipeline(d) {
+            // 更新详情文本
+            document.getElementById('pipeline-l0-detail').textContent = d.l0.total + ' 条 (100%)';
+            document.getElementById('pipeline-l1-detail').textContent = d.l1.extracted + '/' + d.l0.total + ' (' + d.l1.percent + '%)';
+            document.getElementById('pipeline-embedding-detail').textContent = d.embedding.count + ' 条向量';
+            document.getElementById('pipeline-narrative-detail').textContent = 'v' + d.narrative.version + (d.narrative.last_update ? ' · ' + formatTime(d.narrative.last_update) : '');
+
+            // 绘制月相
+            drawMoonPhase('moon-l0', d.l0.percent);
+            drawMoonPhase('moon-l1', d.l1.percent);
+            drawMoonPhase('moon-embedding', d.embedding.count > 0 ? 100 : 0);
+            drawMoonPhase('moon-narrative', d.narrative.version > 0 ? 80 : 0);
         }
 
         function drawMoonPhase(canvasId, percent) {
@@ -1016,8 +1035,15 @@
 
         function generateNarrative() {
             var status = document.getElementById('narrative-status');
-            status.textContent = '生成中，请稍候（可能需要30-60秒）...';
+            status.textContent = '🔄 正在调用 LLM 生成叙事（预计 30-90 秒）...';
             status.style.color = '#666';
+            status.style.fontWeight = 'bold';
+
+            var startTime = Date.now();
+            var timerInterval = setInterval(function() {
+                var elapsed = Math.floor((Date.now() - startTime) / 1000);
+                status.textContent = '🔄 生成中... ' + elapsed + 's（LLM 推理中，请稍候）';
+            }, 1000);
 
             fetch(API + '/narrative/generate', {
                 method: 'POST',
@@ -1026,21 +1052,33 @@
             })
             .then(function(r) { return r.json(); })
             .then(function(d) {
+                clearInterval(timerInterval);
+                var elapsed = Math.floor((Date.now() - startTime) / 1000);
+
                 if (d.status === 'ok') {
-                    status.textContent = '生成成功！';
+                    status.textContent = '✅ 生成成功！（耗时 ' + elapsed + 's）';
                     status.style.color = '#28a745';
-                    loadNarrative();
+                    status.style.fontWeight = 'normal';
+                    setTimeout(function() {
+                        loadNarrative();
+                        loadPipeline(true); // 强制刷新 Pipeline 缓存
+                        status.textContent = '';
+                    }, 2000);
                 } else if (d.status === 'skipped') {
-                    status.textContent = d.message || '没有新增重要记忆，无需更新';
+                    status.textContent = 'ℹ️ ' + (d.message || '没有新增重要记忆，无需更新');
                     status.style.color = '#666';
+                    status.style.fontWeight = 'normal';
                 } else {
-                    status.textContent = '失败：' + (d.message || '未知');
+                    status.textContent = '❌ 失败：' + (d.message || '未知');
                     status.style.color = '#dc3545';
+                    status.style.fontWeight = 'normal';
                 }
             })
             .catch(function(e) {
-                status.textContent = '请求失败：' + e.message;
+                clearInterval(timerInterval);
+                status.textContent = '❌ 请求失败：' + e.message;
                 status.style.color = '#dc3545';
+                status.style.fontWeight = 'normal';
             });
         }
 
@@ -1218,20 +1256,41 @@
 
         function generateSummary() {
             var status = document.getElementById('summary-status');
-            status.textContent = '生成中...';
+            status.textContent = '🔄 正在生成摘要...';
             status.style.color = '#666';
+            status.style.fontWeight = 'bold';
+
+            var startTime = Date.now();
+            var timerInterval = setInterval(function() {
+                var elapsed = Math.floor((Date.now() - startTime) / 1000);
+                status.textContent = '🔄 生成中... ' + elapsed + 's';
+            }, 1000);
 
             fetch(API + '/summary/generate', { method: 'POST' })
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
+                    clearInterval(timerInterval);
+                    var elapsed = Math.floor((Date.now() - startTime) / 1000);
+
                     if (d.status === 'ok') {
-                        status.textContent = '生成成功！';
+                        status.textContent = '✅ 生成成功！（耗时 ' + elapsed + 's）';
                         status.style.color = '#28a745';
-                        loadSummary();
+                        status.style.fontWeight = 'normal';
+                        setTimeout(function() {
+                            loadSummary();
+                            status.textContent = '';
+                        }, 2000);
                     } else {
-                        status.textContent = '失败：' + (d.message || '未知');
+                        status.textContent = '❌ 失败：' + (d.message || '未知');
                         status.style.color = '#dc3545';
+                        status.style.fontWeight = 'normal';
                     }
+                })
+                .catch(function(e) {
+                    clearInterval(timerInterval);
+                    status.textContent = '❌ 请求失败：' + e.message;
+                    status.style.color = '#dc3545';
+                    status.style.fontWeight = 'normal';
                 });
         }
 
