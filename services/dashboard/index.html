@@ -1187,26 +1187,25 @@
         function loadSummaryObservatory() {
             fetch(API + '/auto/status').then(function(r) { return r.json(); }).then(function(d) {
                 var summaryData = d.summary || {};
-                var config = d.config || {};
 
                 // 自动更新状态
-                var autoEnabled = config.auto_update_enabled === 1;
+                var autoEnabled = d.enabled === 1;
                 document.getElementById('observatory-auto-status').textContent = autoEnabled ? '已启用' : '已禁用';
                 document.getElementById('observatory-auto-status').style.color = autoEnabled ? '#28a745' : '#999';
 
                 // 下次更新预计
-                if (d.next_check_at) {
-                    document.getElementById('observatory-next-update').textContent = '定时检查 ' + formatTime(d.next_check_at);
+                if (d.next_check) {
+                    document.getElementById('observatory-next-update').textContent = '定时检查 ' + formatTime(d.next_check);
                 } else {
                     document.getElementById('observatory-next-update').textContent = '-';
                 }
 
                 // 阈值进度
-                var newL0 = summaryData.new_l0 || 0;
-                var thresholdTurns = config.check_threshold_turns || 50;
-                var progress = Math.floor((newL0 / thresholdTurns) * 100);
+                var newMessages = summaryData.new_messages || 0;
+                var threshold = summaryData.threshold || 50;
+                var progress = Math.floor((newMessages / threshold) * 100);
                 document.getElementById('observatory-threshold-progress').innerHTML =
-                    newL0 + ' / ' + thresholdTurns + ' 轮对话 (' + progress + '%)';
+                    newMessages + ' / ' + threshold + ' 轮对话 (' + progress + '%)';
             }).catch(function(e) {
                 console.error('Load summary observatory failed:', e);
             });
