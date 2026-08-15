@@ -217,6 +217,68 @@ def mark_extracted(ids):
     conn.commit()
     conn.close()
 
+def check_and_auto_update_narrative():
+    """L1提取完成后检查是否需要自动更新 Narrative"""
+    try:
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+
+        # 读取配置
+        cfg = c.execute(
+            "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1 FROM narrative_config WHERE id=1"
+        ).fetchone()
+
+        if not cfg or not cfg[0]:  # auto_update_enabled = 0
+            conn.close()
+            return
+
+        threshold_turns = cfg[1] or 50
+        threshold_l1 = cfg[2] or 10
+
+        # 获取上次 Narrative 更新时间
+        last_narrative = c.execute(
+            "SELECT ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+        ).fetchone()
+        last_ts = last_narrative[0] if last_narrative else None
+
+        # 统计上次更新后新增的 L1 数量
+        if last_ts:
+            new_l1_count = c.execute(
+                "SELECT COUNT(*) FROM l1_memories WHERE status='active' AND ts > ?", (last_ts,)
+            ).fetchone()[0]
+        else:
+            new_l1_count = c.execute(
+                "SELECT COUNT(*) FROM l1_memories WHERE status='active'"
+            ).fetchone()[0]
+
+        # 统计上次更新后新增的 L0 对话轮数
+        if last_ts:
+            new_turns = c.execute(
+                "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND ts > ? AND role='assistant'", (last_ts,)
+            ).fetchone()[0]
+        else:
+            new_turns = c.execute(
+                "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND role='assistant'"
+            ).fetchone()[0]
+
+        conn.close()
+
+        should_update = (new_l1_count >= threshold_l1) or (new_turns >= threshold_turns)
+        print(f"[NARRATIVE AUTO] 新增L1={new_l1_count}(阈值{threshold_l1}), 新增轮次={new_turns}(阈值{threshold_turns}), 触发={should_update}")
+
+        if should_update:
+            print("[NARRATIVE AUTO] 触发自动更新...")
+            import requests
+            requests.post(
+                "http://localhost:8001/narrative/generate",
+                json={"trigger_type": "auto_threshold", "force": False},
+                timeout=120
+            )
+            print("[NARRATIVE AUTO] 自动更新请求已发送")
+
+    except Exception as e:
+        print(f"[NARRATIVE AUTO] 检查失败: {e}")
+
 def main():
     print(f"[{datetime.now()}] L1 extraction starting...")
     messages = get_unextracted()
@@ -243,6 +305,8 @@ def main():
             print("  No memories")
         mark_extracted(ids)
     print(f"[{datetime.now()}] Complete.")
+    # 提取完成后检查是否需要更新 Narrative
+    check_and_auto_update_narrative()
 
 if __name__ == "__main__":
     main()
