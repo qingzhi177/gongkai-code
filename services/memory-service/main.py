@@ -200,6 +200,12 @@ def init_db():
     )''')
     # 配置行必须存在，否则自动检查读不到配置会静默跳过
     c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
+    # narrative_state 增量状态表：记录上次已处理到哪条消息
+    c.execute('''CREATE TABLE IF NOT EXISTS narrative_state (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        last_processed_l1_id INTEGER DEFAULT 0,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
     # 增量水位线：记录生成时已消费到的最大 id。
     # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
     # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
@@ -1394,54 +1400,66 @@ async def generate_narrative(req: NarrativeGenerateRequest):
     没有新增则跳过（force=true 强制用全部重要记忆重写）。
     """
     try:
-        # 1. 获取现有 narrative 及其水位线
+        # 1. 获取现有 narrative
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
         existing = c.execute(
-            "SELECT content, last_l1_id FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
+            "SELECT content FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
         ).fetchone()
         existing_narrative = existing[0] if existing else ""
-        watermark = (existing[1] or 0) if existing else 0
 
-        full_rewrite = req.force or not existing_narrative
-        if full_rewrite:
-            watermark = 0
-            existing_narrative = "" if req.force else existing_narrative
+        # 2. 获取增量状态（上次处理到哪条 L1）
+        state = c.execute("SELECT last_processed_l1_id FROM narrative_state WHERE id=1").fetchone()
+        last_id = state[0] if state else 0
 
-        # 2. 只取上次生成后新增的重要记忆，按 id 正序（≈提取顺序）
-        new_memories = c.execute(
-            f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
-            (watermark, NARRATIVE_BATCH_LIMIT)
-        ).fetchall()
-        conn.close()
+        # 3. 如果是强制重生成，忽略增量，读取全部
+        if req.force or not existing_narrative:
+            # 全量：读取所有重要记忆
+            new_memories = c.execute(
+                f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} ORDER BY id ASC LIMIT ?",
+                (NARRATIVE_BATCH_LIMIT,)
+            ).fetchall()
+        else:
+            # 增量：只读上次之后新增的重要记忆
+            new_memories = c.execute(
+                f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
+                (last_id, NARRATIVE_BATCH_LIMIT)
+            ).fetchall()
 
         if not new_memories:
-            return {"status": "skipped", "message": "上次生成后没有新增重要记忆，无需更新"}
+            conn.close()
+            return {"status": "skipped", "message": f"新增记忆不足，跳过更新（上次已处理到 L1 id={last_id}）"}
+
+        # 如果新增不足 5 条且非强制，跳过（内容太少不值得更新）
+        if len(new_memories) < 5 and not req.force and existing_narrative:
+            conn.close()
+            return {"status": "skipped", "message": f"新增记忆不足（{len(new_memories)}条），跳过更新"}
+
+        # 4. 获取最新 L1 id，用于更新 state
+        latest_l1 = c.execute(
+            "SELECT MAX(id) FROM l1_memories WHERE status='active'"
+        ).fetchone()
+        latest_l1_id = latest_l1[0] if latest_l1 and latest_l1[0] else 0
 
         consumed_ids = [m[0] for m in new_memories]
+        conn.close()
 
-        # 3. 获取 narrative 模型配置
+        # 5. 获取模型配置
         config = await get_model_config("narrative")
         if not config["configured"]:
             return {"status": "error", "message": "Narrative 模型未配置"}
 
-        # 4. 构建提示词（增量演化 or 首次/强制全量生成）
+        # 6. 构建提示词并调用 LLM
         prompt_parts = await build_narrative_prompt(existing_narrative, new_memories)
-
-        # 5. 调用 LLM 生成
         new_narrative = await call_llm_for_narrative(config, prompt_parts)
 
         if not new_narrative:
             return {"status": "error", "message": "生成失败"}
 
-        # 6. 保存新版本
+        # 7. 保存新版本 + 更新增量状态
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
-
-        # 标记旧版本为 superseded
         c.execute("UPDATE shared_narrative SET status='superseded' WHERE status='active'")
-
-        # 获取新版本号
         last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
         new_version = last_version + 1
 
@@ -1451,17 +1469,21 @@ async def generate_narrative(req: NarrativeGenerateRequest):
             "reason": req.reason or ("强制全量重写" if req.force else
                                      "首次生成" if not existing else
                                      f"新增 {len(consumed_ids)} 条重要记忆"),
-            "mode": "full" if full_rewrite else "incremental",
+            "mode": "full" if (req.force or not existing) else "incremental",
             "l1_ids": consumed_ids,
             "l1_count": len(consumed_ids),
         }, ensure_ascii=False)
 
-        # 插入新版本
         c.execute(
             "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) VALUES (?, ?, ?, ?, 'active', ?)",
             (new_narrative, new_version, req.trigger_type, trigger_details, consumed_ids[-1])
         )
 
+        # 更新增量状态
+        c.execute(
+            "INSERT OR REPLACE INTO narrative_state (id, last_processed_l1_id, updated_at) VALUES (1, ?, ?)",
+            (latest_l1_id, datetime.now().isoformat())
+        )
         conn.commit()
         new_id = c.lastrowid
         conn.close()
@@ -1470,13 +1492,14 @@ async def generate_narrative(req: NarrativeGenerateRequest):
             "status": "ok",
             "id": new_id,
             "version": new_version,
-            "mode": "full" if full_rewrite else "incremental",
+            "mode": "full" if (req.force or not existing) else "incremental",
             "consumed_l1": len(consumed_ids),
             "content": new_narrative
         }
 
     except Exception as e:
-        print(f"Narrative generation error: {e}")
+        logger.error(f"Narrative generation error: {e}")
+        import traceback; traceback.print_exc()
         return {"status": "error", "message": str(e)}
 
 class NarrativeUpdateRequest(BaseModel):
