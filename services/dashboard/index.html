@@ -289,6 +289,7 @@
                 <button class="btn" onclick="generateNarrative()">生成/更新叙事</button>
                 <button class="btn" onclick="editNarrative()" style="background:#28a745;">编辑</button>
                 <button class="btn" onclick="loadNarrativeHistory()" style="background:#6c757d;">查看历史</button>
+                <button class="btn" onclick="showNarrativeTimeline()" style="background:#6f42c1;">时间线</button>
                 <button class="btn" onclick="toggleNarrativeObservatory()" style="background:#17a2b8;">Observatory</button>
                 <span id="narrative-status" style="margin-left:10px;font-size:12px;"></span>
             </div>
@@ -1096,6 +1097,61 @@
         function toggleNarrativeObservatory() {
             var elem = document.getElementById('narrative-observatory');
             elem.style.display = elem.style.display === 'none' ? 'block' : 'none';
+        }
+
+        var narrativeViewMode = 'read'; // 'read' | 'timeline'
+
+        function showNarrativeTimeline() {
+            narrativeViewMode = 'timeline';
+            var content = document.getElementById('narrative-content').textContent;
+            if (!content || content === '暂无内容' || content.indexOf('点击') === 0) {
+                alert('请先生成叙事内容');
+                return;
+            }
+
+            // 提取 ### 开头的章节作为时间节点
+            var lines = content.split('\n');
+            var nodes = [];
+            var currentNode = null;
+
+            lines.forEach(function(line) {
+                if (line.startsWith('### ')) {
+                    if (currentNode) nodes.push(currentNode);
+                    currentNode = { title: line.replace('### ', ''), summary: [] };
+                } else if (currentNode && line.trim()) {
+                    if (currentNode.summary.length < 2) { // 只取每节前两行摘要
+                        currentNode.summary.push(line.trim().substring(0, 80));
+                    }
+                }
+            });
+            if (currentNode) nodes.push(currentNode);
+
+            if (nodes.length === 0) {
+                alert('未找到时间节点（叙事格式需包含 ### 开头的章节标题）');
+                return;
+            }
+
+            // 渲染时间线
+            var html = '<div style="position:relative;padding-left:40px;">';
+            html += '<div style="position:absolute;left:16px;top:0;bottom:0;width:2px;background:#e0e0e0;"></div>';
+            nodes.forEach(function(node, i) {
+                html += '<div style="position:relative;margin-bottom:24px;">';
+                html += '<div style="position:absolute;left:-32px;top:4px;width:12px;height:12px;border-radius:50%;background:#6f42c1;border:2px solid #fff;box-shadow:0 0 0 2px #6f42c1;"></div>';
+                html += '<div style="font-weight:bold;color:#333;margin-bottom:4px;">' + node.title + '</div>';
+                node.summary.forEach(function(s) {
+                    html += '<div style="font-size:12px;color:#666;">' + s + (s.length >= 80 ? '...' : '') + '</div>';
+                });
+                html += '</div>';
+            });
+            html += '</div>';
+            html += '<div style="margin-top:16px;"><button class="btn" onclick="showNarrativeRead()" style="background:#999;">返回阅读</button></div>';
+
+            document.getElementById('narrative-content').innerHTML = html;
+        }
+
+        function showNarrativeRead() {
+            narrativeViewMode = 'read';
+            loadNarrative(); // 重新加载原始文本
         }
 
         function generateNarrative() {
