@@ -1426,10 +1426,10 @@ async def generate_narrative(req: NarrativeGenerateRequest):
             return {"status": "error", "message": "Narrative 模型未配置"}
 
         # 4. 构建提示词（增量演化 or 首次/强制全量生成）
-        prompt = await build_narrative_prompt(existing_narrative, new_memories)
+        prompt_parts = await build_narrative_prompt(existing_narrative, new_memories)
 
         # 5. 调用 LLM 生成
-        new_narrative = await call_llm_for_narrative(config, prompt)
+        new_narrative = await call_llm_for_narrative(config, prompt_parts)
 
         if not new_narrative:
             return {"status": "error", "message": "生成失败"}
@@ -2050,67 +2050,88 @@ async def update_model_config(purpose: str, req: ModelConfigUpdate):
 
 # ============ Helper Functions ============
 
-async def build_narrative_prompt(existing_narrative: str, new_memories: list) -> str:
-    """构建 Narrative 生成提示词。
+async def build_narrative_prompt(existing_narrative: str, new_memories: list) -> dict:
+    """构建 Narrative 生成提示词，返回 {system, user} 两段。
 
     new_memories: [(id, content, quote, ts), ...] 按提取顺序（≈时间顺序）。
     已有叙事 → 增量演化（现有全文保留，只续写新增）；否则从头生成。
     """
-    # 读取提示词模板（叙事风格与内容准则）
+    # 读取系统角色指令（Narrative生成提示词.md）
     prompt_file = Path(__file__).parent.parent.parent / "Narrative生成提示词.md"
     try:
         with open(prompt_file, 'r', encoding='utf-8') as f:
-            template = f.read()
+            system_prompt = f.read()
     except:
-        template = """你是一段亲密关系的记忆守护者。维护一份连续的共同经历叙事。
+        system_prompt = """你是一段亲密关系的记忆守护者。维护一份连续的共同经历叙事。
 按时间顺序分章节书写，保留时间锚点、情感转折点、共同经历、关系演化，
 重要的原话用引号保留。温暖但不矫饰、连贯流动。"""
 
     # 构建记忆列表（带时间戳，构成时间线骨架）
-    memory_text = ""
+    memory_text = "### 核心记忆\n"
     for m in new_memories:
         ts_date = m[3][:10] if m[3] else "未知时间"
         memory_text += f"- [{ts_date}] {m[1]}\n"
         if m[2]:
-            memory_text += f"  > {m[2]}\n"
+            memory_text += f"  > 原话：{m[2]}\n"
 
-    if existing_narrative:
-        # 增量演化：现有叙事是已经写下的历史，只往后写，不重写
-        task_text = (
-            "## 本次任务：增量演化\n"
-            "现有叙事是这本书已经写下的部分，新增记忆是上次书写之后新发生的经历。\n\n"
-            "**硬性约束**：\n"
-            "- 现有叙事的全部内容**原样保留**——不重写、不删改、不压缩、不换措辞\n"
-            "- 只根据「新增记忆」续写：在时间线对应位置插入新章节，或在末尾续写新篇章\n"
-            "- 新增内容严格基于新增记忆，不虚构任何未记录的经历\n"
-            "- 与现有叙事的称呼、语气、章节格式保持一致，体现关系的延续与成长\n"
-            "- 若某条新增记忆只是琐碎日常、不构成值得书写的经历，可以不写入\n\n"
-            f"## 现有叙事\n{existing_narrative}\n\n"
-            f"## 新增记忆（按时间排序）\n{memory_text}\n"
-            "请输出更新后的**完整叙事**（现有叙事原文 + 新增部分），markdown 格式，"
-            "不要输出任何说明、前言或询问。"
-        )
-    else:
-        task_text = (
-            "## 本次任务：首次生成\n"
-            "根据以下记忆，按时间顺序书写这份共同经历叙事的开篇。\n\n"
-            f"## 记忆（按时间排序）\n{memory_text}\n"
-            "请直接输出叙事正文（markdown 格式），不要输出任何说明、前言或询问。"
-        )
+    # 构建 user message（待处理内容）
+    user_message = f"""请基于以下材料，更新我们的共同经历叙事。
 
-    # 模板含占位符则替换；否则把任务段追加到模板后（用户手写的
-    # Narrative生成提示词.md 没有占位符，只靠 replace 会让 LLM 拿不到数据）
-    if "{existing}" in template and "{memories}" in template:
-        prompt = template.replace("{existing}", existing_narrative or "（首次生成）")
-        prompt = prompt.replace("{memories}", memory_text)
-    else:
-        prompt = f"{template}\n\n---\n\n{task_text}"
+## 现有叙事
+{existing_narrative or "（这是第一次生成，请基于记忆从头写起）"}
 
-    return prompt
+## 新增记忆材料
+{memory_text}
 
-async def call_llm_for_narrative(config: dict, prompt: str) -> str:
-    """调用 LLM 生成 Narrative"""
-    return await call_llm(config, prompt, max_tokens=4000)
+请生成更新后的完整叙事（按时间顺序，markdown 章节格式）："""
+
+    return {"system": system_prompt, "user": user_message}
+
+async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
+    """调用 LLM 生成 Narrative（system+user 两段式）"""
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            # claude 系列走 Anthropic 原生 /messages
+            if config['model'].startswith("claude"):
+                response = await client.post(
+                    f"{config['base_url']}/messages",
+                    headers={
+                        "x-api-key": config['api_key'],
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": config['model'],
+                        "system": prompt_parts["system"],
+                        "messages": [{"role": "user", "content": prompt_parts["user"]}],
+                        "max_tokens": 4000
+                    }
+                )
+                response.raise_for_status()
+                content = response.json().get("content", [])
+                return content[0].get("text", "") if content else ""
+            else:
+                # 其他模型走 /chat/completions
+                response = await client.post(
+                    f"{config['base_url']}/chat/completions",
+                    headers={
+                        "Authorization": f"Bearer {config['api_key']}",
+                        "Content-Type": "application/json"
+                    },
+                    json={
+                        "model": config['model'],
+                        "messages": [
+                            {"role": "system", "content": prompt_parts["system"]},
+                            {"role": "user", "content": prompt_parts["user"]}
+                        ],
+                        "max_tokens": 4000
+                    }
+                )
+                response.raise_for_status()
+                return response.json()["choices"][0]["message"]["content"]
+    except Exception as e:
+        logger.error(f"LLM call error in narrative generation: {e}")
+        return None
 
 async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
     """通用 LLM 调用。claude 系列走 Anthropic 原生 /messages（与网关约定一致，
