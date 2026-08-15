@@ -206,6 +206,13 @@ def init_db():
         last_processed_l1_id INTEGER DEFAULT 0,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
+    # custom_prompts 表：用户自定义交互偏好
+    c.execute('''CREATE TABLE IF NOT EXISTS custom_prompts (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        content TEXT DEFAULT '',
+        enabled INTEGER DEFAULT 1,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
     # 增量水位线：记录生成时已消费到的最大 id。
     # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
     # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
@@ -1601,6 +1608,34 @@ async def update_summary_config(req: SummaryConfigUpdate):
         params.append(1)
         c.execute(f"UPDATE narrative_config SET {', '.join(updates)} WHERE id=?", params)
 
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+# ============ Custom Prompt API ============
+
+@app.get("/custom_prompt")
+async def get_custom_prompt():
+    """获取用户自定义交互偏好"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    row = conn.execute("SELECT content, enabled FROM custom_prompts WHERE id=1").fetchone()
+    conn.close()
+    if not row:
+        return {"content": "", "enabled": 1}
+    return {"content": row[0] or "", "enabled": row[1]}
+
+class CustomPromptUpdate(BaseModel):
+    content: str
+    enabled: int = 1
+
+@app.put("/custom_prompt")
+async def update_custom_prompt(req: CustomPromptUpdate):
+    """更新用户自定义交互偏好"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn.execute(
+        "INSERT OR REPLACE INTO custom_prompts (id, content, enabled, updated_at) VALUES (1, ?, ?, ?)",
+        (req.content, req.enabled, datetime.now().isoformat())
+    )
     conn.commit()
     conn.close()
     return {"status": "ok"}

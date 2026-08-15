@@ -97,6 +97,7 @@
             <button class="tab" onclick="showPanel('l0')">L0原文</button>
             <button class="tab" onclick="showPanel('l1')">L1记忆</button>
             <button class="tab" onclick="showPanel('profile')">画像</button>
+            <button class="tab" onclick="showPanel('custom_prompt')">交互偏好</button>
             <button class="tab" onclick="showPanel('pipeline')">记忆管线</button>
             <button class="tab" onclick="showPanel('extraction')">记忆提取</button>
             <button class="tab" onclick="showPanel('narrative')">共同经历</button>
@@ -151,6 +152,21 @@
             <div class="section"><h3>关于我们</h3><textarea id="profile-us"></textarea></div>
             <button class="btn" onclick="saveProfile()">保存</button>
             <span id="profile-status"></span>
+        </div>
+
+        <div id="custom_prompt" class="panel">
+            <h3>用户交互偏好</h3>
+            <p style="color:#666;font-size:12px;margin-bottom:15px;">
+                自定义你希望 AI 在对话中遵循的交互风格、回复方式或其他偏好。这些内容会作为系统提示的一部分注入到每次对话中。
+            </p>
+            <div class="config-field">
+                <label>
+                    <input type="checkbox" id="custom-prompt-enabled" checked> 启用交互偏好
+                </label>
+            </div>
+            <textarea id="custom-prompt-content" placeholder="例如：回复时尽量简洁，不要过度解释；遇到代码问题时先提供解决方案再解释原理；等等..."></textarea>
+            <button class="btn" onclick="saveCustomPrompt()">保存</button>
+            <span id="custom-prompt-status"></span>
         </div>
 
         <div id="import" class="panel">
@@ -433,6 +449,7 @@
             if (name === 'l0') loadConversations();
             if (name === 'l1') loadL1('all');
             if (name === 'profile') loadProfile();
+            if (name === 'custom_prompt') loadCustomPrompt();
             if (name === 'config') loadConfig();
             if (name === 'logs') loadLogs();
             if (name === 'pipeline') loadPipeline();
@@ -659,6 +676,26 @@
 
         function saveProfile() {
             fetch(API + '/profile', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({ about_user: document.getElementById('profile-user').value, about_ai: document.getElementById('profile-ai').value, about_us: document.getElementById('profile-us').value }) }).then(function() { document.getElementById('profile-status').textContent = '已保存'; setTimeout(function(){document.getElementById('profile-status').textContent='';},2000); });
+        }
+
+        function saveCustomPrompt() {
+            var content = document.getElementById('custom-prompt-content').value;
+            var enabled = document.getElementById('custom-prompt-enabled').checked ? 1 : 0;
+            fetch(API + '/custom_prompt', {
+                method: 'PUT',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ content: content, enabled: enabled })
+            }).then(function() {
+                document.getElementById('custom-prompt-status').textContent = '已保存';
+                setTimeout(function(){document.getElementById('custom-prompt-status').textContent='';},2000);
+            });
+        }
+
+        function loadCustomPrompt() {
+            fetch(API + '/custom_prompt').then(function(r) { return r.json(); }).then(function(data) {
+                document.getElementById('custom-prompt-content').value = data.content || '';
+                document.getElementById('custom-prompt-enabled').checked = data.enabled === 1;
+            });
         }
 
         function handleFile(event) {

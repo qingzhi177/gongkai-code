@@ -325,6 +325,19 @@ async function getRecentSummary() {
   }
 }
 
+// 获取 Custom Prompt（用户自定义交互偏好）
+async function getCustomPrompt() {
+  try {
+    const res = await axios.get(`${MEMORY_SERVICE_URL}/custom_prompt`, { timeout: 3000 });
+    if (res.data && res.data.enabled && res.data.content && res.data.content.trim()) {
+      return res.data.content.trim();
+    }
+    return null;
+  } catch (e) {
+    return null;
+  }
+}
+
 // 时间感知：会话间隔感知阈值。小于这个小时数不注入间隔提示（连续对话不打断）。
 const SESSION_GAP_THRESHOLD_HOURS = 4;
 
@@ -963,16 +976,17 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // 时间感知：memoryMenu 头部要按 conv 算会话间隔，传入稳定的 conv_id
     const convIdForMenu = resolveConvId(req);
-    // 获取画像、记忆目录、Shared Narrative、Recent Summary（含时间锚点 + 会话间隔感知）
-    const [profile, memoryMenu, sharedNarrative, recentSummary] = await Promise.all([
+    // 获取画像、记忆目录、Shared Narrative、Recent Summary、Custom Prompt（含时间锚点 + 会话间隔感知）
+    const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
       getProfile(),
       getMemoryMenu(userContent, convIdForMenu),
       getSharedNarrative(),
-      getRecentSummary()
+      getRecentSummary(),
+      getCustomPrompt()
     ]);
     // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
     // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
-    const systemPrefix = `你拥有一个持续维护的记忆系统。
+    let systemPrefix = `你拥有一个持续维护的记忆系统。
 
 这个记忆系统记录了过去交流中逐渐形成的理解，包括对用户的理解、对自身交流方式的理解，以及双方共同经历的重要内容。
 
@@ -1000,6 +1014,11 @@ ${profile}
 - bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）
 
 当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。`;
+
+    // 如果有 Custom Prompt，追加到 systemPrefix
+    if (customPrompt) {
+      systemPrefix += `\n\n---\n\n[用户交互偏好]\n${customPrompt}`;
+    }
 
     // system 用数组分段，稳定前缀带 cache_control 缓存断点（Anthropic prompt caching）
     const systemBlocks = [
