@@ -290,10 +290,38 @@ async function getProfile() {
       fs.readFile(`${dataDir}/about_ai.md`, 'utf8').catch(() => '（暂无）'),
       fs.readFile(`${dataDir}/about_us.md`, 'utf8').catch(() => '（暂无）')
     ]);
-    
+
     return `## 关于用户\n${aboutUser}\n## 关于AI\n${aboutAi}\n## 关于我们\n${aboutUs}`;
   } catch (e) {
     return '（画像暂无内容）';
+  }
+}
+
+// 获取 Shared Narrative（cache②）
+async function getSharedNarrative() {
+  try {
+    const res = await axios.get(`${MEMORY_SERVICE_URL}/narrative/current`, { timeout: 5000 });
+    if (res.data && res.data.exists && res.data.content) {
+      return res.data.content;
+    }
+    return null;
+  } catch (e) {
+    console.error('[NARRATIVE] 获取失败:', e.message);
+    return null;
+  }
+}
+
+// 获取 Recent Summary（cache③）
+async function getRecentSummary() {
+  try {
+    const res = await axios.get(`${MEMORY_SERVICE_URL}/summary/current`, { timeout: 5000 });
+    if (res.data && res.data.exists && res.data.content) {
+      return res.data.content;
+    }
+    return null;
+  } catch (e) {
+    console.error('[SUMMARY] 获取失败:', e.message);
+    return null;
   }
 }
 
@@ -935,10 +963,12 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // 时间感知：memoryMenu 头部要按 conv 算会话间隔，传入稳定的 conv_id
     const convIdForMenu = resolveConvId(req);
-    // 获取画像和记忆目录（含时间锚点 + 会话间隔感知）
-    const [profile, memoryMenu] = await Promise.all([
+    // 获取画像、记忆目录、Shared Narrative、Recent Summary（含时间锚点 + 会话间隔感知）
+    const [profile, memoryMenu, sharedNarrative, recentSummary] = await Promise.all([
       getProfile(),
-      getMemoryMenu(userContent, convIdForMenu)
+      getMemoryMenu(userContent, convIdForMenu),
+      getSharedNarrative(),
+      getRecentSummary()
     ]);
     // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
     // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
@@ -973,8 +1003,26 @@ ${profile}
 
     // system 用数组分段，稳定前缀带 cache_control 缓存断点（Anthropic prompt caching）
     const systemBlocks = [
-      { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral' } }
+      { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral', ttl: 3600 } }
     ];
+
+    // 按需添加 cache② Shared Narrative
+    if (sharedNarrative) {
+      systemBlocks.push({
+        type: 'text',
+        text: `[共同经历叙事]\n\n${sharedNarrative}`,
+        cache_control: { type: 'ephemeral', ttl: 3600 }
+      });
+    }
+
+    // 按需添加 cache③ Recent Summary
+    if (recentSummary) {
+      systemBlocks.push({
+        type: 'text',
+        text: `[近期阶段摘要]\n\n${recentSummary}`,
+        cache_control: { type: 'ephemeral', ttl: 3600 }
+      });
+    }
 
     // 功能5：把动态的相关记忆目录注入到最新一条 user 消息前面（保持 system 前缀稳定）。
     // content 可能是字符串或 Anthropic 块数组，两种都处理。
