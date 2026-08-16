@@ -1,4 +1,4 @@
-# Memory System v1.6
+# Memory System v1.7
 
 AI 长期记忆系统，基于 Paramecium 架构。
 
@@ -26,6 +26,32 @@ AI 长期记忆系统，基于 Paramecium 架构。
 - 工具格式归一：OpenAI 格式工具自动转 Anthropic 原生格式，兼容新版 API
 
 ## 更新日志
+- v1.7 — 记忆延续性 + 自动更新 + Custom Prompt + Dashboard 优化
+  - 任务D：修复 Narrative 生成提示词内容未注入的 Bug
+    - 分离系统提示词和用户内容，正确构建 LLM 调用结构
+  - 任务C：Identity Context 改为 Memory Continuity Context
+    - 更名为"记忆延续上下文"，提供更清晰的功能描述
+  - 任务A+B：Gateway 注入 Shared Narrative 和 Recent Summary + TTL
+    - 自动注入共同经历叙事和近期阶段摘要到每轮对话
+    - 添加 TTL 检查机制，过期内容标记为 [已过期]
+    - 支持 Anthropic 1 小时 prompt caching（ttl: '1h'）
+  - 任务E：自动触发 Narrative 更新
+    - L1 提取完成后检查是否满足更新条件
+    - 根据配置的轮次阈值和 L1 数量阈值自动触发更新
+    - 新增 data/logs/auto_trigger.log 记录自动触发历史
+  - 任务F：narrative_state 增量状态表
+    - 创建独立的状态追踪表（last_l1_id, last_l0_id）
+    - 实现增量更新逻辑，只处理新增的记忆，避免重复扫描
+  - 任务G：Custom Prompt 功能
+    - Dashboard 新增自定义提示词面板（Profile 下方）
+    - 支持加载、保存和清空功能
+    - Gateway 自动注入到系统消息前缀，无需重启
+  - 任务H：Dashboard 标签名改为"自动更新检查策略"
+    - 更新 Summary 配置区域的标题，更清晰地表达功能
+  - 任务I：Narrative 时间线视觉化模式
+    - 新增时间线视图模式（阅读模式 / 时间线）
+    - 提取 ### 章节标题作为时间节点
+    - 实现纵向时间轴布局，支持一键切换
 - v1.6 — Shared Narrative + Dashboard 扩展 + 更新检查周期
   - Shared Narrative：月相式记忆总结，读取所有 L1 memories 生成整体叙事
     - 新增 narrative.db：存储 narrative 内容、生成时间、使用的模型配置

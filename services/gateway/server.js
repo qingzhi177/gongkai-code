@@ -779,6 +779,13 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   }
   // 功能2补丁：透传 output_config（effort），让前端的思考预算调节真正生效。
   if (outputConfig) body.output_config = outputConfig;
+
+  // DEBUG: 打印 system 的 cache_control
+  console.log('[CACHE DEBUG] system blocks:', JSON.stringify(body.system.map(b => ({
+    preview: b.text.substring(0, 50) + '...',
+    cache_control: b.cache_control
+  })), null, 2));
+
   // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
   let upstream = null;
   let lastErr = null;
@@ -1022,7 +1029,7 @@ ${profile}
 
     // system 用数组分段，稳定前缀带 cache_control 缓存断点（Anthropic prompt caching）
     const systemBlocks = [
-      { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral', ttl: 3600 } }
+      { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral', ttl: '1h' } }
     ];
 
     // 按需添加 cache② Shared Narrative
@@ -1030,7 +1037,7 @@ ${profile}
       systemBlocks.push({
         type: 'text',
         text: `[共同经历叙事]\n\n${sharedNarrative}`,
-        cache_control: { type: 'ephemeral', ttl: 3600 }
+        cache_control: { type: 'ephemeral', ttl: '1h' }
       });
     }
 
@@ -1039,7 +1046,7 @@ ${profile}
       systemBlocks.push({
         type: 'text',
         text: `[近期阶段摘要]\n\n${recentSummary}`,
-        cache_control: { type: 'ephemeral', ttl: 3600 }
+        cache_control: { type: 'ephemeral', ttl: '1h' }
       });
     }
 
