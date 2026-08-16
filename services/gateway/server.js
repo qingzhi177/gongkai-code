@@ -143,10 +143,12 @@ async function loadActiveConfig() {
         model: res.data.model
       };
       console.log(`[CONFIG] 已加载配置：${activeConfig.name} / ${activeConfig.model}`);
+      await refreshModelsCache(true);
       return 'active';
     } else {
       activeConfig = null;
       console.log('[CONFIG] 记忆服务未配置供应商，回退到 .env');
+      await refreshModelsCache(true);
       return 'unconfigured';
     }
   } catch (e) {
@@ -154,6 +156,15 @@ async function loadActiveConfig() {
     console.error('[CONFIG] 拉取配置失败，回退到 .env：', e.message);
     return 'error';
   }
+}
+
+// ============ per-conv 串行队列：同一 conv_id 的请求排队执行，防止上下文错乱 ============
+const convQueues = new Map();
+function enqueueConv(convId, task) {
+  const prev = convQueues.get(convId) || Promise.resolve();
+  const next = prev.then(task, task);
+  convQueues.set(convId, next.catch(() => {}));
+  return next;
 }
 
 // 工具定义
@@ -779,13 +790,6 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   }
   // 功能2补丁：透传 output_config（effort），让前端的思考预算调节真正生效。
   if (outputConfig) body.output_config = outputConfig;
-
-  // DEBUG: 打印 system 的 cache_control
-  console.log('[CACHE DEBUG] system blocks:', JSON.stringify(body.system.map(b => ({
-    preview: b.text.substring(0, 50) + '...',
-    cache_control: b.cache_control
-  })), null, 2));
-
   // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
   let upstream = null;
   let lastErr = null;
@@ -917,7 +921,28 @@ app.post('/v1/messages', (req, res) => {
 });
 
 // OpenAI 兼容 API 端点
-app.post('/v1/chat/completions', async (req, res) => {
+// /v1/chat/completions 入口：per-conv 串行队列包裹，防止同一会话并发导致上下文错乱。
+// tg 客户端走组装模式（handleTgBotAssembled），其余走 chatCompletionsMain。
+app.post('/v1/chat/completions', (req, res) => {
+  const cid = resolveConvId(req);
+  enqueueConv(cid, async () => {
+    try {
+      const clientName = (req.headers['x-client-name'] || '').toLowerCase();
+      if (clientName.includes('tg')) {
+        await handleTgBotAssembled(req, res);
+      } else {
+        await chatCompletionsMain(req, res);
+      }
+    } catch (e) {
+      console.error('网关错误:', e.response?.data || e.message);
+      if (res.headersSent) { try { res.end(); } catch (_) {} return; }
+      res.status(500).json({ error: { message: e.response?.data?.error?.message || e.message, type: 'gateway_error' } });
+    }
+  });
+});
+
+// 原 handler 主体：Kelivo/Claude Code 等直接透传 messages 的客户端走这里。
+async function chatCompletionsMain(req, res) {
   try {
     const { model, messages, stream } = req.body;
 
@@ -983,6 +1008,16 @@ app.post('/v1/chat/completions', async (req, res) => {
 
     // 时间感知：memoryMenu 头部要按 conv 算会话间隔，传入稳定的 conv_id
     const convIdForMenu = resolveConvId(req);
+
+    // 任务E：effort 注入。Kelivo 显式传了 output_config/thinking 就不动；
+    // 没传时按会话配置注入 effort（默认 medium），让每个会话可独立控制思考预算。
+    if (!req.body.output_config && !req.body.thinking) {
+      try {
+        const s = await axios.get(`${MEMORY_SERVICE_URL}/conv/${encodeURIComponent(convIdForMenu)}/settings`, { timeout: 3000 });
+        if (s.data && s.data.effort) req.body.output_config = { effort: s.data.effort };
+      } catch (e) { /* 忽略，用上游默认 */ }
+    }
+
     // 获取画像、记忆目录、Shared Narrative、Recent Summary、Custom Prompt（含时间锚点 + 会话间隔感知）
     const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
       getProfile(),
@@ -1360,7 +1395,128 @@ ${profile}
       }
     });
   }
+}
+
+// ============ TG 桥专用：组装模式 ============
+// TG 桥只发最新一条 user 消息 + conversation_id，网关从 L0 组装历史（按 conv_settings 窗口）。
+// 独立分支，不影响 Kelivo 的 messages 透传逻辑。
+async function handleTgBotAssembled(req, res) {
+  try {
+    const convId = req.body.conversation_id || resolveConvId(req);
+    const msgs = req.body.messages || [];
+    // 取最后一条文本 user 消息作为本轮输入
+    let currentText = '';
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      const m = msgs[i];
+      if (m.role !== 'user') continue;
+      const t = typeof m.content === 'string' ? m.content : '';
+      if (t.trim()) { currentText = t; break; }
+    }
+    if (!currentText) {
+      return res.status(400).json({ error: { message: 'no user text', type: 'invalid_request_error' } });
+    }
+
+    // 1) 会话设置（窗口 + effort + model）
+    let settings = { window_mode: 'all', window_n: 50, window_tokens: 8000, effort: 'medium', model: '' };
+    try {
+      const s = await axios.get(`${MEMORY_SERVICE_URL}/conv/${encodeURIComponent(convId)}/settings`, { timeout: 3000 });
+      settings = { ...settings, ...(s.data || {}) };
+    } catch (e) { /* 用默认 */ }
+
+    // 2) 从 L0 拉历史
+    let history = [];
+    try {
+      const h = await axios.get(`${MEMORY_SERVICE_URL}/conversations/${encodeURIComponent(convId)}/messages?after_id=0&limit=500`, { timeout: 5000 });
+      history = (h.data && h.data.messages) || [];
+    } catch (e) { /* 新会话无历史 */ }
+
+    // 3) 按窗口截断历史（不包含本轮消息）
+    let trimmed = history;
+    if (settings.window_mode === 'n' && settings.window_n > 0) {
+      trimmed = trimmed.slice(-settings.window_n);
+    } else if (settings.window_mode === 'tokens' && settings.window_tokens > 0) {
+      let acc = 0;
+      trimmed = [];
+      for (let i = history.length - 1; i >= 0; i--) {
+        const cost = Math.ceil((history[i].content || '').length / 4);
+        if (acc + cost > settings.window_tokens) break;
+        acc += cost;
+        trimmed.unshift(history[i]);
+      }
+    }
+
+    // 4) 组装 messages：历史（含此前 AI 回复）+ 本轮 user
+    const assembled = trimmed.map(h => ({ role: h.role, content: h.content }));
+    assembled.push({ role: 'user', content: currentText });
+    req.body.messages = assembled;
+    req.body.conversation_id = convId;
+
+    // 5) effort/thinking：客户端没显式传才用会话配置注入
+    if (!req.body.output_config && !req.body.thinking && settings.effort) {
+      req.body.output_config = { effort: settings.effort };
+    }
+    if (settings.model && !req.body.model) req.body.model = settings.model;
+
+    // 6) 走原主流程（记忆注入、上游转发、save_conversation 都在里面；client 自动取 x-client-name='tg-bot'）
+    await chatCompletionsMain(req, res);
+  } catch (e) {
+    console.error('[TG] 组装模式错误:', e.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: { message: e.message, type: 'gateway_error' } });
+    } else { try { res.end(); } catch (_) {} }
+  }
+}
+
+// ============ 模型列表（codex/TG 桥走 OpenAI 格式，Claude Code 走 Anthropic 格式） ============
+let modelsCache = [];
+let modelsCacheTs = 0;
+const MODELS_TTL_MS = 60 * 1000;
+
+async function refreshModelsCache(force = false) {
+  if (!force && modelsCache.length && Date.now() - modelsCacheTs < MODELS_TTL_MS) return;
+  const list = [];
+  const seen = new Set();
+  try {
+    const res = await axios.get(`${MEMORY_SERVICE_URL}/config/providers`, { timeout: 5000 });
+    for (const p of res.data.providers || []) {
+      for (const m of p.models || []) {
+        if (m && !seen.has(m)) { seen.add(m); list.push(m); }
+      }
+    }
+    const active = res.data.active;
+    if (active && active.model && !seen.has(active.model)) { seen.add(active.model); list.push(active.model); }
+    for (const m of [process.env.DEFAULT_MODEL, 'claude-sonnet-4-5', 'deepseek-chat']) {
+      if (m && !seen.has(m)) { seen.add(m); list.push(m); }
+    }
+  } catch (e) {
+    console.error('[MODELS] 刷新失败:', e.message);
+    if (modelsCache.length) return;
+  }
+  modelsCache = list;
+  modelsCacheTs = Date.now();
+  console.log('[MODELS] 模型列表:', modelsCache.join(', '));
+}
+
+app.get('/v1/models', async (req, res) => {
+  await refreshModelsCache();
+  if (req.headers['anthropic-version']) {
+    return res.json({
+      data: modelsCache.map(id => ({ type: 'model', id, display_name: id, created_at: new Date(0).toISOString() }))
+    });
+  }
+  res.json({ object: 'list', data: modelsCache.map(id => ({ id, object: 'model', created: 0, owned_by: 'gateway' })) });
 });
+
+app.get('/v1/models/:modelId', async (req, res) => {
+  await refreshModelsCache();
+  const id = req.params.modelId;
+  if (!modelsCache.includes(id)) {
+    return res.status(404).json({ error: { message: `Model '${id}' not found`, type: 'invalid_request_error', code: 'model_not_found' } });
+  }
+  res.json({ id, object: 'model', created: 0, owned_by: 'gateway' });
+});
+
+app.get('/models', async (req, res) => { req.url = '/v1/models'; app.handle(req, res); });
 
 // 健康检查
 app.get('/health', (req, res) => {
@@ -1370,6 +1526,7 @@ app.get('/health', (req, res) => {
 // 功能6：热重载配置接口（Dashboard 保存后调用，不重启进程）
 app.post('/reload-config', async (req, res) => {
   const state = await loadActiveConfig();
+  await refreshModelsCache(true);
   // active/unconfigured 都算重载成功（unconfigured 是正常状态，回退 .env）；只有 error 是拉取失败
   res.json({
     status: state === 'error' ? 'error' : 'ok',
@@ -1378,9 +1535,32 @@ app.post('/reload-config', async (req, res) => {
   });
 });
 
+// ============ /api 薄代理：转发到记忆服务的同步/配置接口 ============
+// 放在最后注册，避免吞掉 /v1/* 路由（Express 按注册顺序匹配，/api/* 只在 /api 前缀命中）
+app.all('/api/*splat', async (req, res) => {
+  // originalUrl 已含 query，用 pathname 拼接避免与 params:req.query 双重附加 query
+  const path = req.originalUrl.replace(/^\/api/, '');
+  const target = MEMORY_SERVICE_URL + path;
+  try {
+    const upstream = await axios({
+      method: req.method,
+      url: target,   // originalUrl 已含 query string，不再传 params 避免重复
+      data: ['GET', 'HEAD'].includes(req.method) ? undefined : req.body,
+      timeout: 15000,
+      responseType: 'json',
+    });
+    res.status(upstream.status).json(upstream.data);
+  } catch (e) {
+    const status = e.response?.status || 502;
+    res.status(status).json(e.response?.data || { error: { message: e.message, type: 'proxy_error' } });
+  }
+});
+
 // 启动
 app.listen(PORT, async () => {
   console.log(`Memory Gateway running on port ${PORT}`);
   // 启动时拉取一次配置（失败不阻塞启动，转发逻辑会回退到 .env）
   await loadActiveConfig();
+  // 启动时刷新一次模型列表缓存
+  await refreshModelsCache();
 });

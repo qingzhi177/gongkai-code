@@ -213,6 +213,18 @@ def init_db():
         enabled INTEGER DEFAULT 1,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
+    # conv_settings 表：per-conv 会话配置（TG ↔ Kelivo 会话同步）
+    # id='__default__' 为全局默认；其他为具体 conv_id（如 tg_<chat_id>）
+    c.execute('''CREATE TABLE IF NOT EXISTS conv_settings (
+        id TEXT PRIMARY KEY,          -- conv_id；'__default__' 为全局默认
+        window_mode TEXT DEFAULT 'all',   -- all | n | tokens
+        window_n INTEGER DEFAULT 50,      -- window_mode=n 时的条数
+        window_tokens INTEGER DEFAULT 8000, -- window_mode=tokens 时的 token 预算（粗略 char/4）
+        effort TEXT DEFAULT 'medium',     -- low | medium | high（output_config.effort）
+        model TEXT DEFAULT '',
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
+    c.execute("INSERT OR IGNORE INTO conv_settings (id) VALUES ('__default__')")
     # 增量水位线：记录生成时已消费到的最大 id。
     # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
     # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
@@ -1639,6 +1651,93 @@ async def update_custom_prompt(req: CustomPromptUpdate):
     conn.commit()
     conn.close()
     return {"status": "ok"}
+
+# ============ 会话配置 + 同步接口（TG ↔ Kelivo 会话同步） ============
+
+class ConvSettingsUpdate(BaseModel):
+    window_mode: Optional[str] = None
+    window_n: Optional[int] = None
+    window_tokens: Optional[int] = None
+    effort: Optional[str] = None
+    model: Optional[str] = None
+
+def _get_conv_settings(c, cid: str) -> dict:
+    row = c.execute("SELECT * FROM conv_settings WHERE id=?", (cid,)).fetchone()
+    if not row:
+        row = c.execute("SELECT * FROM conv_settings WHERE id='__default__'").fetchone()
+    if not row:
+        return {"window_mode": "all", "window_n": 50, "window_tokens": 8000, "effort": "medium", "model": ""}
+    return {"window_mode": row[1], "window_n": row[2], "window_tokens": row[3], "effort": row[4], "model": row[5]}
+
+@app.get("/conv/{cid}/settings")
+async def get_conv_settings(cid: str):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    s = _get_conv_settings(c, cid)
+    conn.close()
+    return {"conv_id": cid, **s}
+
+@app.put("/conv/{cid}/settings")
+async def put_conv_settings(cid: str, req: ConvSettingsUpdate):
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    cur = _get_conv_settings(c, cid)
+    for k in ("window_mode", "window_n", "window_tokens", "effort", "model"):
+        v = getattr(req, k)
+        if v is not None:
+            cur[k] = v
+    c.execute(
+        "INSERT INTO conv_settings (id, window_mode, window_n, window_tokens, effort, model, updated_at) "
+        "VALUES (?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET "
+        "window_mode=excluded.window_mode, window_n=excluded.window_n, "
+        "window_tokens=excluded.window_tokens, effort=excluded.effort, "
+        "model=excluded.model, updated_at=excluded.updated_at",
+        (cid, cur["window_mode"], cur["window_n"], cur["window_tokens"], cur["effort"], cur["model"], datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.get("/conv/defaults")
+async def get_conv_defaults():
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    s = _get_conv_settings(c, "__default__")
+    conn.close()
+    return s
+
+@app.put("/conv/defaults")
+async def put_conv_defaults(req: ConvSettingsUpdate):
+    return await put_conv_settings("__default__", req)
+
+@app.get("/conversations")
+async def list_conversations():
+    """列出所有有 L0 的会话（按最近活跃排序）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT conv_id, COUNT(*), MAX(ts) FROM l0_messages "
+        "WHERE status='active' GROUP BY conv_id ORDER BY MAX(ts) DESC"
+    ).fetchall()
+    conn.close()
+    return {"conversations": [
+        {"conv_id": r[0], "msg_count": r[1], "last_ts": r[2]} for r in rows
+    ]}
+
+@app.get("/conversations/{cid}/messages")
+async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200):
+    """增量拉取：返回 id > after_id 的消息（升序）。origin 推导：assistant→ai，user→client。"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, role, content, ts, client FROM l0_messages "
+        "WHERE conv_id=? AND status='active' AND id>? ORDER BY id ASC LIMIT ?",
+        (cid, after_id, limit)).fetchall()
+    conn.close()
+    return {"conv_id": cid, "next_after_id": rows[-1][0] if rows else after_id, "messages": [
+        {"id": r[0], "role": r[1], "content": r[2], "ts": r[3],
+         "origin": "ai" if r[1] == "assistant" else (r[4] or "unknown")}
+        for r in rows
+    ]}
 
 class SummaryUpdateRequest(BaseModel):
     content: str

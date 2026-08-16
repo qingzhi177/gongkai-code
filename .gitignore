@@ -10,3 +10,6 @@ services/memory-service/.env
 services/gateway/.env
 *.pyc
 .DS_Store
+
+# 网关运行日志
+services/gateway/gateway.log
