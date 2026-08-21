@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/home/qingzhi/memory-system/data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", os.path.expanduser("~/memory-system/data")))
 SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", 8000))

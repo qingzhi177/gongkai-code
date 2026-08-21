@@ -105,6 +105,7 @@
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
             <button class="tab" onclick="showPanel('logs')">系统日志</button>
+            <button class="tab" onclick="showPanel('convs')">会话配置</button>
         </div>
 
         <div id="overview" class="panel active">
@@ -366,6 +367,39 @@
         </div>
 
         <!-- System Logs 页面 -->
+        <div id="convs" class="panel">
+            <h3>会话配置（TG/Kelivo 同步的窗口与推理强度）</h3>
+            <div class="config-section">
+                <h4>选择会话</h4>
+                <select id="convs-select" style="width:100%;margin-bottom:8px;" onchange="onConvSelect()"></select>
+                <div style="font-size:12px;color:#888;" id="convs-meta"></div>
+            </div>
+            <div class="config-section">
+                <h4>会话设置</h4>
+                <div style="margin-bottom:8px;"><label>窗口模式：</label>
+                    <select id="convs-window-mode" style="margin-right:8px;">
+                        <option value="all">全部（最新500条）</option>
+                        <option value="n">按条数</option>
+                        <option value="tokens">按token预算</option>
+                    </select>
+                </div>
+                <div style="margin-bottom:8px;"><label>条数：</label>
+                    <input type="number" id="convs-window-n" style="width:100px;" min="1" value="50"></div>
+                <div style="margin-bottom:8px;"><label>Token预算：</label>
+                    <input type="number" id="convs-window-tokens" style="width:100px;" min="100" value="8000"></div>
+                <div style="margin-bottom:8px;"><label>推理强度(effort)：</label>
+                    <select id="convs-effort" style="margin-right:8px;">
+                        <option value="low">low</option>
+                        <option value="medium">medium</option>
+                        <option value="high">high</option>
+                    </select>
+                </div>
+                <div style="margin-bottom:8px;"><label>模型（留空=网关默认）：</label>
+                    <input type="text" id="convs-model" placeholder="如 claude-opus-4-6" style="width:60%;"></div>
+                <button onclick="saveConvSettings()" style="padding:6px 16px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;">保存</button>
+                <span id="convs-status" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+        </div>
         <div id="logs" class="panel">
             <h3>系统日志</h3>
             <div style="margin-bottom:15px;">
@@ -452,6 +486,7 @@
             if (name === 'profile') loadProfile();
             if (name === 'custom_prompt') loadCustomPrompt();
             if (name === 'config') loadConfig();
+            if (name === 'convs') loadConvs();
             if (name === 'logs') loadLogs();
             if (name === 'pipeline') loadPipeline();
             if (name === 'extraction') loadExtraction();
@@ -1678,6 +1713,55 @@
         }
 
         loadStats();
+        function loadConvs() {
+            fetch(API + '/conversations').then(function(r) { return r.json(); }).then(function(d) {
+                var sel = document.getElementById('convs-select');
+                sel.innerHTML = '';
+                (d.conversations || []).forEach(function(c) {
+                    var o = document.createElement('option');
+                    o.value = c.conv_id;
+                    o.textContent = (c.conv_id.length > 40 ? c.conv_id.substring(0, 40) + '…' : c.conv_id) + '（' + c.msg_count + '条）';
+                    sel.appendChild(o);
+                });
+                onConvSelect();
+            }).catch(function(e) {
+                document.getElementById('convs-status').textContent = '加载失败: ' + e;
+            });
+        }
+        function onConvSelect() {
+            var cid = document.getElementById('convs-select').value;
+            if (!cid) return;
+            fetch(API + '/conv/' + encodeURIComponent(cid) + '/settings').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('convs-window-mode').value = d.window_mode || 'all';
+                document.getElementById('convs-window-n').value = d.window_n || 50;
+                document.getElementById('convs-window-tokens').value = d.window_tokens || 8000;
+                document.getElementById('convs-effort').value = d.effort || 'medium';
+                document.getElementById('convs-model').value = d.model || '';
+                document.getElementById('convs-meta').textContent = '会话: ' + cid;
+            });
+        }
+        function saveConvSettings() {
+            var cid = document.getElementById('convs-select').value;
+            if (!cid) return;
+            var body = {
+                window_mode: document.getElementById('convs-window-mode').value,
+                window_n: parseInt(document.getElementById('convs-window-n').value) || 50,
+                window_tokens: parseInt(document.getElementById('convs-window-tokens').value) || 8000,
+                effort: document.getElementById('convs-effort').value,
+                model: document.getElementById('convs-model').value.trim()
+            };
+            fetch(API + '/conv/' + encodeURIComponent(cid) + '/settings', {
+                method: 'PUT',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body)
+            }).then(function(r) { return r.json(); }).then(function(d) {
+                var st = document.getElementById('convs-status');
+                st.textContent = d.status === 'ok' ? '✓ 已保存' : '✗ 保存失败';
+                setTimeout(function() { st.textContent = ''; }, 2500);
+            }).catch(function(e) {
+                document.getElementById('convs-status').textContent = '保存失败: ' + e;
+            });
+        }
     </script>
 </body>
 </html>

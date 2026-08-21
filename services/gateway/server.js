@@ -109,8 +109,32 @@ function dedupKey(s) {
   return (s || '').replace(/\s+/g, '');
 }
 function cleanMessagesForSave(messages, aiText) {
-  const out = [];
+  // 工具轮后重发去重：assistant(文本A) → user(tool_result) → assistant(文本A 相同)
+  // → 跳过第二条 A（保留先发的）。L0 不存工具轮，去掉这种冗余让上下文更干净。
+  const pre = [];
+  let lastAssistantText = null;
+  let afterToolResult = false;
   for (const m of (messages || [])) {
+    const isToolResult = m && m.role === 'user' && Array.isArray(m.content) &&
+      m.content.some(b => b && typeof b === 'object' && b.type === 'tool_result');
+    const text = m ? toPlainText(m.content).trim() : '';
+    if (m && m.role === 'assistant' && text && afterToolResult && lastAssistantText &&
+        dedupKey(text) === dedupKey(lastAssistantText)) {
+      afterToolResult = false;
+      continue;
+    }
+    if (isToolResult) {
+      afterToolResult = true;
+    } else if (m && m.role === 'assistant' && text) {
+      lastAssistantText = text;
+      afterToolResult = false;
+    } else {
+      afterToolResult = false;
+    }
+    pre.push(m);
+  }
+  const out = [];
+  for (const m of (pre || [])) {
     if (!m || m.role === 'system') continue;
     const text = toPlainText(m.content);
     if (!text) continue;
@@ -160,6 +184,20 @@ async function loadActiveConfig() {
 
 // ============ per-conv 串行队列：同一 conv_id 的请求排队执行，防止上下文错乱 ============
 const convQueues = new Map();
+// OpenAI image_url 块 -> Anthropic image 块（TG 桥图片消息用）
+function toAnthropicContent(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return content;
+  return content.map(b => {
+    if (!b || typeof b !== 'object') return b;
+    if (b.type === 'image_url' && b.image_url && typeof b.image_url.url === 'string' && b.image_url.url.startsWith('data:')) {
+      const m = /^data:(image\/[a-zA-Z0-9.+\-]+);base64,(.+)$/.exec(b.image_url.url);
+      if (m) return { type: 'image', source: { type: 'base64', media_type: m[1], data: m[2] } };
+    }
+    return b;
+  });
+}
+
 function enqueueConv(convId, task) {
   const prev = convQueues.get(convId) || Promise.resolve();
   const next = prev.then(task, task);
@@ -294,7 +332,7 @@ function toAnthropicTool(t) {
 // 读取 L2 画像
 async function getProfile() {
   const fs = require('fs').promises;
-  const dataDir = '/home/qingzhi/memory-system/data/profile';
+  const dataDir = (process.env.MEMORY_DATA_DIR || (require('os').homedir() + '/memory-system/data')) + '/profile';
   try {
     const [aboutUser, aboutAi, aboutUs] = await Promise.all([
       fs.readFile(`${dataDir}/about_user.md`, 'utf8').catch(() => '（暂无）'),
@@ -474,7 +512,7 @@ async function executeTool(name, args) {
   
   if (name === 'update_profile') {
     const fs = require('fs').promises;
-    const dataDir = '/home/qingzhi/memory-system/data/profile';
+    const dataDir = (process.env.MEMORY_DATA_DIR || (require('os').homedir() + '/memory-system/data')) + '/profile';
     const filePath = `${dataDir}/${args.section}.md`;
     try {
       if (args.action === 'append') {
@@ -1404,15 +1442,21 @@ async function handleTgBotAssembled(req, res) {
   try {
     const convId = req.body.conversation_id || resolveConvId(req);
     const msgs = req.body.messages || [];
-    // 取最后一条文本 user 消息作为本轮输入
+    // 取最后一条 user 消息作为本轮输入（支持图片：保留完整 content）
     let currentText = '';
+    let currentContent = null;
     for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i];
       if (m.role !== 'user') continue;
-      const t = typeof m.content === 'string' ? m.content : '';
-      if (t.trim()) { currentText = t; break; }
+      const t = typeof m.content === 'string' ? m.content
+        : Array.isArray(m.content) ? m.content.filter(b => b && b.type === 'text').map(b => b.text).join(' ') : '';
+      if (t.trim() || (Array.isArray(m.content) && m.content.some(b => b && b.type === 'image_url'))) {
+        currentText = t;
+        currentContent = m.content;
+        break;
+      }
     }
-    if (!currentText) {
+    if (!currentText && !currentContent) {
       return res.status(400).json({ error: { message: 'no user text', type: 'invalid_request_error' } });
     }
 
@@ -1423,10 +1467,16 @@ async function handleTgBotAssembled(req, res) {
       settings = { ...settings, ...(s.data || {}) };
     } catch (e) { /* 用默认 */ }
 
-    // 2) 从 L0 拉历史
+    // 2) 从 L0 拉历史（用 last 取最新 N 条，避免 after_id=0 拉到最早历史）
+    let lastN = 500;
+    if (settings.window_mode === 'n' && settings.window_n > 0) {
+      lastN = settings.window_n;
+    } else if (settings.window_mode === 'tokens') {
+      lastN = 2000; // tokens 模式拉大窗口，本地再按预算截断
+    }
     let history = [];
     try {
-      const h = await axios.get(`${MEMORY_SERVICE_URL}/conversations/${encodeURIComponent(convId)}/messages?after_id=0&limit=500`, { timeout: 5000 });
+      const h = await axios.get(`${MEMORY_SERVICE_URL}/conversations/${encodeURIComponent(convId)}/messages?last=${lastN}`, { timeout: 5000 });
       history = (h.data && h.data.messages) || [];
     } catch (e) { /* 新会话无历史 */ }
 
@@ -1447,7 +1497,7 @@ async function handleTgBotAssembled(req, res) {
 
     // 4) 组装 messages：历史（含此前 AI 回复）+ 本轮 user
     const assembled = trimmed.map(h => ({ role: h.role, content: h.content }));
-    assembled.push({ role: 'user', content: currentText });
+    assembled.push({ role: 'user', content: toAnthropicContent(currentContent ?? currentText) });
     req.body.messages = assembled;
     req.body.conversation_id = convId;
 

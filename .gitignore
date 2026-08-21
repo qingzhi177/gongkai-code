@@ -13,3 +13,7 @@ services/gateway/.env
 
 # 网关运行日志
 services/gateway/gateway.log
+
+# 备份文件与运行日志（不入库）
+*.bak_*
+data/logs/*.log

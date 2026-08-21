@@ -101,7 +101,7 @@ CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", 8000))
 ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY")
 ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DATA_DIR = Path(os.getenv("DATA_DIR", "/home/qingzhi/memory-system/data"))
+DATA_DIR = Path(os.getenv("DATA_DIR", os.path.expanduser("~/memory-system/data")))
 # 功能6：网关地址，用于配置变更后通知网关热重载
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:3000")
 SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
@@ -1724,18 +1724,25 @@ async def list_conversations():
     ]}
 
 @app.get("/conversations/{cid}/messages")
-async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200):
+async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200, last: int = 0):
     """增量拉取：返回 id > after_id 的消息（升序）。origin 推导：assistant→ai，user→client。"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, role, content, ts, client FROM l0_messages "
-        "WHERE conv_id=? AND status='active' AND id>? ORDER BY id ASC LIMIT ?",
-        (cid, after_id, limit)).fetchall()
+    if last and last > 0:
+        rows = c.execute(
+            "SELECT id, role, content, ts, client FROM l0_messages "
+            "WHERE conv_id=? AND status='active' ORDER BY id DESC LIMIT ?",
+            (cid, last)).fetchall()
+        rows = list(reversed(rows))
+    else:
+        rows = c.execute(
+            "SELECT id, role, content, ts, client FROM l0_messages "
+            "WHERE conv_id=? AND status='active' AND id>? ORDER BY id ASC LIMIT ?",
+            (cid, after_id, limit)).fetchall()
     conn.close()
     return {"conv_id": cid, "next_after_id": rows[-1][0] if rows else after_id, "messages": [
         {"id": r[0], "role": r[1], "content": r[2], "ts": r[3],
-         "origin": "ai" if r[1] == "assistant" else (r[4] or "unknown")}
+         "origin": "ai" if r[1] == "assistant" else ("tg" if (r[4] or "").startswith("tg") else (r[4] or "unknown"))}
         for r in rows
     ]}
 
