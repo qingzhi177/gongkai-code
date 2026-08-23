@@ -152,6 +152,21 @@ function cleanMessagesForSave(messages, aiText) {
   return out;
 }
 
+// 只保存本轮新增（最后一条 user 文本 + AI 回复）。
+// 历史全量由 Kelivo 上行上报（带 group 语义）管理；网关不再全量重存历史，
+// 避免“路径A无group重存”与“路径B带group上报”并存造成重复/乱序/旧版本残留。
+function buildTurnMessages(messages, aiText) {
+  const out = [];
+  for (let i = (messages || []).length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!m || m.role !== 'user') continue;
+    const t = toPlainText(m.content).trim();
+    if (t) { out.push({ role: 'user', content: t }); break; }
+  }
+  if (aiText) out.push({ role: 'assistant', content: aiText });
+  return out;
+}
+
 // 功能6：动态配置缓存。启动时和 /reload-config 时从记忆服务拉取当前供应商配置。
 // 拉取失败或未配置时，转发逻辑回退到 .env（配置优先，.env 兜底）。
 let activeConfig = null;   // { name, base_url, api_key, model } 或 null
@@ -1262,7 +1277,7 @@ ${profile}
         // 单轮对话的回复永远存不进 L0，多轮也会丢最后一条 AI 回复。
         // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
         const aiText = extractAssistantText(result);
-        const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
+        const cleanedMessages = buildTurnMessages(req.body.messages, aiText);
         axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
           conv_id, client, messages: cleanedMessages
         }).catch(err => console.error('保存对话失败:', err.message));
@@ -1381,7 +1396,7 @@ ${profile}
       // 问题2 Bug A：append 本轮 AI 回复（原因见流式分支同处注释）
       // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
       const aiText = extractAssistantText(result);
-      const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
+      const cleanedMessages = buildTurnMessages(req.body.messages, aiText);
 
       axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
         conv_id: conv_id,
@@ -1476,7 +1491,7 @@ async function handleTgBotAssembled(req, res) {
     }
     let history = [];
     try {
-      const h = await axios.get(`${MEMORY_SERVICE_URL}/conversations/${encodeURIComponent(convId)}/messages?last=${lastN}`, { timeout: 5000 });
+      const h = await axios.get(`${MEMORY_SERVICE_URL}/conversations/${encodeURIComponent(convId)}/messages?last=${lastN}&order=anchor`, { timeout: 5000 });
       history = (h.data && h.data.messages) || [];
     } catch (e) { /* 新会话无历史 */ }
 

@@ -225,6 +225,20 @@ def init_db():
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute("INSERT OR IGNORE INTO conv_settings (id) VALUES ('__default__')")
+    # 方案C：group 语义列（幂等 migration；列已存在则跳过）
+    for col, coldef in (("group_id", "TEXT"), ("version", "INTEGER DEFAULT 0"), ("group_anchor", "INTEGER")):
+        try:
+            c.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
+        except sqlite3.OperationalError:
+            pass
+    # 思考链独立存储：不进入 L0 正文，按会话关联
+    c.execute('''CREATE TABLE IF NOT EXISTS thinking_records (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        conv_id TEXT NOT NULL,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
+        thinking TEXT NOT NULL,
+        answer_ref TEXT
+    )''')
     # 增量水位线：记录生成时已消费到的最大 id。
     # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
     # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
@@ -629,6 +643,46 @@ async def save_conversation(req: SaveRequest):
             content = normalize_content(msg.get("content", ""))
             if not content or role == "system":
                 continue
+            gid = (msg.get("group_id") or "").strip()
+            ver = int(msg.get("version") or 0)
+            ts_val = (msg.get("ts") or "").strip()
+            if ts_val:
+                ts_val = ts_val.replace("T", " ")[:19]  # 统一为 "YYYY-MM-DD HH:MM:SS"
+            # 内容级去重：同 conv 同 role 同内容(忽略换行)已有 active → 跳过。
+            # 修复 Kelivo 版本切换/重新生成导致的历史漂移：内容未变的消息不再
+            # 被无谓 superseded 重插（superseded 垃圾由 7011 条降到最低）。
+            dup = c.execute(
+                "SELECT id FROM l0_messages WHERE conv_id=? AND role=? AND status='active' AND "
+                "REPLACE(REPLACE(content,char(10),''),char(13),'')=REPLACE(REPLACE(?,char(10),''),char(13),'') LIMIT 1",
+                (req.conv_id, role, content)).fetchone()
+            if dup:
+                continue
+            if gid:
+                # 方案C：group 语义（逻辑位置稳定，版本替换）
+                old = c.execute(
+                    "SELECT id, version, extracted, group_anchor FROM l0_messages "
+                    "WHERE conv_id=? AND group_id=? AND status='active' ORDER BY id LIMIT 1",
+                    (req.conv_id, gid)).fetchone()
+                if old:
+                    if ver <= (old[1] or 0):
+                        continue  # 旧版本/同版本 → 跳过（内容未变化重复丢弃）
+                    c.execute("UPDATE l0_messages SET status='superseded' WHERE id=?", (old[0],))
+                    if old[2] == 1:
+                        superseded_old_ids.append(old[0])
+                    anchor_val = old[3] if old[3] else old[0]
+                    c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted, ts, group_id, version, group_anchor) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                              (req.conv_id, idx, role, content, req.client, 'active', 0,
+                               ts_val or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), gid, ver, anchor_val))
+                    saved += 1
+                    continue
+                # 新 group：插入后回填 anchor=自身 id
+                c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted, ts, group_id, version) VALUES (?,?,?,?,?,?,?,?,?,?)',
+                          (req.conv_id, idx, role, content, req.client, 'active', 0,
+                           ts_val or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), gid, ver))
+                nid = c.lastrowid
+                c.execute("UPDATE l0_messages SET group_anchor=? WHERE id=?", (nid, nid))
+                saved += 1
+                continue
             c.execute('SELECT id, content, extracted FROM l0_messages WHERE conv_id=? AND msg_idx=? AND status=?',
                       (req.conv_id, idx, 'active'))
             existing = c.fetchone()
@@ -828,7 +882,7 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     c = conn.cursor()
     if conv_id:
         c.execute(
-            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC LIMIT ? OFFSET ?',
+            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY id ASC LIMIT ? OFFSET ?',
             (conv_id, 'active', limit, offset)
         )
     else:
@@ -1143,8 +1197,8 @@ async def delete_l0_message(msg_id: int):
         if not row:
             return {"status": "error", "detail": "message not found"}
         conv_id, extracted, cur_status = row
-        # 标记该 L0 superseded
-        c.execute('UPDATE l0_messages SET status=? WHERE id=?', ('superseded', msg_id))
+        # 物理删除：软删标记会绕过 save 查重导致"复活"，用户显式删除应彻底移除
+        c.execute('DELETE FROM l0_messages WHERE id=?', (msg_id,))
         # 只有已提取过 L1 的消息才需要联动（extracted=0 的没进过批次，无 L1）
         if extracted == 1 and cur_status == 'active':
             l1_ids_to_purge = _cascade_l1_on_version_switch(c, conv_id, [msg_id])
@@ -1723,26 +1777,58 @@ async def list_conversations():
         {"conv_id": r[0], "msg_count": r[1], "last_ts": r[2]} for r in rows
     ]}
 
+class ThinkingRecord(BaseModel):
+    conv_id: str
+    thinking: str
+    answer_ref: Optional[str] = None
+
+@app.post("/thinking")
+async def save_thinking(req: ThinkingRecord):
+    """思考链独立存储（不进 L0 正文）：供 Kelivo 端拉取后挂载显示"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    c.execute("INSERT INTO thinking_records (conv_id, thinking, answer_ref) VALUES (?,?,?)",
+              (req.conv_id, req.thinking, req.answer_ref))
+    conn.commit()
+    tid = c.lastrowid
+    conn.close()
+    return {"status": "ok", "id": tid}
+
+@app.get("/conversations/{cid}/thinkings")
+async def conversation_thinkings(cid: str, after_id: int = 0, limit: int = 100):
+    """增量拉取思考链（按 id 升序）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, ts, thinking, answer_ref FROM thinking_records WHERE conv_id=? AND id>? ORDER BY id ASC LIMIT ?",
+        (cid, after_id, limit)).fetchall()
+    conn.close()
+    return {"conv_id": cid, "next_after_id": rows[-1][0] if rows else after_id, "thinkings": [
+        {"id": r[0], "ts": r[1], "thinking": r[2], "answer_ref": r[3]} for r in rows
+    ]}
+
 @app.get("/conversations/{cid}/messages")
-async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200, last: int = 0):
+async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200, last: int = 0, order: str = "id"):
     """增量拉取：返回 id > after_id 的消息（升序）。origin 推导：assistant→ai，user→client。"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
+    order_expr = "COALESCE(group_anchor, id) ASC" if order == "anchor" else "id ASC"
     if last and last > 0:
         rows = c.execute(
-            "SELECT id, role, content, ts, client FROM l0_messages "
-            "WHERE conv_id=? AND status='active' ORDER BY id DESC LIMIT ?",
+            f"SELECT id, role, content, ts, client, group_id FROM l0_messages "
+            f"WHERE conv_id=? AND status='active' ORDER BY id DESC LIMIT ?",
             (cid, last)).fetchall()
         rows = list(reversed(rows))
     else:
         rows = c.execute(
-            "SELECT id, role, content, ts, client FROM l0_messages "
-            "WHERE conv_id=? AND status='active' AND id>? ORDER BY id ASC LIMIT ?",
+            f"SELECT id, role, content, ts, client, group_id FROM l0_messages "
+            f"WHERE conv_id=? AND status='active' AND id>? ORDER BY {order_expr} LIMIT ?",
             (cid, after_id, limit)).fetchall()
     conn.close()
     return {"conv_id": cid, "next_after_id": rows[-1][0] if rows else after_id, "messages": [
         {"id": r[0], "role": r[1], "content": r[2], "ts": r[3],
-         "origin": "ai" if r[1] == "assistant" else ("tg" if (r[4] or "").startswith("tg") else (r[4] or "unknown"))}
+         "origin": "ai" if r[1] == "assistant" else ("tg" if (r[4] or "").startswith("tg") else (r[4] or "unknown")),
+         "group_id": r[5]}
         for r in rows
     ]}
 
@@ -2358,6 +2444,11 @@ def build_summary_prompt(messages: list) -> str:
 - 保留时间顺序
 - 突出重要信息
 - 简洁明了
+- 【AI 第一人称】以 AI（[我]）的第一人称视角记录；对话中 [我] 是 AI，[你] 是对话的用户；提及用户不要用 "用户"，用 ta / 她 / 宝宝 / 小猫，保持事件与信息主语清晰
+- 【保留关系质感】保留对话的温度，但以事实为主，不要捏造没有的关系性或事实性内容
+- 【每天成句】每天发生的事各自成句；绝不许把两天的事并成一句话——那等于把其中一天弄丢了
+- 【只说一半就写一半】用户只说了 "那个前端"，就写 "那个前端"；绝不许自己编名字、编职位
+- 【亲密含蓄】亲密内容用含蓄的说法概括（如 "度过了亲密的一晚"）；事实和约定照记；注意内容语义去重；细节可适度提及，但不要逐字复述
 
 摘要："""
 
