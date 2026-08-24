@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -813,6 +813,77 @@ class KelivoBackupImportReq(BaseModel):
     path: str                   # VPS 上备份 zip 的路径
     mode: Optional[str] = "skip"   # skip | append
     convs: Optional[List[str]] = None   # 指定导入的 conv_id；None=全部
+
+class MemoryImportReq(BaseModel):
+    path: str
+    mode: Optional[str] = "merge"   # merge | replace
+
+@app.get("/export/memory")
+async def export_memory_api():
+    """记忆库整体导出（zip：L0/L1/thinking/叙事/摘要/自定义提示/会话设置/画像）"""
+    from memory_export import export_memory_zip
+    from fastapi.responses import Response
+    data = export_memory_zip(str(SQLITE_PATH),
+                             str(Path(SQLITE_PATH).parent.parent / "profile"))
+    fname = "memory_export_" + datetime.now().strftime("%Y%m%d_%H%M") + ".zip"
+    return Response(content=data, media_type="application/zip",
+                    headers={"Content-Disposition": f"attachment; filename={fname}"})
+
+@app.post("/import/memory")
+async def import_memory_api(req: MemoryImportReq):
+    """记忆库整体导入（zip）。mode: merge(按主键去重) | replace(先清空相关表)"""
+    try:
+        from memory_export import import_memory_zip, EXPORT_TABLES
+        data = open(req.path, "rb").read()
+        if req.mode == "replace":
+            for t in EXPORT_TABLES:
+                conn = sqlite3.connect(str(SQLITE_PATH))
+                conn.execute(f"DELETE FROM {t}")
+                conn.commit(); conn.close()
+        stats = import_memory_zip(data, str(SQLITE_PATH),
+                                  str(Path(SQLITE_PATH).parent.parent / "profile"), mode=req.mode)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.get("/export/feel")
+async def export_feel_api():
+    """feel 单独导出（l1_memories event_type='feel' 子集）"""
+    from memory_export import export_feel
+    return {"status": "ok", "count": len(export_feel(str(SQLITE_PATH))), "items": export_feel(str(SQLITE_PATH))}
+
+class FeelImportReq(BaseModel):
+    items: List[dict]
+
+@app.post("/import/feel")
+async def import_feel_api(req: FeelImportReq):
+    """feel 单独导入（按 content 去重；补 ChromaDB 向量）"""
+    try:
+        from memory_export import import_feel
+        async def chroma_add(l1_id, content):
+            emb = await get_embedding(content)
+            if emb:
+                l1_collection.add(ids=[f"l1_{l1_id}"], embeddings=[emb],
+                                  documents=[content],
+                                  metadatas=[{"event_type": "feel", "client": "ai_self"}])
+        n = import_feel(str(SQLITE_PATH), req.items, chroma_add=chroma_add)
+        return {"status": "ok", "imported": n}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/import/kelivo-backup/upload")
+async def upload_kelivo_backup(file: UploadFile):
+    """上传备份 zip → 保存到临时目录 → 返回预览（会话列表）"""
+    try:
+        import uuid as _uuid
+        outdir = Path("/tmp/imports"); outdir.mkdir(parents=True, exist_ok=True)
+        fpath = outdir / f"{_uuid.uuid4().hex}.zip"
+        fpath.write_bytes(await file.read())
+        from kelivo_backup_importer import preview_kelivo_backup
+        convs = preview_kelivo_backup(str(fpath))
+        return {"status": "ok", "path": str(fpath), "conversations": convs}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
 
 @app.post("/import/kelivo-backup/preview")
 async def preview_kelivo_backup_api(req: KelivoBackupImportReq):
