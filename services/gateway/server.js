@@ -1246,7 +1246,8 @@ ${profile}
             // 故保留。原污染问题（web_search_tool_result 被硬编码成 search_web、按 tool_use_id 覆盖真实工具名，
             // 导致重进窗口工具卡片变"联网搜索"）已在 Kelivo 侧修复：解析 web_search_tool_result 时按
             // tool_use_id 取回真实工具名（如 recall），不再污染持久化事件。
-            emitter.toolResolve(toolUse.id, toolResult);
+            // EXPERIMENT: toolResolve disabled (web_search_tool_result block suspected as '联网搜索' source in kelivo v1.2.3)
+            // emitter.toolResolve(toolUse.id, toolResult);
             toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
           }
           nonSystemMessages.push({ role: 'assistant', content: result.content });
@@ -1277,7 +1278,7 @@ ${profile}
         // 单轮对话的回复永远存不进 L0，多轮也会丢最后一条 AI 回复。
         // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
         const aiText = extractAssistantText(result);
-        const cleanedMessages = buildTurnMessages(req.body.messages, aiText);
+        const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
         axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
           conv_id, client, messages: cleanedMessages
         }).catch(err => console.error('保存对话失败:', err.message));
@@ -1396,7 +1397,7 @@ ${profile}
       // 问题2 Bug A：append 本轮 AI 回复（原因见流式分支同处注释）
       // L0 重复根治：cleanMessagesForSave 去空消息+相邻重复，稳定 msg_idx。
       const aiText = extractAssistantText(result);
-      const cleanedMessages = buildTurnMessages(req.body.messages, aiText);
+      const cleanedMessages = cleanMessagesForSave(req.body.messages, aiText);
 
       axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
         conv_id: conv_id,

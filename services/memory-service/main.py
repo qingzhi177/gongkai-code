@@ -809,6 +809,34 @@ class ImportRequest(BaseModel):
     client: str = "import"
     conv_date: Optional[str] = None
 
+class KelivoBackupImportReq(BaseModel):
+    path: str                   # VPS 上备份 zip 的路径
+    mode: Optional[str] = "skip"   # skip | append
+    convs: Optional[List[str]] = None   # 指定导入的 conv_id；None=全部
+
+@app.post("/import/kelivo-backup/preview")
+async def preview_kelivo_backup_api(req: KelivoBackupImportReq):
+    """预览备份中的会话列表（选择导入前查看）"""
+    try:
+        from kelivo_backup_importer import preview_kelivo_backup
+        convs = preview_kelivo_backup(req.path)
+        return {"status": "ok", "conversations": convs}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/import/kelivo-backup")
+async def import_kelivo_backup_api(req: KelivoBackupImportReq):
+    """导入 kelivo-backup v2 (zip+sqlite) → L0 / thinking_records（版本折叠：用户选择版本优先）。
+    旧版 JSON 导入保留。convs 为空=全部会话。"""
+    try:
+        from kelivo_backup_importer import import_kelivo_backup
+        stats = import_kelivo_backup(req.path, mode=req.mode,
+                                     memory_db_path=str(SQLITE_PATH),
+                                     convs=req.convs)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 @app.post("/import_conversation")
 async def import_conversation(req: ImportRequest):
     """导入历史对话到 L0"""
@@ -2071,6 +2099,7 @@ async def purge_all_data(confirmation: dict):
         c.execute("DELETE FROM recent_summary")
         c.execute("DELETE FROM user_profile")
         c.execute("DELETE FROM ai_profile")
+        c.execute("DELETE FROM thinking_records")
         c.execute("VACUUM")
         conn.commit()
         conn.close()
