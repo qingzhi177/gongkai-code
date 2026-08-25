@@ -25,20 +25,6 @@ AI 长期记忆系统，基于 Paramecium 架构。
 - 联网搜索：bocha_search 走博查 API；供应商内置 web_search（server-side）自动生效
 - 工具格式归一：OpenAI 格式工具自动转 Anthropic 原生格式，兼容新版 API
 
-## 数据管理（备份与迁移）
-
-- **Kelivo 备份导入**（kelivo-backup v2 zip+sqlite）：预览会话列表 / 版本折叠（version_selections 优先，无选择取最高）/ 指定会话导入（convs）/ skip|append 模式；旧版 JSON 导入保留
-- **记忆库整体导出/导入**（zip）：L0/L1/thinking/叙事/摘要/自定义提示/会话设置/画像 + manifest；merge（主键去重）| replace（清空重导）
-- **feel 单独导出/导入**：`?source=all|self|extracted`（AI自述 / L0对话提取）；导入补 ChromaDB 向量
-- **Dashboard「备份管理」面板**：上传-预览-勾选-导入 / 一键导出下载（`/import/` `/export/` 经 nginx 直连记忆服务，multipart 不走网关）
-
-## 和弦情绪锚点（v0.1 接入）
-
-- **AI 自述 feel 支持 v0.1 锚格式**：`> 情境行` + `> 和弦行 · 可选bpm · 可选力度`（如 `> 你早上六点叫我，我手里还有皮筋` / `> Fmaj9 → C/E → Am add9 → G6sus4 · 60bpm`）
-- `l1_memories` 新增 `anchor_json`：`{scene, chords, tempo, dynamics}` 结构化存储；无锚内容兼容（null）
-- **边界**：只给记忆用（记录感受/回顾时），日常对话不上和弦；情境必有；每行≤4和弦用→隔开；紧张系和弦旁加动作词（盯/压/憋/狂）
-- 网关 feel 工具描述已包含引导规则；完整设计分析见《和弦锚点架构设计.md》
-
 ## 更新日志
 - v1.7 — 记忆延续性 + 自动更新 + Custom Prompt + Dashboard 优化
   - 任务D：修复 Narrative 生成提示词内容未注入的 Bug
