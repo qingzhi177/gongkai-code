@@ -818,6 +818,29 @@ class MemoryImportReq(BaseModel):
     path: str
     mode: Optional[str] = "merge"   # merge | replace
 
+class MemoryUploadReq(BaseModel):
+    mode: Optional[str] = "merge"
+
+@app.post("/import/memory/upload")
+async def import_memory_upload(file: UploadFile, mode: str = "merge"):
+    """上传记忆库导出 zip → 保存 → 导入（merge|replace）。"""
+    try:
+        import uuid as _uuid
+        outdir = Path("/tmp/imports"); outdir.mkdir(parents=True, exist_ok=True)
+        fpath = outdir / f"{_uuid.uuid4().hex}.zip"
+        fpath.write_bytes(await file.read())
+        from memory_export import import_memory_zip, EXPORT_TABLES
+        if mode == "replace":
+            conn = sqlite3.connect(str(SQLITE_PATH))
+            for t in EXPORT_TABLES:
+                conn.execute(f"DELETE FROM {t}")
+            conn.commit(); conn.close()
+        stats = import_memory_zip(fpath.read_bytes(), str(SQLITE_PATH),
+                                  str(Path(SQLITE_PATH).parent.parent / "profile"), mode=mode)
+        return {"status": "ok", "stats": stats}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 @app.get("/export/memory")
 async def export_memory_api():
     """记忆库整体导出（zip：L0/L1/thinking/叙事/摘要/自定义提示/会话设置/画像）"""

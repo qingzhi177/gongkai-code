@@ -106,7 +106,6 @@
             <button class="tab" onclick="showPanel('config')">配置</button>
             <button class="tab" onclick="showPanel('logs')">系统日志</button>
             <button class="tab" onclick="showPanel('convs')">会话配置</button>
-            <button class="tab" onclick="showPanel('bak')">备份管理</button>
         </div>
 
         <div id="overview" class="panel active">
@@ -401,49 +400,6 @@
                 <span id="convs-status" style="margin-left:10px;font-size:12px;"></span>
             </div>
         </div>
-        <div id="bak" class="panel">
-            <h3>备份管理（Kelivo 备份导入 / 记忆库导出导入 / feel）</h3>
-            <div class="config-section">
-                <h4>Kelivo 备份导入</h4>
-                <div style="margin-bottom:8px;">
-                    <input type="file" id="bk-file" accept=".zip">
-                    <button onclick="uploadBk()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">上传并预览</button>
-                    <select id="bk-mode" style="margin-left:8px;">
-                        <option value="skip">跳过已有会话</option>
-                        <option value="append">追加</option>
-                    </select>
-                </div>
-                <div id="bk-list" style="max-height:200px;overflow-y:auto;font-size:13px;"></div>
-                <div style="margin-top:8px;">
-                    <button onclick="doImportBk()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">导入选中</button>
-                    <span id="bk-status" style="margin-left:10px;font-size:12px;"></span>
-                </div>
-            </div>
-            <div class="config-section">
-                <h4>记忆库整体导出 / 导入</h4>
-                <div style="margin-bottom:8px;">
-                    <a href="/export/memory" download style="padding:5px 14px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;">导出记忆库(zip)</a>
-                    <span style="margin-left:8px;"></span>
-                    <input type="file" id="mem-file" accept=".zip">
-                    <select id="mem-mode">
-                        <option value="merge">合并导入</option>
-                        <option value="replace">替换导入（先清空）</option>
-                    </select>
-                    <button onclick="doImportMem()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">导入</button>
-                    <span id="mem-status" style="margin-left:8px;font-size:12px;"></span>
-                </div>
-            </div>
-            <div class="config-section">
-                <h4>feel 导出 / 导入</h4>
-                <div>
-                    <a href="/export/feel" download="feel.json" style="padding:5px 14px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;">导出 feel(json)</a>
-                    <span style="margin-left:8px;"></span>
-                    <input type="file" id="feel-file" accept=".json">
-                    <button onclick="doImportFeel()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">导入 feel</button>
-                    <span id="feel-status" style="margin-left:8px;font-size:12px;"></span>
-                </div>
-            </div>
-        </div>
         <div id="logs" class="panel">
             <h3>系统日志</h3>
             <div style="margin-bottom:15px;">
@@ -531,7 +487,6 @@
             if (name === 'custom_prompt') loadCustomPrompt();
             if (name === 'config') loadConfig();
             if (name === 'convs') loadConvs();
-            if (name === 'bak') {}
             if (name === 'logs') loadLogs();
             if (name === 'pipeline') loadPipeline();
             if (name === 'extraction') loadExtraction();
@@ -1806,64 +1761,6 @@
             }).catch(function(e) {
                 document.getElementById('convs-status').textContent = '保存失败: ' + e;
             });
-        }
-        var bkPath = '';
-        function uploadBk() {
-            var f = document.getElementById('bk-file').files[0];
-            if (!f) { alert('请选择备份 zip'); return; }
-            var fd = new FormData(); fd.append('file', f);
-            document.getElementById('bk-status').textContent = '上传中...';
-            fetch('/import/kelivo-backup/upload', { method: 'POST', body: fd })
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    if (d.status !== 'ok') { document.getElementById('bk-status').textContent = '失败: ' + d.detail; return; }
-                    bkPath = d.path;
-                    var box = document.getElementById('bk-list'); box.innerHTML = '';
-                    (d.conversations || []).forEach(function(c) {
-                        var div = document.createElement('div');
-                        div.innerHTML = '<label><input type="checkbox" value="' + c.conv_id + '" checked> ' +
-                            ((c.title || c.conv_id).substring(0, 26)) + '（' + (c.msg_count || 0) + '条 / ' + (c.last_ts || '') + '）</label>';
-                        box.appendChild(div);
-                    });
-                    document.getElementById('bk-status').textContent = '共 ' + (d.conversations || []).length + ' 个会话';
-                }).catch(function(e) { document.getElementById('bk-status').textContent = '上传失败: ' + e; });
-        }
-        function doImportBk() {
-            if (!bkPath) { alert('请先上传预览'); return; }
-            var convs = [];
-            document.querySelectorAll('#bk-list input:checked').forEach(function(c) { convs.push(c.value); });
-            var body = { path: bkPath, mode: document.getElementById('bk-mode').value, convs: convs };
-            document.getElementById('bk-status').textContent = '导入中...';
-            fetch('/import/kelivo-backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-                .then(function(r) { return r.json(); })
-                .then(function(d) { document.getElementById('bk-status').textContent = JSON.stringify(d.stats || d); })
-                .catch(function(e) { document.getElementById('bk-status').textContent = '导入失败: ' + e; });
-        }
-        function doImportMem() {
-            var f = document.getElementById('mem-file').files[0];
-            if (!f) { alert('请选择 zip'); return; }
-            var fd = new FormData(); fd.append('file', f);
-            fd.append('mode', document.getElementById('mem-mode').value);
-            document.getElementById('mem-status').textContent = '导入中...';
-            fetch('/import/memory/upload', { method: 'POST', body: fd })
-                .then(function(r) { return r.json(); })
-                .then(function(d) { document.getElementById('mem-status').textContent = JSON.stringify(d.stats || d); })
-                .catch(function(e) { document.getElementById('mem-status').textContent = '失败: ' + e; });
-        }
-        function doImportFeel() {
-            var f = document.getElementById('feel-file').files[0];
-            if (!f) { alert('请选择 json'); return; }
-            var rd = new FileReader();
-            rd.onload = function() {
-                var obj = JSON.parse(rd.result);
-                var items = Array.isArray(obj) ? obj : (obj.items || []);
-                document.getElementById('feel-status').textContent = '导入中(' + items.length + '条)...';
-                fetch('/import/feel', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ items: items }) })
-                    .then(function(r) { return r.json(); })
-                    .then(function(d) { document.getElementById('feel-status').textContent = '导入: ' + d.imported; })
-                    .catch(function(e) { document.getElementById('feel-status').textContent = '失败: ' + e; });
-            };
-            rd.readAsText(f);
         }
     </script>
 </body>
