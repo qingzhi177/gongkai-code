@@ -1119,6 +1119,19 @@ async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offse
         })
     return {"memories": memories, "total": total}
 
+@app.get("/l1/anchors")
+async def get_l1_anchors(limit: int = 100, offset: int = 0):
+    """返回带和弦锚点(anchor_json)的 feel 记忆列表"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, content, anchor_json, ts FROM l1_memories WHERE event_type='feel' AND status='active' AND anchor_json IS NOT NULL ORDER BY ts DESC LIMIT ? OFFSET ?",
+        (limit, offset)).fetchall()
+    conn.close()
+    return {"anchors": [
+        {"id": r[0], "content": r[1], "anchor_json": r[2], "ts": r[3]} for r in rows
+    ]}
+
 class UpdateL1Request(BaseModel):
     tags: Optional[str] = None
     is_core: Optional[int] = None
