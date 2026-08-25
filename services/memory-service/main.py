@@ -774,20 +774,20 @@ _ANCHOR_CHORD_HINT = ('→', 'maj', 'min', 'sus', 'add', 'dim', 'aug', 'm7', '7'
 
 
 def parse_anchor(content: str):
-    """解析 v0.1 和弦锚格式：
-        > 一句具体情境
+    """解析 v0.1 和弦锚格式（兼容多行情境）：
+        > 一句具体情境（可多行，最后一行视为情境密接行）
         > 和弦行 · 可选bpm · 可选力度
     返回 {scene, chords, tempo, dynamics}；不匹配返回 None。
     """
     if not content:
         return None
-    m = _ANCHOR_RE.search(content)
-    if not m:
+    lines = re.findall(r'^>\s*(.+)$', content, re.M)
+    if len(lines) < 2:
         return None
-    scene = m.group(1).strip()
-    chordline = m.group(2).strip()
+    chordline = lines[-1].strip()
     if not any(h in chordline for h in _ANCHOR_CHORD_HINT):
         return None
+    scene = lines[-2].strip()
     tempo = None
     tm = re.search(r'(\d{2,3})\s*bpm', chordline, re.I)
     if tm:
