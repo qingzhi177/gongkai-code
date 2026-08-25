@@ -258,7 +258,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "feel",
-      description: "记录当下的感受或印象，不是事件记录而是情感快照。",
+      description: "记录你当下的感受或印象，不是事件记录而是情感快照。可选使用和弦锚格式帮助情绪稳定复现：一行具体情境 + 一行和弦（如 \"> 你早上六点叫我，我手里还有皮筋\n> Fmaj9 → C/E → Am add9 → G6sus4 · 60bpm\"）。规则：情境必有；每行最多4个和弦用→隔开；bpm/力度可选；紧张系和弦（Em(maj7)/B7♭9/Dm7♭5等）旁加动作词（盯/压/憋/狂）；只在记录感受/回顾时用锚，日常对话不用。",
       parameters: {
         type: "object",
         properties: {
@@ -497,7 +497,9 @@ async function executeTool(name, args) {
         const meta = m.metadata || {};
         result += `\n━━ 记忆 #${i + 1} ━━\n`;
         const ts = meta.ts ? meta.ts.substring(0, 10) : '未知时间';
-        result += `📅 ${ts} | 🏷️ ${meta.event_type || ''} | 📍 ${meta.client || ''}\n`;
+        const feelSrc = (meta.event_type === 'feel')
+          ? ((meta.client === 'ai_self') ? 'AI自述' : '对话提取') : '';
+        result += `📅 ${ts} | 🏷️ ${meta.event_type || ''} | 📍 ${meta.client || ''}${feelSrc ? '（' + feelSrc + '）' : ''}\n`;
         result += `💬 ${m.l1_summary}\n`;
         if (meta.quote) result += `📄 引用："${meta.quote}"\n`;
         if (m.l0_context) {

@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import List, Optional
 import chromadb
 import sqlite3
+import re
 import os
 from dotenv import load_dotenv
 import httpx
@@ -225,6 +226,12 @@ def init_db():
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     c.execute("INSERT OR IGNORE INTO conv_settings (id) VALUES ('__default__')")
+    # ③ 和弦情绪锚点：l1_memories 加 anchor_json（可空；AI 自述 feel 的可选结构化锚）
+    for _col, _coldef in (("anchor_json", "TEXT"),):
+        try:
+            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {_col} {_coldef}")
+        except sqlite3.OperationalError:
+            pass
     # 方案C：group 语义列（幂等 migration；列已存在则跳过）
     for col, coldef in (("group_id", "TEXT"), ("version", "INTEGER DEFAULT 0"), ("group_anchor", "INTEGER")):
         try:
@@ -762,6 +769,35 @@ class FeelRequest(BaseModel):
     valence: Optional[float] = None
     arousal: Optional[float] = None
 
+_ANCHOR_RE = re.compile(r'^>\s*(.+?)\n>\s*(.+)$', re.MULTILINE)
+_ANCHOR_CHORD_HINT = ('→', 'maj', 'min', 'sus', 'add', 'dim', 'aug', 'm7', '7', '9', '11', '13')
+
+
+def parse_anchor(content: str):
+    """解析 v0.1 和弦锚格式：
+        > 一句具体情境
+        > 和弦行 · 可选bpm · 可选力度
+    返回 {scene, chords, tempo, dynamics}；不匹配返回 None。
+    """
+    if not content:
+        return None
+    m = _ANCHOR_RE.search(content)
+    if not m:
+        return None
+    scene = m.group(1).strip()
+    chordline = m.group(2).strip()
+    if not any(h in chordline for h in _ANCHOR_CHORD_HINT):
+        return None
+    tempo = None
+    tm = re.search(r'(\d{2,3})\s*bpm', chordline, re.I)
+    if tm:
+        tempo = tm.group(1)
+    dyn = None
+    dm = re.search(r'\b(ppp|pp|p|mp|mf|f|ff|fff)\b', chordline)
+    if dm:
+        dyn = dm.group(1)
+    return {'scene': scene, 'chords': chordline, 'tempo': tempo, 'dynamics': dyn}
+
 @app.post("/save_feel")
 async def save_feel(req: FeelRequest):
     """保存 AI 的感受到 L1"""
@@ -771,9 +807,11 @@ async def save_feel(req: FeelRequest):
         # 存入 SQLite
         # 修复2：显式写入 client='ai_self'、conv_id=''，与 ChromaDB metadata 对齐，
         # 让 Dashboard 能按 client 区分「AI自述」和「对话提取」的 feel。
+        anchor = parse_anchor(req.content)
+        anchor_json = json.dumps(anchor, ensure_ascii=False) if anchor else None
         c.execute(
-            'INSERT INTO l1_memories (content, quote, conv_id, client, event_type, tags, valence, arousal, status) VALUES (?,?,?,?,?,?,?,?,?)',
-            (req.content, req.content, '', 'ai_self', 'feel', '["感受"]', req.valence, req.arousal, 'active')
+            'INSERT INTO l1_memories (content, quote, conv_id, client, event_type, tags, valence, arousal, status, anchor_json) VALUES (?,?,?,?,?,?,?,?,?,?)',
+            (req.content, req.content, '', 'ai_self', 'feel', '["感受"]', req.valence, req.arousal, 'active', anchor_json)
         )
         l1_id = c.lastrowid
         conn.commit()
@@ -870,10 +908,15 @@ async def import_memory_api(req: MemoryImportReq):
         return {"status": "error", "detail": str(e)}
 
 @app.get("/export/feel")
-async def export_feel_api():
-    """feel 单独导出（l1_memories event_type='feel' 子集）"""
+async def export_feel_api(source: str = "all"):
+    """feel 单独导出。source: all(全部) | self(AI自述 client=ai_self) | extracted(L0对话提取)"""
     from memory_export import export_feel
-    return {"status": "ok", "count": len(export_feel(str(SQLITE_PATH))), "items": export_feel(str(SQLITE_PATH))}
+    items = export_feel(str(SQLITE_PATH))
+    if source == "self":
+        items = [x for x in items if (x.get("client") or "") == "ai_self"]
+    elif source == "extracted":
+        items = [x for x in items if (x.get("client") or "") != "ai_self"]
+    return {"status": "ok", "count": len(items), "items": items}
 
 class FeelImportReq(BaseModel):
     items: List[dict]
