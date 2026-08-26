@@ -476,6 +476,43 @@ async function getMemoryMenu(userMessage, convId) {
 }
 
 // 执行工具调用
+// 把工具执行结果文本转成 Kelivo 原生"来源摘要卡"的 items（仅前端展示，不进 L0/上下文）。
+// recall 文本含 "━━记忆 #N ━━" 分隔块 → 每条记忆一个条目；其他工具 → 前两行摘要。
+function toolResultToItems(name, resultText) {
+  const text = String(resultText || '');
+  const today = new Date().toISOString().slice(0, 10);
+  const SH = String.fromCharCode(35);
+  const NL = String.fromCharCode(10);
+  function mk(title) {
+    return { type: 'web_search_result', title: String(title).slice(0, 120), url: '', page_age: today };
+  }
+  if (name === 'recall') {
+    const items = [];
+    const blocks = text.split('━━');
+    for (let i = 0; i < blocks.length; i++) {
+      const b = blocks[i];
+      if (b.indexOf('记忆 ' + SH) < 0) continue;
+      const body = blocks[i + 1] || '';
+      let title = '';
+      for (const ln of body.split(NL)) {
+        const t = ln.trim();
+        if (t.indexOf('💬') === 0) { title = t.slice(2).trim(); break; }
+        if (t.indexOf('📅') === 0 && title === '') { title = t.slice(2).trim() || '记忆'; }
+      }
+      const num = b.split('记忆 ' + SH)[1].split(' ')[0].trim();
+      items.push(mk('记忆 ' + SH + num + (title ? ' · ' + title : '')));
+      i++;
+    }
+    if (items.length === 0) {
+      const head = text.split(NL).filter(x => x.trim()).slice(0, 2).join(' · ');
+      items.push(mk(head || '未找到相关记忆。'));
+    }
+    return items.slice(0, 8);
+  }
+  const head = text.split(NL).filter(x => x.trim()).slice(0, 2).join(' · ');
+  return [mk(head || '已完成')];
+}
+
 async function executeTool(name, args) {
   console.log('[TOOL] 调用:', name, JSON.stringify(args));
 
@@ -772,7 +809,8 @@ function makeEmitter(res, isAnthropic, requestModel) {
     // bug修复：解除工具卡片的 loading 状态。发一个 web_search_tool_result 块（Kelivo 的 Claude 解析器
     // 唯一会转成 toolResults chunk 的流块），tool_use_id 匹配卡片 id → Kelivo 按 id 命中并把该工具块
     // loading 置为 false。不解除的话 hasLoadingTool 恒真，token 永远显示 0。
-    toolResolve(id, resultText) {
+    // v2: content 填 items（web_search_result 类型），Kelivo 渲染成"N 条记忆/引用"摘要卡片，展示工具结果。
+    toolResolve(id, items) {
       if (!isAnthropic) return;
       feIndex++;
       const idx = feIndex;
@@ -781,8 +819,8 @@ function makeEmitter(res, isAnthropic, requestModel) {
         content_block: {
           type: 'web_search_tool_result',
           tool_use_id: id,
-          // content 用空结果数组即可满足解析（我们的工具结果本身不走这个展示，只为解除 loading）
-          content: []
+          // content 为工具结果摘要 items（Kelivo 原生渲染来源摘要卡）
+          content: items || []
         }
       });
       sseSend(res, 'content_block_stop', { type: 'content_block_stop', index: idx });
@@ -1248,8 +1286,8 @@ ${profile}
             // 故保留。原污染问题（web_search_tool_result 被硬编码成 search_web、按 tool_use_id 覆盖真实工具名，
             // 导致重进窗口工具卡片变"联网搜索"）已在 Kelivo 侧修复：解析 web_search_tool_result 时按
             // tool_use_id 取回真实工具名（如 recall），不再污染持久化事件。
-            // EXPERIMENT: toolResolve disabled (web_search_tool_result block suspected as '联网搜索' source in kelivo v1.2.3)
-            // emitter.toolResolve(toolUse.id, toolResult);
+            // toolResolve v2：工具结果转引用摘要卡（recall=记忆条目 / 其他=文本摘要），Kelivo 原生渲染
+            emitter.toolResolve(toolUse.id, toolResultToItems(toolUse.name, toolResult));
             toolResults.push({ type: 'tool_result', tool_use_id: toolUse.id, content: toolResult });
           }
           nonSystemMessages.push({ role: 'assistant', content: result.content });
