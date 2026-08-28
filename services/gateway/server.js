@@ -558,7 +558,7 @@ async function executeTool(name, args) {
         valence: args.valence || null,
         arousal: args.arousal || null
       });
-      return '感受已记录。';
+      return '感受已记录 ✓ 内容：「' + String(args.content || '').slice(0, 80) + '」';
     } catch (e) {
       return `记录感受失败: ${e.message}`;
     }
@@ -572,7 +572,7 @@ async function executeTool(name, args) {
       if (args.action === 'append') {
         const current = await fs.readFile(filePath, 'utf8').catch(() => '');
         await fs.writeFile(filePath, current + '\n' + args.content, 'utf8');
-        return '已追加到画像。';
+        return '已追加到画像（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」';
       } else if (args.action === 'rewrite') {
         // 备份旧版本
         const current = await fs.readFile(filePath, 'utf8').catch(() => '');
@@ -581,7 +581,7 @@ async function executeTool(name, args) {
           await fs.writeFile(`${dataDir}/${backupName}`, current, 'utf8');
         }
         await fs.writeFile(filePath, args.content, 'utf8');
-        return '画像已更新（旧版本已备份）。';
+        return '画像已重写（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」（旧版本已备份）';
       }
     } catch (e) {
       return `更新画像失败: ${e.message}`;

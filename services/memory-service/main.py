@@ -1132,6 +1132,65 @@ async def get_l1_anchors(limit: int = 100, offset: int = 0):
         {"id": r[0], "content": r[1], "anchor_json": r[2], "ts": r[3]} for r in rows
     ]}
 
+@app.get("/viz/l0l1")
+async def get_viz_l0l1():
+    """L0-L1 关联可视化：active L1（含批次 source_msg_id）+ 批次窗口内 L0 消息。
+    批次 = source_msg_id（该次提取首条消息 id），按 id 区间不重叠切分。
+    """
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client, source_msg_id "
+        "FROM l1_memories WHERE status='active' ORDER BY ts ASC").fetchall()
+    stars = []
+    batch_ids = set()
+    for r in rows:
+        mid, content, quote, etype, tags, val, aro, core, acc, ts, client, smid = r
+        domain = etype or 'general'
+        if etype == 'feel':
+            domain = '情绪' if client == 'ai_self' else '感受'
+        elif etype == 'relationship':
+            domain = '关系'
+        elif etype == 'preference_change':
+            domain = '偏好'
+        elif etype == 'event':
+            domain = '事件'
+        elif etype == 'fact':
+            domain = '事实'
+        elif etype == 'plan':
+            domain = '计划'
+        elif etype == 'general':
+            domain = '日常'
+        imp = 6
+        if core:
+            imp = 9
+        if etype in ('feel', 'relationship'):
+            imp = max(imp, 7)
+        nm = (quote or '').strip()
+        if not nm:
+            nm = ' '.join((content or '').split())[:60]
+        stars.append({
+            'id': 'l1_' + str(mid), 'mid': mid, 'name': nm[:30],
+            'domain': domain, 'importance': imp, 'pinned': bool(core),
+            'created': (ts or '')[:10] + 'T00:00:00',
+            'content': (content or '')[:600],
+            'batch': smid,
+        })
+        if smid is not None:
+            batch_ids.add(smid)
+    batch_ids = sorted(batch_ids)
+    batches = {}
+    for i, sid in enumerate(batch_ids):
+        nxt = batch_ids[i + 1] if i + 1 < len(batch_ids) else sid + 100000
+        rows0 = c.execute(
+            "SELECT role, content, ts FROM l0_messages WHERE status='active' AND id >= ? AND id < ? ORDER BY id LIMIT 60",
+            (sid, nxt)).fetchall()
+        batches[str(sid)] = [
+            {'role': rr[0], 'content': (rr[1] or '')[:400], 'ts': rr[2]} for rr in rows0
+        ]
+    conn.close()
+    return {'stars': stars, 'batches': batches}
+
 class UpdateL1Request(BaseModel):
     tags: Optional[str] = None
     is_core: Optional[int] = None

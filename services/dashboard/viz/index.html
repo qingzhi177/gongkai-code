@@ -1,0 +1,855 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#050209">
+<title>Memory · 记忆银河</title>
+<link href="https://cdn.jsdelivr.net/npm/@fontsource/cormorant-garamond@5/400-italic.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@fontsource/playfair-display@5/600-italic.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/300.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/400.min.css" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/@fontsource/noto-serif-sc@5/500.min.css" rel="stylesheet">
+
+<!-- ═══════════════════════════════════════════════════════════
+     ① CONFIG —— 只改这里就能变成你们自己的银河
+     ═══════════════════════════════════════════════════════════ -->
+<script>
+const CONFIG = {
+  title:    'L1 × L0',                       // 大标题（英文衬线体）
+  subtitle: 'memory · constellation',  // 副标题
+  motto:    'L1 是星，L0 是它降落的轨迹。', // 中文小字
+  coreName: '核心记忆',                      // 中心那颗星的名字
+  coreEn:   'Where it all began',           // 中心星的英文小字（比如你们的纪念日、TA 的名字）
+  dataUrl:  '/api/viz/l0l1',                  // 记忆数据文件路径（加载失败时自动用下面内嵌的示例数据）
+};
+</script>
+
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{height:100%;overflow:hidden;background:#050209}
+body{font-family:"Noto Serif SC","Songti SC",serif;color:#F3EAF5}
+#gl{position:fixed;inset:0;display:block;touch-action:none}
+
+/* 开场黑幕 */
+#veil{position:fixed;inset:0;z-index:30;background:#050209;pointer-events:none;
+  transition:opacity 2s ease}
+#veil.gone{opacity:0}
+
+.head{position:fixed;top:0;left:0;right:0;z-index:10;text-align:center;
+  padding:calc(env(safe-area-inset-top) + 16px) 16px 0;pointer-events:none;
+  opacity:0;transition:opacity 1.6s ease .6s}
+.head.in{opacity:1}
+.head h1{font-family:"Playfair Display",serif;font-style:italic;font-weight:600;
+  font-size:30px;color:#F6ECFA;text-shadow:0 0 30px rgba(210,150,230,.6)}
+.head .sub{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:14px;
+  color:rgba(220,200,240,.55);letter-spacing:.16em;margin-top:2px}
+.head .zh{font-family:"Noto Serif SC",serif;font-weight:300;font-size:12.5px;
+  color:rgba(220,205,238,.45);letter-spacing:.16em;margin-top:14px}
+
+#labels{position:fixed;inset:0;z-index:6;pointer-events:none;overflow:hidden}
+.lbl{position:absolute;transform:translate(-50%,-50%);white-space:nowrap;
+  transition:opacity .4s ease;will-change:transform,opacity}
+.lbl .t{font-family:"Noto Serif SC",serif;font-weight:400;font-size:13px;color:#FBEFFA;
+  text-shadow:0 0 12px rgba(255,180,230,.7),0 1px 4px rgba(0,0,0,.8);letter-spacing:.04em}
+.lbl .d{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:11px;
+  color:rgba(230,205,240,.7);letter-spacing:.08em;margin-top:1px;text-shadow:0 1px 4px rgba(0,0,0,.8)}
+.lbl.core{transform:translate(-50%,10px)}
+.lbl.core .t{font-size:18px;font-weight:500;letter-spacing:.14em;text-shadow:0 0 22px rgba(255,180,235,1)}
+.lbl.core .en{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:12.5px;
+  color:rgba(238,212,246,.8);letter-spacing:.16em;margin-top:1px}
+
+.hint{position:fixed;left:50%;transform:translateX(-50%);z-index:7;
+  bottom:calc(env(safe-area-inset-bottom) + 18px);
+  font-family:"Cormorant Garamond",serif;font-style:italic;font-size:12px;
+  color:rgba(225,205,240,.35);letter-spacing:.14em;white-space:nowrap;
+  transition:opacity .8s ease;pointer-events:none}
+
+#scrim{position:fixed;inset:0;z-index:20;background:transparent;opacity:0;pointer-events:none;transition:opacity .4s ease}
+#scrim.show{opacity:1;pointer-events:auto}
+/* 低存在感：文字直接从底部渐隐浮现，无卡片框，星空是主角 */
+#card{position:fixed;left:0;right:0;bottom:0;z-index:21;
+  max-height:50vh;display:flex;flex-direction:column;
+  padding:40px 26px calc(22px + env(safe-area-inset-bottom));
+  background:linear-gradient(to top,rgba(5,2,12,.92) 34%,rgba(5,2,12,.5) 66%,rgba(5,2,12,0));
+  border:none;box-shadow:none;
+  opacity:0;transform:translateY(22px);pointer-events:none;
+  transition:opacity .55s ease,transform .55s ease}
+#card.show{opacity:1;transform:translateY(0);pointer-events:auto}
+.c-head{display:flex;align-items:center;gap:12px;margin-bottom:6px}
+.c-star{width:30px;height:30px;flex-shrink:0}
+.c-title{flex:1}
+.c-title .t{font-family:"Noto Serif SC",serif;font-size:17px;color:#FCF0FA;line-height:1.3;font-weight:500}
+.c-title .en{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:12.5px;
+  color:rgba(230,205,242,.7);letter-spacing:.1em;margin-top:1px}
+.c-close{border:none;background:transparent;color:rgba(230,205,242,.55);font-size:20px;cursor:pointer;padding:2px 4px;align-self:flex-start}
+.c-meta{display:flex;align-items:center;gap:10px;margin:10px 0 12px}
+.c-date{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:13px;color:rgba(232,208,244,.75)}
+.c-tag{font-family:"Noto Serif SC",serif;font-size:11px;color:#F5D9EE;background:rgba(210,140,200,.2);
+  padding:3px 11px;border-radius:99px;border:1px solid rgba(230,170,220,.25)}
+.c-body{font-family:"Noto Serif SC",serif;font-weight:300;overflow-y:auto;font-size:14px;line-height:2.05;
+  color:rgba(244,234,248,.9);white-space:pre-wrap;overscroll-behavior:contain;letter-spacing:.02em;flex:1}
+.c-body::-webkit-scrollbar{width:3px}
+.c-body::-webkit-scrollbar-thumb{background:rgba(230,180,230,.25);border-radius:3px}
+.c-fact{position:relative;padding:8px 0 8px 20px;border-bottom:1px solid rgba(230,180,230,.08)}
+.c-fact::before{content:"✦";position:absolute;left:0;top:10px;font-size:10px;color:#E89AD8;opacity:.8}
+.c-acts{display:flex;gap:14px;margin-top:18px;flex-shrink:0}
+.c-acts button{width:38px;height:38px;border:none;cursor:pointer;border-radius:50%;
+  background:transparent;
+  display:flex;align-items:center;justify-content:center;color:rgba(235,198,232,.5);transition:all .2s ease}
+.c-acts button:active{transform:scale(.9);color:#f0b8e4}
+.c-acts svg{width:20px;height:20px}
+
+.loading{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;
+  font-family:"Cormorant Garamond",serif;font-style:italic;color:rgba(225,205,240,.5);
+  font-size:16px;letter-spacing:.12em;z-index:31}
+
+/* ==== v4 ==== */
+#searchbar{margin:14px auto 0;width:min(76vw,430px);opacity:0;transition:opacity 1s ease 1.1s;pointer-events:none;position:relative;z-index:2}
+#searchbar.in{opacity:1;pointer-events:auto}
+#sinput{width:100%;background:rgba(18,8,28,.34);border:1px solid rgba(230,180,230,.18);border-radius:999px;padding:10px 20px;color:#F3EAF5;font-family:"Noto Serif SC",serif;font-size:13px;letter-spacing:.06em;outline:none;backdrop-filter:blur(8px)}
+#sinput::placeholder{color:rgba(230,200,240,.32);letter-spacing:.1em}
+#sres{position:absolute;top:calc(100% + 8px);left:50%;transform:translateX(-50%);z-index:28;width:min(80vw,440px);max-height:36vh;overflow-y:auto;display:none;background:rgba(14,6,24,.42);border:1px solid rgba(230,180,230,.14);border-radius:16px;backdrop-filter:blur(14px);padding:6px;pointer-events:auto}
+#sres.show{display:block}
+.sres-i{display:flex;gap:10px;align-items:flex-start;padding:8px 10px;border-radius:10px;cursor:pointer;transition:background .2s}
+.sres-i:hover{background:rgba(230,160,220,.12)}
+.smark{flex:none;font-size:13px;line-height:1.3;margin-top:4px;opacity:.72}
+.sres-i .tx{flex:1;min-width:0}
+.sres-i .t{font-size:12.5px;color:rgba(246,236,250,.88);line-height:1.55;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.sres-i .d{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:10.5px;color:rgba(230,205,242,.5);margin-top:1px;letter-spacing:.1em}
+#sidx{position:fixed;right:12px;bottom:calc(env(safe-area-inset-bottom) + 86px);z-index:26;display:flex;flex-direction:column;gap:7px;align-items:flex-end;opacity:0;transition:opacity .5s ease;pointer-events:none}
+#sidx.in{opacity:1;pointer-events:auto}
+.schip{cursor:pointer;font-family:"Noto Serif SC",serif;font-size:10.5px;letter-spacing:.12em;color:rgba(245,225,245,.78);background:rgba(20,10,34,.5);border:1px solid rgba(230,180,230,.2);border-radius:999px;padding:4px 12px;backdrop-filter:blur(6px);transition:all .25s ease;white-space:nowrap}
+.schip:hover{border-color:rgba(255,200,240,.5);color:#FBEFFA}
+.schip.on{background:rgba(220,150,215,.28);border-color:rgba(255,190,240,.6);color:#fff;box-shadow:0 0 14px rgba(230,150,220,.4)}
+#taxis{position:fixed;left:10px;top:50%;transform:translateY(-50%);z-index:24;display:flex;flex-direction:column;align-items:center;gap:9px;opacity:0;transition:opacity .5s ease;pointer-events:none}
+#taxis.in{opacity:1;pointer-events:auto}
+#trange{-webkit-appearance:none;appearance:none;width:3px;height:34vh;writing-mode:vertical-lr;direction:rtl;background:linear-gradient(180deg,rgba(230,170,225,.14),rgba(230,170,225,.5));border-radius:2px;outline:none;cursor:pointer}
+#trange::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;border-radius:50%;background:radial-gradient(circle at 35% 30%,#ffe6fa,#d69ad8);border:1px solid rgba(255,220,250,.6);box-shadow:0 0 10px rgba(230,150,220,.6)}
+#tlabel{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:10.5px;color:rgba(232,208,244,.72);letter-spacing:.08em;writing-mode:vertical-rl;text-orientation:mixed;max-height:60px;overflow:hidden}
+.uihide{opacity:0!important;pointer-events:none!important}
+.c-tgl{margin-top:14px;color:rgba(230,200,240,.5);font-size:11px;letter-spacing:.16em;cursor:pointer;text-align:center;border:none;background:transparent;display:block;width:100%;padding:4px}
+.c-tgl:hover{color:#F5D9EE}
+.cbatch{margin-top:2px;display:none;max-height:26vh;overflow-y:auto;padding-right:4px;overscroll-behavior:contain}
+.cbatch::-webkit-scrollbar{width:3px}
+.cbatch::-webkit-scrollbar-thumb{background:rgba(230,180,230,.25);border-radius:3px}
+.cbatch.show{display:block}
+.cbatch .bh{font-family:"Cormorant Garamond",serif;font-style:italic;font-size:11.5px;color:rgba(232,208,244,.6);letter-spacing:.14em;margin-bottom:6px}
+.l0line{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;line-height:1.85;color:rgba(240,228,246,.82);margin:5px 0;letter-spacing:.02em}
+.l0line .who{flex:none;font-family:"Cormorant Garamond",serif;font-style:italic;font-size:11.5px;padding-top:2px;width:34px;text-align:center;border-radius:999px;padding:0 6px;background:rgba(234,170,220,.14);color:rgba(240,200,232,.85)}
+.l0line.user .who{background:rgba(140,170,240,.14);color:rgba(190,210,250,.9)}
+.l0line .txt{flex:1;white-space:pre-wrap}
+#cbodyEdit{width:100%;min-height:120px;max-height:38vh;background:rgba(10,4,20,.6);border:1px solid rgba(230,180,230,.25);border-radius:12px;color:#F3EAF5;font-family:"Noto Serif SC",serif;font-size:13px;line-height:1.9;padding:12px 14px;outline:none;resize:vertical;letter-spacing:.02em;backdrop-filter:blur(8px)}
+#cbodyEdit:focus{border-color:rgba(240,180,235,.5)}
+.cedit-acts{display:flex;gap:10px;justify-content:flex-end;margin-top:10px}
+.cedit-b{padding:6px 16px;border-radius:999px;border:1px solid rgba(230,180,230,.3);background:rgba(210,140,200,.15);color:#F5D9EE;font-size:11.5px;letter-spacing:.1em;cursor:pointer}
+.cedit-b:hover{background:rgba(210,140,200,.3)}
+.cedit-b.pri{background:rgba(220,150,215,.35);border-color:rgba(255,190,240,.5)}
+.hint{display:none!important}
+</style>
+<script type="importmap">
+{"imports":{
+  "three":"./vendor/build/three.module.js",
+  "three/addons/":"./vendor/addons/"
+}}
+</script>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<div id="veil"></div>
+<div id="labels"></div>
+
+<div class="head" id="head">
+  <h1 id="hTitle"></h1>
+  <div class="sub" id="hSub"></div>
+  <div class="zh" id="hZh"></div>
+<div id="searchbar"><input id="sinput" placeholder="寻星 · 键入关键词…" /></div>
+<div id="sres"></div>
+<div id="sidx"></div>
+<div id="taxis"><div id="tlabel">全部</div><input type="range" id="trange" /></div>
+
+</div>
+<div class="loading" id="loading">entering the galaxy…</div>
+<div class="hint" id="hint">drag to orbit · pinch to fly · tap a star</div>
+
+<div id="scrim" onclick="closeCard()"></div>
+<div id="card">
+  <div class="c-head">
+    <svg class="c-star" id="cStar" viewBox="0 0 32 32"></svg>
+    <div class="c-title"><div class="t" id="cTitle"></div><div class="en" id="cEn"></div></div>
+    <button class="c-close" onclick="closeCard()">✕</button>
+  </div>
+  <div class="c-meta"><span class="c-date" id="cDate"></span><span class="c-tag" id="cTag"></span></div>
+  <div class="c-body" id="cBody"></div>
+  <button type="button" id="cbatchToggle" class="c-tgl" onclick="window.toggleBatch()">✦ 展开这段对话的原文</button>
+  <div id="cbatch" class="cbatch"></div>
+  <div class="c-acts">
+    <button id="cLike" onclick="cardLike()" title="心动"><svg viewBox="0 0 24 24" fill="none"><path d="M12 20.5S3.5 15 3.5 9.2C3.5 6.3 5.7 4.5 8 4.5c1.7 0 3.1 1 4 2.4.9-1.4 2.3-2.4 4-2.4 2.3 0 4.5 1.8 4.5 4.7 0 5.8-8.5 11.3-8.5 11.3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg></button>
+    <button onclick="closeCard()" title="收起"><svg viewBox="0 0 24 24" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     ② 内嵌示例数据 —— dataUrl 加载失败时用它（双击打开即可预览）
+     换成你自己的记忆：照这个格式改，或让你的 AI 帮你生成 memory.json
+     每条星星字段：name 标题 / domain 类别 / importance 重要度1-10 /
+     pinned 是否置顶 / created 日期 / content 正文
+     ═══════════════════════════════════════════════════════════ -->
+<script id="memory-data" type="application/json">{"stars":[],"batches":{}}</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
+
+// 文案从 CONFIG 注入
+document.title=CONFIG.title+' · 记忆银河';
+document.getElementById('hTitle').textContent=CONFIG.title;
+document.getElementById('hSub').textContent=CONFIG.subtitle;
+document.getElementById('hZh').textContent=CONFIG.motto;
+
+// ── 颜色语言（粉=温柔·金=珍贵·蓝紫=思考）——类别→颜色，想加类别就照抄一行 ──
+const PAL={
+  '恋爱':'#ff7ec4','关系核心':'#ff8fd0','婚恋':'#ff9ad0','我们的故事':'#e888d8',
+  '编程':'#8f9fff','AI':'#a98cff','网络':'#8fa8ff','心理':'#9a8cf0','自省':'#a89ce8','情绪':'#b48ce8',
+  '家庭':'#ffcf8a','宠物':'#ffbe7a','居家':'#ffd6a3','回忆':'#f0c88a','工作':'#ffe39a','求职':'#ffdb88',
+  '学习':'#ecd8a0','创作':'#dca0ec','写作':'#cca8f0','游戏':'#f09ce8','社交':'#9cc4ff','人际':'#aac0f0',
+  '日常':'#cfd8f0','出行':'#a0c8dc','健康':'#c8e0bc','饮食':'#ffcf9a',
+};
+const FALL=['#ff9ed4','#b98cff','#8f9fff','#ffc98a','#c8a0f0','#e89ce8','#ffb0d8'];
+function domCol(d){ if(PAL[d])return PAL[d]; let h=0;for(const c of (d||''))h=(h*31+c.charCodeAt(0))>>>0; return FALL[h%FALL.length]; }
+
+const canvas=document.getElementById('gl');
+const renderer=new THREE.WebGLRenderer({canvas,antialias:true,alpha:false});
+renderer.setPixelRatio(Math.min(devicePixelRatio,2));
+renderer.setSize(innerWidth,innerHeight);
+renderer.toneMapping=THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure=1.05;
+
+const scene=new THREE.Scene();
+scene.background=new THREE.Color('#050209');
+const camera=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,0.1,100);
+camera.position.set(0,3.1,6.3);
+
+const controls=new OrbitControls(camera,canvas);
+controls.enableDamping=true;controls.dampingFactor=.05;
+controls.enablePan=false;controls.autoRotate=true;controls.autoRotateSpeed=.32;
+controls.minDistance=2.2;controls.maxDistance=14;controls.target.set(0,0,0);
+controls.maxPolarAngle=Math.PI*0.86;
+
+// ── 粒子柔光 shader（呼吸 + 景深近大远小）──
+const P_VERT=`
+attribute float aSize; attribute float aPhase; attribute vec3 aColor;
+uniform float uTime; uniform float uPix; varying vec3 vColor; varying float vTw;
+void main(){
+  vColor=aColor;
+  float br=0.9+0.1*sin(uTime*0.28+aPhase);   // 很慢的呼吸，不是闪烁
+  vTw=br;
+  vec4 mv=modelViewMatrix*vec4(position,1.0);
+  gl_PointSize=aSize*uPix*br*(1.0/-mv.z);
+  gl_Position=projectionMatrix*mv;
+}`;
+const P_FRAG=`
+varying vec3 vColor; varying float vTw;
+void main(){
+  float d=length(gl_PointCoord-0.5);
+  float a=smoothstep(0.5,0.0,d);
+  a=pow(a,1.6)*vTw;
+  if(a<0.01) discard;
+  gl_FragColor=vec4(vColor,a);
+}`;
+function particleMat(sizeScale){
+  return new THREE.ShaderMaterial({
+    uniforms:{uTime:{value:0},uPix:{value:renderer.getPixelRatio()*sizeScale}},
+    vertexShader:P_VERT,fragmentShader:P_FRAG,
+    transparent:true,depthWrite:false,blending:THREE.AdditiveBlending});
+}
+
+function C(hex){const c=new THREE.Color(hex);return[c.r,c.g,c.b];}
+const rand=(a,b)=>a+Math.random()*(b-a);
+const pw=(p)=>Math.pow(Math.random(),p);
+
+// ── 银河盘（核心重心 + 弥漫双臂，被星尘糊化）──
+const GAL_R=5, BRANCHES=2, SPIN=1.15;
+function buildGalaxy(){
+  const N=14000, pos=new Float32Array(N*3), col=new Float32Array(N*3), sz=new Float32Array(N), ph=new Float32Array(N);
+  const cIn=C('#ffdcf2'), cMid=C('#c891ff'), cOut=C('#8fb0ff'), gold=C('#ffcf9a');
+  for(let i=0;i<N;i++){
+    const r=pw(1.7)*GAL_R;                             // 分布更均匀→盘更满，中段也密
+    const branch=(i%BRANCHES)/BRANCHES*Math.PI*2;
+    const spin=r*SPIN;
+    const scat=0.55;                                    // 更大散射→臂糊掉，不再两条明显链
+    const sx=pw(2.6)*(Math.random()<.5?1:-1)*scat*(r+0.4);
+    const sz2=pw(2.6)*(Math.random()<.5?1:-1)*scat*(r+0.4);
+    const sy=pw(3.0)*(Math.random()<.5?1:-1)*scat*0.34*(r+0.3);  // 盘薄
+    pos[i*3]=Math.cos(branch+spin)*r+sx;
+    pos[i*3+1]=sy;
+    pos[i*3+2]=Math.sin(branch+spin)*r+sz2;
+    const tN=r/GAL_R;
+    let cr,cg,cb;
+    if(tN<0.5){const k=tN/0.5;cr=cIn[0]+(cMid[0]-cIn[0])*k;cg=cIn[1]+(cMid[1]-cIn[1])*k;cb=cIn[2]+(cMid[2]-cIn[2])*k;}
+    else{const k=(tN-0.5)/0.5;cr=cMid[0]+(cOut[0]-cMid[0])*k;cg=cMid[1]+(cOut[1]-cMid[1])*k;cb=cMid[2]+(cOut[2]-cMid[2])*k;}
+    if(Math.random()<0.06){cr=gold[0];cg=gold[1];cb=gold[2];}   // 稀疏金
+    col[i*3]=cr;col[i*3+1]=cg;col[i*3+2]=cb;
+    sz[i]=rand(1.4,5.0)*(tN<0.3?1.15:1);            // 中心不再过度放大，压掉白团
+    ph[i]=Math.random()*6.28;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('aColor',new THREE.BufferAttribute(col,3));
+  g.setAttribute('aSize',new THREE.BufferAttribute(sz,1));
+  g.setAttribute('aPhase',new THREE.BufferAttribute(ph,1));
+  return new THREE.Points(g,particleMat(1.05));
+}
+
+// ── 弥漫星尘（铺满空间，增强景深）──
+function buildDust(){
+  const N=6400, pos=new Float32Array(N*3), col=new Float32Array(N*3), sz=new Float32Array(N), ph=new Float32Array(N);
+  const cols=[C('#e8b8ff'),C('#9fb8ff'),C('#ffd0ec'),C('#c8a0f0'),C('#ffe0b0')];
+  for(let i=0;i<N;i++){
+    const r=pw(1.1)*GAL_R*1.7+0.5;
+    const th=Math.random()*Math.PI*2, y=(Math.random()-0.5)*GAL_R*1.1;
+    pos[i*3]=Math.cos(th)*r; pos[i*3+1]=y; pos[i*3+2]=Math.sin(th)*r;
+    const c=cols[Math.floor(Math.random()*cols.length)];
+    col[i*3]=c[0];col[i*3+1]=c[1];col[i*3+2]=c[2];
+    sz[i]=rand(0.5,1.8); ph[i]=Math.random()*6.28;
+  }
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('aColor',new THREE.BufferAttribute(col,3));
+  g.setAttribute('aSize',new THREE.BufferAttribute(sz,1));
+  g.setAttribute('aPhase',new THREE.BufferAttribute(ph,1));
+  const m=particleMat(1);m.uniforms.uPix.value*=0.9;
+  return new THREE.Points(g,m);
+}
+
+// ── 记忆星（数据驱动·时间当半径·可点击）──
+let mem=[], core=null, labeled=[], memPoints=null, memPos=[], origColor=null, origSize=null;
+function buildMemories(stars){
+  const ts=stars.filter(s=>s.created).map(s=>+new Date(s.created));
+  const t0=Math.min(...ts),t1=Math.max(...ts),span=Math.max(1,t1-t0);
+  const sorted=stars.slice().sort((a,b)=>(a.created||'').localeCompare(b.created||''));
+  mem=sorted.map((s,i)=>{
+    const tt=s.created?(+new Date(s.created)-t0)/span:Math.random();
+    const r=0.15+Math.pow(tt,0.85)*GAL_R*0.96;
+    const branch=(i%BRANCHES)/BRANCHES*Math.PI*2, spin=r*SPIN;
+    const jx=rand(-0.35,0.35),jz=rand(-0.35,0.35),jy=rand(-0.16,0.16);
+    const x=Math.cos(branch+spin)*r+jx, z=Math.sin(branch+spin)*r+jz, y=jy;
+    return {s,x,y,z,imp:s.importance||4,bright:(s.importance||0)>=7||s.pinned,color:domCol(s.domain)};
+  });
+  core=mem[0]; core.x=0;core.y=0;core.z=0;core.isCore=true;core.bright=true;
+  const N=mem.length, pos=new Float32Array(N*3),col=new Float32Array(N*3),sz=new Float32Array(N),ph=new Float32Array(N);
+  memPos=[];
+  mem.forEach((m,i)=>{
+    pos[i*3]=m.x;pos[i*3+1]=m.y;pos[i*3+2]=m.z;
+    // 四档：普通 / 重要(≥7) / 珍贵(钉选·≥9) / 核心 —— 大小与亮度都拉开
+    const impN=Math.min(m.imp,10);
+    const tier=m.isCore?3:((m.s.pinned||impN>=9)?2:(impN>=7?1:0));
+    m.tier=tier;
+    sz[i]=[5,9,12,13][tier];                        // 纯点，四档大小（核心不再巨大）
+    const dim=[0.62,0.85,1.0,1.15][tier];           // 亮度区分，但不夸张
+    const c=C(m.color); col[i*3]=c[0]*dim;col[i*3+1]=c[1]*dim;col[i*3+2]=c[2]*dim;
+    ph[i]=Math.random()*6.28;
+    memPos.push(new THREE.Vector3(m.x,m.y,m.z));
+  });
+  const g=new THREE.BufferGeometry();
+  g.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  g.setAttribute('aColor',new THREE.BufferAttribute(col,3));
+  g.setAttribute('aSize',new THREE.BufferAttribute(sz,1));
+  g.setAttribute('aPhase',new THREE.BufferAttribute(ph,1));
+  memPoints=new THREE.Points(g,particleMat(1.4));
+  scene.add(memPoints);
+  origColor=Float32Array.from(col); origSize=Float32Array.from(sz);   // 原始亮度/大小，供高亮后复原
+  // 标签默认全隐藏——保持星空干净，点星才在卡片里看内容
+  labeled=[]; labelsEl.innerHTML='';
+}
+
+// ── 中心紫色柔光晕（低亮度）──
+let coreGlow=null;
+function buildCoreGlow(){
+  const s=128,cv=document.createElement('canvas');cv.width=cv.height=s;
+  const g=cv.getContext('2d'),grd=g.createRadialGradient(s/2,s/2,0,s/2,s/2,s/2);
+  grd.addColorStop(0,'rgba(255,226,246,.5)');grd.addColorStop(.28,'rgba(234,178,242,.2)');
+  grd.addColorStop(.62,'rgba(186,142,236,.06)');grd.addColorStop(1,'rgba(162,126,226,0)');
+  g.fillStyle=grd;g.fillRect(0,0,s,s);
+  const mat=new THREE.SpriteMaterial({map:new THREE.CanvasTexture(cv),blending:THREE.AdditiveBlending,depthWrite:false,transparent:true,opacity:.4});
+  coreGlow=new THREE.Sprite(mat);coreGlow.scale.set(1.8,1.8,1);scene.add(coreGlow);
+}
+
+// ── 轨道环（若隐若现淡金）──
+function buildOrbits(){
+  for(const r of [1.3,2.4,3.6,4.7]){
+    const g=new THREE.RingGeometry(r-0.006,r+0.006,128);
+    const m=new THREE.MeshBasicMaterial({color:'#ffd9a0',transparent:true,opacity:0.05,
+      side:THREE.DoubleSide,blending:THREE.AdditiveBlending,depthWrite:false});
+    const ring=new THREE.Mesh(g,m);ring.rotation.x=-Math.PI/2;scene.add(ring);
+  }
+}
+
+// ── 标签 ──
+const labelsEl=document.getElementById('labels');
+const _v=new THREE.Vector3();
+function updateLabels(){
+  for(const m of labeled){
+    if(!m.el)continue;
+    _v.set(m.x,m.y,m.z).project(camera);
+    const behind=_v.z>1;
+    const x=(_v.x*0.5+0.5)*innerWidth, y=(-_v.y*0.5+0.5)*innerHeight;
+    const vis=!behind&&x>10&&x<innerWidth-10&&y>70&&y<innerHeight-40;
+    m.el.style.opacity=vis?(m.isCore?1:0.9):0;
+    m.el.style.left=x+'px';m.el.style.top=y+'px';
+  }
+}
+
+// ── 后处理 Bloom ──
+const composer=new EffectComposer(renderer);
+composer.addPass(new RenderPass(scene,camera));
+const bloom=new UnrealBloomPass(new THREE.Vector2(innerWidth,innerHeight),0.6,0.62,0.12);
+composer.addPass(bloom);
+composer.addPass(new OutputPass());
+
+let galaxy=null,dustPts=null;
+// ── 交互：点击星 → 飞近 + 卡片 ──
+const ray=new THREE.Raycaster();ray.params.Points.threshold=0.14;
+const ndc=new THREE.Vector2();
+let downXY=null;
+canvas.addEventListener('pointerdown',e=>{downXY=[e.clientX,e.clientY];});
+canvas.addEventListener('pointerup',e=>{
+  if(!downXY)return;
+  const moved=Math.abs(e.clientX-downXY[0])+Math.abs(e.clientY-downXY[1]);
+  downXY=null; if(moved>8||!memPoints)return;
+  ndc.x=(e.clientX/innerWidth)*2-1; ndc.y=-(e.clientY/innerHeight)*2+1;
+  ray.setFromCamera(ndc,camera);
+  const hit=ray.intersectObject(memPoints);
+  if(hit.length){ const i=hit[0].index; highlight(i); openCard(mem[i].s);
+    document.getElementById('hint').style.opacity=0; }
+});
+
+// ── 流星 ──
+const meteors=[]; let meteorTimer=2.5;
+function spawnMeteor(){
+  const R=GAL_R*1.5, TRAIL=14;
+  const start=new THREE.Vector3((Math.random()-0.5)*R*2, rand(1.5,4.5), (Math.random()-0.5)*R*2);
+  const vel=new THREE.Vector3(rand(-1,1),-rand(.3,.7),rand(-1,1)).normalize().multiplyScalar(rand(5,8));
+  const geo=new THREE.BufferGeometry(),pos=new Float32Array(TRAIL*3),col=new Float32Array(TRAIL*3);
+  const tint=[[1,.92,1],[1,.85,.95],[.9,.92,1]][Math.floor(Math.random()*3)];
+  for(let i=0;i<TRAIL;i++){const a=Math.pow(1-i/TRAIL,1.5);col[i*3]=tint[0]*a;col[i*3+1]=tint[1]*a;col[i*3+2]=tint[2]*a;}
+  geo.setAttribute('position',new THREE.BufferAttribute(pos,3));
+  geo.setAttribute('color',new THREE.BufferAttribute(col,3));
+  const line=new THREE.Line(geo,new THREE.LineBasicMaterial({vertexColors:true,transparent:true,blending:THREE.AdditiveBlending,depthWrite:false}));
+  scene.add(line);
+  meteors.push({line,vel,life:0,ttl:rand(1.1,1.8),trail:Array.from({length:TRAIL},()=>start.clone())});
+}
+function updateMeteors(dt){
+  for(let i=meteors.length-1;i>=0;i--){
+    const m=meteors[i]; m.life+=dt;
+    const head=m.trail[0].clone().addScaledVector(m.vel,dt);
+    m.trail.unshift(head); m.trail.pop();
+    const arr=m.line.geometry.attributes.position.array;
+    m.trail.forEach((p,j)=>{arr[j*3]=p.x;arr[j*3+1]=p.y;arr[j*3+2]=p.z;});
+    m.line.geometry.attributes.position.needsUpdate=true;
+    m.line.material.opacity=Math.min(1,m.life*3)*Math.max(0,1-m.life/m.ttl);
+    if(m.life>=m.ttl){scene.remove(m.line);m.line.geometry.dispose();m.line.material.dispose();meteors.splice(i,1);}
+  }
+}
+
+// ── 点击 → 关联记忆自身变亮变大 + 星座连线（不叠大光斑）──
+const NOISE_DOM=new Set(['','其他','未分类','feel','plan']);
+let hlLines=null, hlActive=[];
+function clearHighlight(){
+  if(hlLines){scene.remove(hlLines);hlLines.geometry.dispose();hlLines.material.dispose();hlLines=null;}
+  if(hlActive.length&&memPoints){
+    const cA=memPoints.geometry.attributes.aColor, sA=memPoints.geometry.attributes.aSize;
+    hlActive.forEach(i=>{cA.array[i*3]=origColor[i*3];cA.array[i*3+1]=origColor[i*3+1];cA.array[i*3+2]=origColor[i*3+2];sA.array[i]=origSize[i];});
+    cA.needsUpdate=true;sA.needsUpdate=true;
+  }
+  hlActive=[];
+}
+function highlight(index){
+  clearHighlight();
+  const A=mem[index];
+  const rel=mem.map((m,i)=>({m,i})).filter(o=>o.i!==index && o.m.s.domain===A.s.domain && !NOISE_DOM.has(A.s.domain))
+    .sort((a,b)=>b.m.imp-a.m.imp).slice(0,8);
+  const idxs=[index,...rel.map(o=>o.i)];
+  const cA=memPoints.geometry.attributes.aColor, sA=memPoints.geometry.attributes.aSize;
+  idxs.forEach((i,k)=>{
+    cA.array[i*3]=Math.min(2.2,origColor[i*3]*2.6);        // 提亮（HDR，Bloom 会让它发光）
+    cA.array[i*3+1]=Math.min(2.2,origColor[i*3+1]*2.6);
+    cA.array[i*3+2]=Math.min(2.2,origColor[i*3+2]*2.6);
+    sA.array[i]=origSize[i]*(k===0?2.4:1.9)+4;             // 变大，点中的更大
+  });
+  cA.needsUpdate=true;sA.needsUpdate=true; hlActive=idxs;
+  const lp=[]; rel.forEach(o=>lp.push(A.x,A.y,A.z,o.m.x,o.m.y,o.m.z));
+  if(lp.length){
+    const g=new THREE.BufferGeometry();g.setAttribute('position',new THREE.Float32BufferAttribute(lp,3));
+    hlLines=new THREE.LineSegments(g,new THREE.LineBasicMaterial({color:new THREE.Color(A.color),
+      transparent:true,opacity:.4,blending:THREE.AdditiveBlending,depthWrite:false}));
+    scene.add(hlLines);
+  }
+}
+
+// ── 卡片 ──
+function esc(t){return(t||'').replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]))}
+function excerpt(c){const p=parse(c);if(p.facts&&p.facts.length)return p.facts[0];return(p.plain||'').replace(/\s+/g,' ');}
+function parse(c){if(typeof c!=='string')return{plain:''};const s=c.trim();
+  if(s.startsWith('{')){try{const o=JSON.parse(s);return{facts:o.core_facts||o.facts||null,plain:(!o.core_facts&&!o.facts)?s:null};}catch{return{plain:c}}}
+  return{plain:c};}
+window.openCard=s=>{
+  document.getElementById('cTitle').textContent=(s.name&&s.name.trim())?s.name:excerpt(s.content).slice(0,16);
+  document.getElementById('cEn').textContent=s.isCoreCard?CONFIG.coreEn:'';
+  document.getElementById('cDate').textContent=(s.created||'').slice(0,10).replace(/-/g,'.');
+  document.getElementById('cTag').textContent=s.pinned?'置顶记忆':(s.importance>=8?'重要记忆':(s.domain||'记忆'));
+  document.getElementById('cStar').innerHTML=`<path d="M16 2l2.4 11.6L30 16l-11.6 2.4L16 30l-2.4-11.6L2 16l11.6-2.4z" fill="${domCol(s.domain)}" opacity=".9"/>`;
+  const p=parse(s.content);
+  document.getElementById('cBody').innerHTML=(p.facts&&p.facts.length)?p.facts.map(f=>`<div class="c-fact">${esc(f)}</div>`).join(''):`<div>${esc(p.plain||'（这颗记忆还没有正文）')}</div>`;
+  document.getElementById('cBody').scrollTop=0;
+  document.getElementById('cLike').style.color=s.pinned?'#ff9ecf':'#EBC6E8';
+  document.getElementById('scrim').classList.add('show');document.getElementById('card').classList.add('show');
+};
+window.closeCard=()=>{document.getElementById('scrim').classList.remove('show');document.getElementById('card').classList.remove('show');clearHighlight();};
+window.cardLike=()=>{const b=document.getElementById('cLike');b.style.color=(b.style.color==='rgb(255, 158, 207)')?'#EBC6E8':'#ff9ecf';};
+
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);composer.setSize(innerWidth,innerHeight);
+});
+
+// ── 主循环 ──
+const clock=new THREE.Clock();
+let openT=0;
+function animate(){
+  requestAnimationFrame(animate);
+  const dt=clock.getDelta(), et=clock.elapsedTime;
+  if(galaxy)galaxy.material.uniforms.uTime.value=et;
+  if(dustPts)dustPts.material.uniforms.uTime.value=et;
+  if(memPoints)memPoints.material.uniforms.uTime.value=et;
+  if(coreGlow){const p=1+0.1*Math.sin(et*0.85);coreGlow.scale.setScalar(1.8*p);coreGlow.material.opacity=0.36+0.08*Math.sin(et*0.85);}
+  // 流星
+  meteorTimer-=dt; if(meteorTimer<=0){spawnMeteor();meteorTimer=rand(2.4,6.5);}
+  updateMeteors(dt);
+  // 开场推进
+  if(openT<1){openT=Math.min(1,openT+dt*0.42);const e=1-Math.pow(1-openT,3);
+    camera.position.z=8.4-(8.4-6.3)*e;}
+  controls.update();
+  if (flyAnim) flyAnim(performance.now());
+  updateLabels();
+  composer.render();
+}
+
+// ── 加载：先试 CONFIG.dataUrl，失败自动退回内嵌示例数据 ──
+function boot(d){
+  galaxy=buildGalaxy();scene.add(galaxy);
+  dustPts=buildDust();scene.add(dustPts);
+  buildOrbits();buildCoreGlow();buildMemories(d.stars||[]);
+  document.getElementById('loading').style.display='none';
+  document.getElementById('veil').classList.add('gone');
+  document.getElementById('head').classList.add('in');
+  animate();
+}
+
+// ===== v4：批次展开 / 搜索+飞行+回退 / 时间轴 / 编辑 / 索引 / 隐藏UI =====
+var __VIZDATA = null;
+try { __VIZDATA = JSON.parse(document.getElementById('memory-data').textContent); } catch (e) { __VIZDATA = { stars: [], batches: {} }; }
+var BATCHES = {};
+function setVizData(d) { if (d && d.batches) BATCHES = d.batches; }
+
+function escHTML(t) {
+  return String(t || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+function renderBatch(s) {
+  var box = document.getElementById('cbatch');
+  var tgl = document.getElementById('cbatchToggle');
+  if (!tgl || !box) return;
+  if (!s.batch || !BATCHES[s.batch] || !BATCHES[s.batch].length) {
+    tgl.style.display = 'none';
+    box.classList.remove('show');
+    return;
+  }
+  tgl.style.display = 'block';
+  var out = '<div class="bh">✦ 这段星光降落的轨迹 · 批次 ' + s.batch + '</div>';
+  for (var i = 0; i < BATCHES[s.batch].length; i++) {
+    var m = BATCHES[s.batch][i];
+    var who = (m.role === 'user') ? '她' : '我';
+    var cls = m.role === 'user' ? 'user' : '';
+    out += '<div class="l0line ' + cls + '"><span class="who">' + who + '</span><span class="txt">' + escHTML(m.content) + '</span></div>';
+  }
+  box.innerHTML = out;
+}
+function toggleBatch() {
+  var box = document.getElementById('cbatch');
+  if (box) { box.classList.toggle('show'); }
+}
+window.toggleBatch = toggleBatch;
+
+function buildIndex() {
+  var el = document.getElementById('sidx');
+  if (!el) return;
+  var domains = {};
+  mem.forEach(function(m) { domains[m.s.domain] = (domains[m.s.domain] || 0) + 1; });
+  var keys = Object.keys(domains).sort(function(a, b) { return domains[b] - domains[a]; });
+  el.innerHTML = keys.map(function(d) {
+    return '<div class="schip" data-d="' + d + '">✦ ' + d + ' · ' + domains[d] + '</div>';
+  }).join('');
+  Array.prototype.forEach.call(el.children, function(ch) {
+    ch.addEventListener('click', function() { focusDomain(ch.getAttribute('data-d')); });
+  });
+}
+
+var dlActive = [];
+function clearDomain() {
+  if (!memPoints) return;
+  var cA = memPoints.geometry.attributes.aColor, sA = memPoints.geometry.attributes.aSize;
+  dlActive.forEach(function(i) { cA.array[i*3]=origColor[i*3];cA.array[i*3+1]=origColor[i*3+1];cA.array[i*3+2]=origColor[i*3+2];sA.array[i]=origSize[i]; });
+  cA.needsUpdate = true; sA.needsUpdate = true; dlActive = [];
+}
+function boostArr(arr, base, i) {
+  arr[i*3] = Math.min(2.4, Math.max(base[i*3] * 2.6, 1.0));
+  arr[i*3+1] = Math.min(2.4, Math.max(base[i*3+1] * 2.6, 1.0));
+  arr[i*3+2] = Math.min(2.4, Math.max(base[i*3+2] * 2.6, 1.0));
+}
+function focusDomain(d) {
+  closeCard();
+  clearHighlight(); clearDomain();
+  Array.prototype.forEach.call(document.querySelectorAll('.schip'), function(ch) {
+    ch.classList.toggle('on', ch.getAttribute('data-d') === d);
+  });
+  var hits = [];
+  mem.forEach(function(m, i) { if (m.s.domain === d) hits.push(i); });
+  if (!hits.length || !memPoints) return;
+  var cA = memPoints.geometry.attributes.aColor, sA = memPoints.geometry.attributes.aSize;
+  hits.forEach(function(i) {
+    boostArr(cA.array, origColor, i);
+    sA.array[i] = origSize[i] * 1.8 + 3;
+  });
+  cA.needsUpdate = true; sA.needsUpdate = true; dlActive = hits;
+}
+
+// ---- 时间轴（左侧竖排） ----
+var tMin = 0, tMax = 0;
+function buildTaxis() {
+  var ts = mem.map(function(m) { return +new Date(m.s.created); });
+  tMin = Math.min.apply(null, ts); tMax = Math.max.apply(null, ts);
+  var r = document.getElementById('trange');
+  if (!r || tMin === tMax) return;
+  r.min = tMin; r.max = tMax; r.value = tMax;
+  setTlabel(r.value);
+  r.addEventListener('input', function() {
+    setTlabel(r.value);
+    timeClip(+r.value);
+  });
+}
+function setTlabel(v) {
+  var d = new Date(+v);
+  document.getElementById('tlabel').textContent = (d.getFullYear()) + '.' + ('0' + (d.getMonth() + 1)).slice(-2) + '.' + ('0' + d.getDate()).slice(-2);
+}
+function timeClip(t) {
+  if (!memPoints) return;
+  var cA = memPoints.geometry.attributes.aColor, sA = memPoints.geometry.attributes.aSize;
+  mem.forEach(function(m, i) {
+    var created = +new Date(m.s.created);
+    if (created > t) {
+      cA.array[i*3]=origColor[i*3]*0.12; cA.array[i*3+1]=origColor[i*3+1]*0.12; cA.array[i*3+2]=origColor[i*3+2]*0.12;
+      sA.array[i]=origSize[i]*0.5;
+    } else {
+      cA.array[i*3]=origColor[i*3]; cA.array[i*3+1]=origColor[i*3+1]; cA.array[i*3+2]=origColor[i*3+2];
+      sA.array[i]=origSize[i];
+    }
+  });
+  cA.needsUpdate = true; sA.needsUpdate = true;
+}
+
+// ---- 搜索 + 结果面板 + 飞行定位 / 回退 ----
+var flyAnim = null;
+var __savedView = null;
+function flyTo(i) {
+  if (!memPoints) return;
+  if (!__savedView) __savedView = { p: camera.position.clone(), t: controls.target.clone() };
+  var m = mem[i];
+  var target = new THREE.Vector3(m.x, m.y, m.z);
+  var camTo = target.clone().add(new THREE.Vector3(0, 0.55, 2.3));
+  var tFrom = controls.target.clone(), cFrom = camera.position.clone();
+  var t0 = performance.now(), DUR = 620;
+  flyAnim = function(now) {
+    var k = Math.min(1, (now - t0) / DUR);
+    k = 1 - Math.pow(1 - k, 3);
+    controls.target.lerpVectors(tFrom, target, k);
+    camera.position.lerpVectors(cFrom, camTo, k);
+    if (k >= 1) flyAnim = null;
+  };
+}
+function flyBack() {
+  if (!__savedView) return;
+  var sv = __savedView; __savedView = null;
+  var tFrom = controls.target.clone(), cFrom = camera.position.clone();
+  var t0 = performance.now(), DUR = 700;
+  flyAnim = function(now) {
+    var k = Math.min(1, (now - t0) / DUR);
+    k = 1 - Math.pow(1 - k, 3);
+    controls.target.lerpVectors(tFrom, sv.t, k);
+    camera.position.lerpVectors(cFrom, sv.p, k);
+    if (k >= 1) flyAnim = null;
+  };
+}
+
+function doSearch(q) {
+  q = (q || '').trim();
+  clearHighlight(); clearDomain();
+  Array.prototype.forEach.call(document.querySelectorAll('.schip'), function(ch) { ch.classList.remove('on'); });
+  if (tMax) { document.getElementById('trange').value = tMax; timeClip(tMax); }
+  var panel = document.getElementById('sres');
+  if (!q) { panel.classList.remove('show'); panel.innerHTML = ''; return; }
+  var hits = [];
+  mem.forEach(function(m, i) {
+    var hay = (m.s.name || '') + ' ' + (m.s.content || '');
+    if (hay.indexOf(q) >= 0) hits.push(i);
+  });
+  if (!hits.length) { panel.innerHTML = '<div style="text-align:center;padding:10px;font-size:11.5px;color:rgba(230,205,242,.5);letter-spacing:.14em;font-style:italic">✦ 未寻到 · 换一个词试试</div>'; panel.classList.add('show'); return; }
+  if (memPoints) {
+    var cA = memPoints.geometry.attributes.aColor, sA = memPoints.geometry.attributes.aSize;
+    hits.forEach(function(i) {
+      boostArr(cA.array, origColor, i);
+      sA.array[i] = origSize[i] * 2 + 4;
+    });
+    cA.needsUpdate = true; sA.needsUpdate = true; dlActive = hits;
+  }
+  panel.innerHTML = hits.map(function(i) {
+    var m = mem[i];
+    return '<div class="sres-i" data-i="' + i + '"><span class="smark" style="color:' + domCol(m.s.domain) + ';text-shadow:0 0 8px ' + domCol(m.s.domain) + '">✦</span>' +
+      '<span class="tx"><div class="t">' + escHTML(m.s.name || '') + '</div><div class="d">' + (m.s.created || '').slice(0, 10).replace(/-/g, '.') + ' · ' + m.s.domain + '</div></span></div>';
+  }).join('');
+  panel.classList.add('show');
+  Array.prototype.forEach.call(panel.children, function(it) {
+    it.addEventListener('click', function() {
+      var i = +it.getAttribute('data-i');
+      panel.classList.remove('show');
+      flyTo(i);
+      setTimeout(function() { highlight(i); openCard(mem[i].s); }, 720);
+    });
+  });
+}
+
+// ---- 编辑 ----
+function editCard() {
+  var body = document.getElementById('cBody');
+  var s = window.__curStar;
+  if (!body || !s) return;
+  window.__editOrig = body.innerHTML;
+  body.innerHTML = '<textarea id="cbodyEdit">' + escHTML(s.content || '') + '</textarea>' +
+    '<div class="cedit-acts"><button class="cedit-b pri" onclick="window.saveEdit()">✦ 保存</button>' +
+    '<button class="cedit-b" onclick="window.cancelEdit()">收起</button></div>';
+}
+function saveEdit() {
+  var ta = document.getElementById('cbodyEdit');
+  var s = window.__curStar;
+  if (!ta || !s) return;
+  s.content = ta.value;
+  try { fetch('/api/l1/' + s.mid, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: ta.value }) }); } catch (e) {}
+  var nm = (' ' + s.content).replace(/\s+/g, ' ').trim().slice(0, 28) || s.name;
+  s.name = nm;
+  var body = document.getElementById('cBody');
+  body.innerHTML = '<div>' + escHTML(s.content || '（这颗记忆还没有正文）') + '</div>';
+  var pb = document.querySelector('.cedit-b.pri');
+  if (pb) { pb.textContent = '已存储 ✦'; setTimeout(function() { pb.textContent = '✦ 保存'; }, 1400); }
+  var tt = document.getElementById('cTitle');
+  if (tt) tt.textContent = nm;
+}
+function cancelEdit() {
+  var body = document.getElementById('cBody');
+  if (body && window.__editOrig) { body.innerHTML = window.__editOrig; window.__editOrig = null; }
+}
+window.editCard = editCard;
+window.saveEdit = saveEdit;
+window.cancelEdit = cancelEdit;
+
+// ---- 打开/关闭时 UI 显隐 + 视角回退 ----
+function hideUI() {
+  var ids = ['sidx', 'taxis', 'searchbar', 'sres'];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (el) el.classList.add('uihide');
+  }
+}
+function showUI() {
+  var ids = ['sidx', 'taxis', 'searchbar'];
+  for (var i = 0; i < ids.length; i++) {
+    var el = document.getElementById(ids[i]);
+    if (el) el.classList.remove('uihide');
+  }
+  document.getElementById('sres').classList.remove('show');
+  var rp = document.getElementById('sres');
+  if (rp) { rp.classList.remove('show'); rp.classList.remove('uihide'); }
+}
+
+
+var __origLike = window.cardLike;
+window.cardLike = function() {
+  var s = window.__curStar;
+  if (!s) return;
+  var now = s.pinned ? 0 : 1;
+  s.pinned = !s.pinned;
+  s.importance = s.pinned ? 9 : 6;
+  try { fetch('/api/l1/' + s.mid, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ is_core: now }) }); } catch (e) {}
+  try { buildMemories(mem.map(function(m) { return m.s; })); } catch (e) {}
+  var b = document.getElementById('cLike');
+  if (b) b.style.color = s.pinned ? '#ff9ecf' : '#EBC6E8';
+};
+var __origOpen = window.openCard;
+window.openCard = function(s) {
+  window.__curStar = s;
+  hideUI();
+  if (__origOpen) __origOpen(s);
+  renderBatch(s);
+};
+var __origClose = window.closeCard;
+window.closeCard = function() {
+  if (__origClose) __origClose();
+  window.__curStar = null;
+  showUI();
+  flyBack();
+};
+
+var __actsInit = setInterval(function() {
+  var acts = document.querySelector('.c-acts');
+  if (acts && !document.getElementById('cEditBtn')) {
+    var b = document.createElement('button');
+    b.id = 'cEditBtn';
+    b.title = '编辑';
+    b.setAttribute('onclick', 'window.editCard()');
+    b.style.cssText = 'width:38px;height:38px;border:none;cursor:pointer;border-radius:50%;background:transparent;display:flex;align-items:center;justify-content:center;color:rgba(235,198,232,.5);transition:all .2s ease';
+    b.innerHTML = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none"><path d="M4 20h4L19.5 8.5a2.1 2.1 0 0 0-3-3L5 17v3z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>';
+    acts.appendChild(b);
+  }
+}, 300);
+
+function __vizInitNow() {
+  if (window.__vizInit || typeof memPoints === 'undefined' || !memPoints) return;
+  window.__vizInit = true;
+  buildIndex();
+  buildTaxis();
+  var si = document.getElementById('sinput');
+  if (si) si.addEventListener('input', function() { doSearch(si.value); });
+  var sb2 = document.getElementById('searchbar');
+  if (sb2) sb2.classList.add('in');
+  var sxe = document.getElementById('sidx');
+  if (sxe) sxe.classList.add('in');
+  var tx2 = document.getElementById('taxis');
+  if (tx2) tx2.classList.add('in');
+}
+var __origBoot = boot;
+boot = function(d) { setVizData(d); __origBoot(d); __vizInitNow(); };
+var __vizFallbackT = setInterval(function() {
+  if (!window.__vizInit && typeof memPoints !== 'undefined' && memPoints) __vizInitNow();
+  if (window.__vizInit) clearInterval(__vizFallbackT);
+}, 400);
+fetch(CONFIG.dataUrl+'?d='+Date.now()).then(r=>{if(!r.ok)throw 0;return r.json()}).then(boot)
+  .catch(()=>{ // 双击直接打开(file://)或没有 memory.json 时：用内嵌示例数据
+    try{ boot(JSON.parse(document.getElementById('memory-data').textContent)); }
+    catch(e){ document.getElementById('loading').textContent='星光加载失败，稍后再来 ♡';console.error(e); }
+  });
+</script>
+<script type="module" src="https://static.cloudflareinsights.com/beacon.min.js/v4513226cdae34746b4dedf0b4dfa099e1781791509496" integrity="sha512-ZE9pZaUXND66v380QUtch/5sE9tPFh2zg45pR2PB0CVkCtOREv2AJKkSidISWkysEuQ0EH8faUU5du78bx87UQ==" data-cf-beacon='{"version":"2024.11.0","token":"f0b2ea1254744942bb41a58ca8da0a75","r":1}' crossorigin="anonymous"></script>
+</body>
+</html>
