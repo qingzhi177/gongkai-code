@@ -67,6 +67,19 @@ body{font-family:"Songti SC","Noto Serif SC",Georgia,serif;background:#faf7f2;co
 var D = { thinkings: [] };
 var LOADING = false;
 var esc = function(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+function formatTime(ts) {
+  if (ts == null || ts === '') return '';
+  try {
+    var str = String(ts).replace(' ', 'T');
+    if (str.indexOf('Z') === -1 && str.indexOf('+') === -1) str += 'Z';
+    var d = new Date(str);
+    var mo = String(d.getMonth() + 1).padStart(2, '0');
+    var day = String(d.getDate()).padStart(2, '0');
+    var h = String(d.getHours()).padStart(2, '0');
+    var mi = String(d.getMinutes()).padStart(2, '0');
+    return d.getFullYear() + '-' + mo + '-' + day + ' ' + h + ':' + mi;
+  } catch (e) { return String(ts).substring(0, 16); }
+}
 var box = document.getElementById('stream');
 var curQ = '', curSeg = '';
 function segOf(n){ return n < 300 ? 's' : (n <= 800 ? 'm' : 'l'); }
@@ -92,7 +105,7 @@ function render() {
     var lit = '';
     var inQ = curQ && (t.think.indexOf(curQ) >= 0 || (t.answer||'').indexOf(curQ) >= 0);
     if (curQ) lit = inQ ? ' lit' : ' dim';
-    var ctx = (D.convs[t.conv] || []).map(function(m){
+    var ctx = ((D.convs || {})[t.conv] || []).map(function(m){
       var w = m.role === 'user' ? '她' : '我';
       var u = m.role === 'user' ? ' u' : '';
       return '<div><span class="who' + u + '">' + w + '</span> · ' + esc(m.content.slice(0,60)) + '</div>';
@@ -100,7 +113,7 @@ function render() {
     var ansTxt = markIt(t.full_reply || t.answer || '', curQ);
     html += '<div class="tk' + lit + '">' +
       '<span class="dot"></span>' +
-      '<div class="date">' + esc(t.ts).replace(/ /, ' · ') + '</div>' +
+      '<div class="date">' + formatTime(t.ts).replace(/ /, ' · ') + '</div>' +
       '<div class="mist"><div class="meta"><span class="w"></span><span class="ln">thinking · ' + t._full + ' 字</span></div>' +
       '<div class="txt">' + markIt(t.think, curQ) + '</div></div>' +
       (t.answer ? '<div class="answer"><div class="lab">通 向</div>' + ansTxt + '</div>' : '') +
@@ -143,7 +156,11 @@ fetch('/api/viz/thinkings?limit=500')
   .then(function(r) { if (!r.ok) throw 0; return r.json(); })
   .then(function(d) {
     D = d || { thinkings: [] };
-    D.thinkings.forEach(function(t) { t._full = (t.thinking || '').length; });
+    D.thinkings.forEach(function(t) {
+      t._full = (t.thinking || '').length;
+      t.think = t.thinking || '';
+      t.answer = t.full_reply || t.answer_ref || '';
+    });
     render();
     rebuildDist();
   })

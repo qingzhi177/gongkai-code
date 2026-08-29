@@ -995,6 +995,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
         }
         return null;
       }).filter(Boolean);
+      console.log('[THINK-DBG] 聚合块:', JSON.stringify(content.map(function(c){ return c.type; })));
+      console.log('[THINK-DBG] 聚合块:', JSON.stringify(content.map(function(c){ return c.type; })));
       resolve({ id: msgId, content, stop_reason: stopReason, usage });
     });
 
@@ -1271,9 +1273,9 @@ ${profile}
               totalUsage.cache_read_input_tokens = (totalUsage.cache_read_input_tokens || 0) + result.usage.cache_read_input_tokens;
           }
 
-          if (result.stop_reason !== 'tool_use') break;
           const thinkBlocks = result.content.filter(c => c.type === 'thinking');
           if (thinkBlocks.length) thinkAcc.push(thinkBlocks.map(c => c.thinking || '').join('\n'));
+          if (result.stop_reason !== 'tool_use') break;
           const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
           if (toolUseBlocks.length === 0) break;
 
@@ -1302,7 +1304,9 @@ ${profile}
           '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens);
         // bug修复：记住本轮真实 usage，供随后可能到来的工具回环短路时返回（否则回环 0 会覆盖显示）
         rememberUsage(computeConvId(req), totalUsage);
-        if (thinkAcc.length && result) {
+        console.log('[THINK-DBG] thinkAcc=' + thinkAcc.length);
+console.log('[THINK-DBG] thinkAcc=' + thinkAcc.length);
+if (thinkAcc.length && result) {
           const replyText = extractAssistantText(result) || '';
           const thinkText = thinkAcc.join('\n\n');
           if (thinkText.trim()) {
