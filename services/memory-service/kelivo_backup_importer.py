@@ -145,12 +145,12 @@ def _import_conv(mem_conn, cid, messages, thinkings, mode):
     for t in thinkings:
         dup = mem_conn.execute(
             "SELECT 1 FROM thinking_records WHERE conv_id=? AND answer_ref=? LIMIT 1",
-            (cid, t['answer_ref'], t.get('full_reply'))).fetchone()
+            (cid, t['answer_ref'])).fetchone()
         if dup:
             continue
         mem_conn.execute(
             "INSERT INTO thinking_records (conv_id, ts, thinking, answer_ref, full_reply) VALUES (?,?,?,?,?)",
-            (cid, t['ts'] or datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), t['thinking'], t['answer_ref']))
+            (cid, t['ts'] or datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), t['thinking'], t['answer_ref'], t.get('full_reply')))
         t_saved += 1
     return saved, t_saved
 
