@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<title>思维潜流 · Undercurrent</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{font-family:"Songti SC","Noto Serif SC",Georgia,serif;background:#faf7f2;color:#3d3a41;min-height:100vh}
+.hero{text-align:center;padding:calc(env(safe-area-inset-top) + 34px) 20px 10px}
+.hero .en{font-size:10px;letter-spacing:.42em;color:#b9aca0;text-transform:uppercase}
+.hero h1{font-family:Georgia,serif;font-weight:400;font-size:27px;letter-spacing:.18em;color:#3b3640;margin-top:10px}
+.hero .line{width:34px;height:1px;margin:13px auto 10px;background:linear-gradient(90deg,transparent,#a89ac8,transparent)}
+.hero .sub{font-size:12px;color:#9c9288;letter-spacing:.1em;line-height:1.9}
+#sfind{width:min(72vw,340px);margin:16px auto 0;background:#fffdf9;border:1px solid #e9e1d6;border-radius:999px;padding:9px 18px;font-family:inherit;font-size:12.5px;color:#5d5868;outline:none;letter-spacing:.05em;display:block}
+#sfind::placeholder{color:#c4bbae;letter-spacing:.14em}
+#sfind:focus{border-color:#cbbce2}
+.dist{display:flex;gap:16px;justify-content:center;align-items:center;margin:14px auto 0;font-size:11px;color:#a89f92;letter-spacing:.08em}
+.dist span{cursor:pointer;display:inline-flex;gap:6px;align-items:center;padding:3px 10px;border-radius:999px;border:1px solid transparent;transition:all .25s}
+.dist span.on{border-color:#cbbce2;background:#f2edf8;color:#6d6480}
+.dist i{width:4px;height:4px;border-radius:50%;background:#c9b8de;display:inline-block}
+.stream{max-width:720px;margin:14px auto 80px;padding:0 18px;position:relative}
+.stream::before{content:'';position:absolute;left:50%;top:0;bottom:0;width:1px;background:linear-gradient(180deg,#e8e2d8,#d8d0e0 40%,#e8e2d8)}
+.tk{position:relative;margin:22px 0;width:50%;padding-right:26px;transition:opacity .35s ease}
+.tk:nth-child(odd){left:0;text-align:right;padding-right:30px}
+.tk:nth-child(even){left:50%;padding-left:30px;text-align:left}
+.tk .dot{position:absolute;top:14px;width:7px;height:7px;border-radius:50%;background:#a89ac8;box-shadow:0 0 0 3px #faf7f2,0 0 10px rgba(150,140,190,.5)}
+.tk:nth-child(odd) .dot{right:-3.5px}
+.tk:nth-child(even) .dot{left:-3.5px}
+.tk .date{font-family:Georgia,serif;font-style:italic;font-size:10.5px;color:#b3a89b;letter-spacing:.08em}
+.tk .mist{margin-top:8px;position:relative;border:1px solid #e9e3da;background:#fffdf9;border-radius:14px;padding:13px 16px;cursor:pointer;transition:box-shadow .3s ease,transform .3s ease,border-color .3s;box-shadow:0 1px 8px rgba(170,150,120,.06)}
+.tk .mist:hover{transform:translateY(-2px);box-shadow:0 6px 18px rgba(160,140,180,.1)}
+.tk .mist .meta{display:flex;align-items:center;gap:8px;margin-bottom:7px}
+.tk .mist .w{width:5px;height:5px;border-radius:50%;background:#c9b8de;animation:br 2.8s ease-in-out infinite}
+@keyframes br{0%,100%{opacity:.45}50%{opacity:1}}
+.tk .mist .ln{font-family:Georgia,serif;font-style:italic;font-size:10px;color:#b5a8c0;letter-spacing:.12em}
+.tk .mist .txt{font-size:12.8px;line-height:1.95;color:#6c6880;font-weight:300;letter-spacing:.02em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;text-align:left}
+.tk.open .mist .txt{-webkit-line-clamp:unset;display:block}
+.tk.open .mist{border-color:#d8cfe8}
+.tk .answer{margin-top:8px;font-size:11.8px;line-height:1.8;color:#8a8478;padding-left:12px;border-left:2px solid #e5ddd2;display:none;text-align:left}
+.tk.open .answer{display:block}
+.tk .answer .lab{font-size:9.5px;letter-spacing:.2em;color:#c0b3a2;margin-bottom:2px}
+.tk .ctx{margin-top:8px;font-size:11px;line-height:1.8;color:#a89f92;display:none;text-align:left}
+.tk.open .ctx{display:block}
+.tk .ctx .who{color:#9c8fae;font-family:Georgia,serif;font-style:italic}
+.tk .ctx .who.u{color:#8f9cae}
+.tk.dim{opacity:.18}
+.tk.lit .mist{border-color:#b9a6dd;box-shadow:0 4px 16px rgba(160,140,190,.16)}
+.tk mark, .tk .txt mark{background:rgba(169,152,200,.22);color:#5d4f7a;border-radius:2px;padding:0 1px}
+.foot{text-align:center;color:#c5bcb0;font-size:10.5px;letter-spacing:.24em;padding:26px 0 40px}
+@media(max-width:560px){.stream::before{left:10px}.tk{width:100%;left:0!important;text-align:left;padding:0 0 0 30px!important}.tk .dot{left:6.5px;right:auto!important}}
+</style>
+</head>
+<body>
+<div class="hero">
+  <div class="en">Undercurrent · Thinking Stream</div>
+  <h1>思维潜流</h1>
+  <div class="line"></div>
+  <div class="sub">水面之上是对话，水面之下是思绪。</div>
+  <input id="sfind" placeholder="在水中寻一个字…" />
+  <div class="dist" id="dist"></div>
+</div>
+<div class="stream" id="stream"></div>
+<div class="foot">✦ · THINKING RECORDS · ✦</div>
+<script id="tdata" type="application/json">{"thinkings":[]}</script>
+<script>
+var D = { thinkings: [] };
+var LOADING = false;
+var esc = function(s){ return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); };
+var box = document.getElementById('stream');
+var curQ = '', curSeg = '';
+function segOf(n){ return n < 300 ? 's' : (n <= 800 ? 'm' : 'l'); }
+function markIt(text, q) {
+  var t = esc(text);
+  if (!q) return t;
+  var eq = esc(q);
+  var out = '', idx = 0;
+  while (true) {
+    var p = t.indexOf(eq, idx);
+    if (p < 0) { out += t.slice(idx); break; }
+    out += t.slice(idx, p) + '<mark>' + eq + '</mark>';
+    idx = p + eq.length;
+  }
+  return out;
+}
+function render() {
+  var html = '';
+  for (var i = 0; i < D.thinkings.length; i++) {
+    var t = D.thinkings[i];
+    var seg = segOf(t._full);
+    if (curSeg && seg !== curSeg) continue;
+    var lit = '';
+    var inQ = curQ && (t.think.indexOf(curQ) >= 0 || (t.answer||'').indexOf(curQ) >= 0);
+    if (curQ) lit = inQ ? ' lit' : ' dim';
+    var ctx = (D.convs[t.conv] || []).map(function(m){
+      var w = m.role === 'user' ? '她' : '我';
+      var u = m.role === 'user' ? ' u' : '';
+      return '<div><span class="who' + u + '">' + w + '</span> · ' + esc(m.content.slice(0,60)) + '</div>';
+    }).join('');
+    var ansTxt = markIt(t.full_reply || t.answer || '', curQ);
+    html += '<div class="tk' + lit + '">' +
+      '<span class="dot"></span>' +
+      '<div class="date">' + esc(t.ts).replace(/ /, ' · ') + '</div>' +
+      '<div class="mist"><div class="meta"><span class="w"></span><span class="ln">thinking · ' + t._full + ' 字</span></div>' +
+      '<div class="txt">' + markIt(t.think, curQ) + '</div></div>' +
+      (t.answer ? '<div class="answer"><div class="lab">通 向</div>' + ansTxt + '</div>' : '') +
+      '<div class="ctx">' + ctx + '</div>' +
+      '</div>';
+  }
+  box.innerHTML = html;
+}
+function rebuildDist() {
+  var dist = document.getElementById('dist');
+  var cnt = { s:0, m:0, l:0 };
+  D.thinkings.forEach(function(t){ cnt[segOf(t._full)]++; });
+  dist.innerHTML = '<span data-s="">✦ 全部 ' + D.thinkings.length + '</span>' +
+    '<span data-s="s"><i></i>短思 ' + cnt.s + '</span>' +
+    '<span data-s="m"><i></i>长思 ' + cnt.m + '</span>' +
+    '<span data-s="l"><i></i>深潜 ' + cnt.l + '</span>';
+  Array.prototype.forEach.call(dist.children, function(sp){
+    sp.addEventListener('click', function(){
+      var v = sp.getAttribute('data-s');
+      curSeg = (curSeg === v) ? '' : v;
+      Array.prototype.forEach.call(dist.children, function(x){
+        x.classList.toggle('on', x === sp && !!curSeg);
+      });
+      render();
+    });
+  });
+}
+render();
+box.addEventListener('click', function(e) {
+  var tk = e.target && e.target.closest ? e.target.closest('.tk') : null;
+  if (tk) tk.classList.toggle('open');
+});
+// 搜索
+var sf = document.getElementById('sfind');
+sf.addEventListener('input', function(){ curQ = sf.value.trim(); render(); });
+// 长度分布
+// 分布由 rebuildDist() 构建
+// 正式版：从接口加载
+fetch('/api/viz/thinkings?limit=500')
+  .then(function(r) { if (!r.ok) throw 0; return r.json(); })
+  .then(function(d) {
+    D = d || { thinkings: [] };
+    D.thinkings.forEach(function(t) { t._full = (t.thinking || '').length; });
+    render();
+    rebuildDist();
+  })
+  .catch(function() {
+    var box2 = document.getElementById('stream');
+    if (box2) box2.innerHTML = '<div style="text-align:center;padding:60px 20px;color:#b3a89b;font-style:italic;font-size:13px">✦ 潜流暂时止息 · 稍后再来</div>';
+  });
+</script>
+</body>
+</html>

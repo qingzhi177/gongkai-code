@@ -1307,10 +1307,11 @@ ${profile}
           const thinkText = thinkAcc.join('\n\n');
           if (thinkText.trim()) {
             try {
+              console.log('[THINK-SAVE] 保存思考链 len=' + thinkText.length + ' reply=' + replyText.length);
               axios.post(MEMORY_SERVICE_URL + '/thinking', {
                 conv_id: computeConvId(req), thinking: thinkText,
                 answer_ref: replyText.slice(0, 200), full_reply: replyText
-              }).catch(function() {});
+              }).then(function() { console.log('[THINK-SAVE] OK'); }).catch(function(e) { console.log('[THINK-SAVE] FAIL ' + e.message); });
             } catch (e) {}
           }
         }
