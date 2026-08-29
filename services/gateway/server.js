@@ -11,6 +11,19 @@ app.use(express.json({ limit: '10mb' }));
 const MEMORY_SERVICE_URL = process.env.MEMORY_SERVICE_URL || 'http://localhost:8001';
 const PORT = process.env.PORT || 3000;
 
+// ========== 记忆浮现参数配置 ==========
+const SURFACE_PROBABILITY = 0.3;          // 30% 概率开放回忆
+const MIN_RELEVANCE = 0.15;               // RRF 分数阈值
+const COOLDOWN_HOURS = 24;                // 主通道冷却时长（小时）
+const SERENDIPITY_PROBABILITY = 0.05;    // 5% 概率触发无由来浮现
+const SERENDIPITY_COOLDOWN_DAYS = 7;     // 无由来浮现冷却时长（天）
+const SHOW_COUNT_WEIGHTS = [
+  { value: 0, weight: 0.2 },  // 20% 不显示
+  { value: 1, weight: 0.6 },  // 60% 显示 1 条
+  { value: 2, weight: 0.2 }   // 20% 显示 2 条
+];
+const SESSION_GAP_THRESHOLD_HOURS = 4;   // 会话间隔感知阈值
+
 // bug修复：工具回环短路时不请求上游、没有真实 usage。缓存上一轮真实回答的 usage（按 conv_id），
 // 回环时取出返回，避免 Kelivo 把已显示的 token 数用 0 覆盖（工具场景显示 0 的根因）。
 const lastUsageByConv = new Map();
@@ -226,7 +239,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "recall",
-      description: "搜索记忆库中的详细信息。当目录里的摘要不够用、需要看原文细节时使用。",
+      description: "当你隐约觉得某个话题以前聊过、或想确认某个细节时，用这个工具主动回忆。不需要确定记忆一定存在才搜——凭感觉去找也可以。目录里没显示的，不代表记忆库里没有。",
       parameters: {
         type: "object",
         properties: {
@@ -402,10 +415,7 @@ async function getCustomPrompt() {
   }
 }
 
-// 时间感知：会话间隔感知阈值。小于这个小时数不注入间隔提示（连续对话不打断）。
-const SESSION_GAP_THRESHOLD_HOURS = 4;
-
-// 搜索记忆获取目录 + 时间感知头部
+// 搜索记忆获取目录 + 时间感知头部 + 随机浮现逻辑
 // 头部两条动态信息（都注入 memoryMenu，不进 system 前缀，不影响 prompt caching）：
 //   1. 当前北京时间 —— 给 LLM 时间锚点，避免把历史记忆里的相对时间（"过了十一天"）
 //      误当成当前状态（问题1）。
@@ -438,7 +448,6 @@ async function getMemoryMenu(userMessage, convId) {
       } else if (gapHours >= 24 * 7) {
         sessionNote = `距上次对话约${Math.round(gapHours / 24)}天（有段时间没见）`;
       }
-      // < 阈值：不注入，连续对话不打断
     }
   } catch (e) {
     // 查不到上次时间时静默跳过，不影响主流程
@@ -448,32 +457,210 @@ async function getMemoryMenu(userMessage, convId) {
   let header = `[当前时间：${currentDateStr}（北京时间）]`;
   if (sessionNote) header += `\n[${sessionNote}]`;
 
-  // 4. 相关记忆检索。检索失败不影响时间锚点——仍返回头部。
-  let memories = [];
+  // 4. 随机门控：是否开放回忆？
+  if (Math.random() > SURFACE_PROBABILITY) {
+    return header + '\n';
+  }
+
+  // 5. 主通道：相关度驱动
+  let selectedMemories = await relevanceDrivenSurfacing(userMessage);
+
+  // 6. 并行通道：无由来浮现
+  if (Math.random() < SERENDIPITY_PROBABILITY) {
+    const serendipityMemory = await serendipitousSurfacing(convId);
+    if (serendipityMemory) {
+      // 无由来浮现优先，但总数不超过 2 条
+      selectedMemories = [serendipityMemory, ...selectedMemories].slice(0, 2);
+    }
+  }
+
+  if (selectedMemories.length === 0) return header + '\n';
+
+  // 7. 格式化为自然语言念头
+  const formattedMemories = formatMemoriesAsThoughts(selectedMemories);
+
+  // 8. 更新展示指标
+  await updateDisplayMetrics(selectedMemories.map(m => m.id));
+
+  return header + formattedMemories;
+}
+
+// 相关度驱动的记忆浮现（主通道）
+async function relevanceDrivenSurfacing(userMessage) {
   try {
     const res = await axios.post(`${MEMORY_SERVICE_URL}/search`, {
       query: userMessage,
       mode: "semantic",
-      n: 8
+      n: 20  // 扩大候选池
     });
-    memories = res.data.memories || [];
+    let memories = res.data.memories || [];
+
+    // 相关度过滤
+    memories = memories.filter(m => m.score >= MIN_RELEVANCE);
+
+    // 冷却过滤
+    const cooldownMs = COOLDOWN_HOURS * 3600 * 1000;
+    const now = Date.now();
+    memories = memories.filter(m => {
+      const lastShown = m.metadata.last_shown_at;
+      if (!lastShown) return true;
+      return (now - lastShown) >= cooldownMs;
+    });
+
+    if (memories.length === 0) return [];
+
+    // 加权随机抽取
+    const numToShow = weightedRandomChoice(SHOW_COUNT_WEIGHTS);
+    if (numToShow === 0) return [];
+
+    return weightedSample(memories, numToShow);
   } catch (e) {
     console.error('记忆检索失败:', e.message);
+    return [];
   }
-
-  if (memories.length === 0) return header + '\n';
-
-  let menu = header + '\n[相关记忆目录]\n';
-  for (const m of memories) {
-    const meta = m.metadata || {};
-    const core = meta.is_core ? '⭐ ' : '- ';
-    const date = meta.ts ? meta.ts.substring(0, 10) : '';
-    const type = meta.event_type || '';
-    const summary = m.l1_summary || m.content || '';
-    menu += `${core}[${date} ${type}] ${summary.substring(0, 60)}\n`;
-  }
-  return menu;
 }
+
+// 无由来浮现（并行通道）
+async function serendipitousSurfacing(convId) {
+  try {
+    const res = await axios.post(`${MEMORY_SERVICE_URL}/search_serendipity`, {
+      min_arousal: 0.6,
+      cooldown_days: SERENDIPITY_COOLDOWN_DAYS,
+      n: 10
+    });
+
+    const candidates = res.data.memories || [];
+    if (candidates.length === 0) return null;
+
+    // 加权随机选一条（情感强度 + 核心记忆权重 + 时间衰减）
+    const weights = candidates.map(m => {
+      const arousal = m.metadata.arousal || 0;
+      const coreBonus = m.metadata.is_core ? 0.5 : 0;
+      const memoryDate = new Date(m.metadata.ts);
+      const daysAgo = (Date.now() - memoryDate.getTime()) / (24 * 3600 * 1000);
+      const timeDecay = Math.max(0.3, 1 - daysAgo / 365);
+      return (arousal + coreBonus) * timeDecay;
+    });
+
+    const totalWeight = weights.reduce((sum, w) => sum + w, 0);
+    let rand = Math.random() * totalWeight;
+
+    for (let i = 0; i < candidates.length; i++) {
+      rand -= weights[i];
+      if (rand <= 0) return candidates[i];
+    }
+
+    return candidates[0];  // fallback
+  } catch (e) {
+    console.error('[SERENDIPITY] 查询失败:', e.message);
+    return null;
+  }
+}
+
+// 加权随机选择（从权重数组中选一个值）
+function weightedRandomChoice(options) {
+  const total = options.reduce((sum, opt) => sum + opt.weight, 0);
+  let rand = Math.random() * total;
+  for (const opt of options) {
+    rand -= opt.weight;
+    if (rand <= 0) return opt.value;
+  }
+  return options[options.length - 1].value;
+}
+
+// 加权采样（按 score 加权，分数越高越容易被选中）
+function weightedSample(items, n) {
+  const sampled = [];
+  const pool = [...items];
+
+  for (let i = 0; i < n && pool.length > 0; i++) {
+    const totalScore = pool.reduce((sum, m) => sum + m.score, 0);
+    if (totalScore === 0) break;
+
+    let rand = Math.random() * totalScore;
+
+    for (let j = 0; j < pool.length; j++) {
+      rand -= pool[j].score;
+      if (rand <= 0) {
+        sampled.push(pool[j]);
+        pool.splice(j, 1);
+        break;
+      }
+    }
+  }
+
+  return sampled;
+}
+
+// 格式化为自然语言念头
+function formatMemoriesAsThoughts(memories) {
+  if (memories.length === 0) return '';
+
+  const thoughts = memories.map(m => {
+    const meta = m.metadata || {};
+    const timePhrase = toFuzzyTime(meta.ts);
+    const coreMarker = meta.is_core ? '⭐ ' : '';
+    const summary = m.l1_summary || '';
+
+    return `（${coreMarker}${timePhrase}，${summary}）`;
+  });
+
+  return '\n' + thoughts.join('\n\n') + '\n';
+}
+
+// 模糊化时间（精确日期 → 自然语言时间描述）
+function toFuzzyTime(isoTimestamp) {
+  if (!isoTimestamp) return '不知何时';
+
+  try {
+    const memoryDate = new Date(isoTimestamp);
+    const now = new Date();
+    const daysAgo = Math.floor((now - memoryDate) / (24 * 3600 * 1000));
+
+    if (daysAgo < 1) return '今天早些时候';
+    if (daysAgo < 3) return '前两天';
+    if (daysAgo < 7) return '最近';
+    if (daysAgo < 14) return '前阵子';
+    if (daysAgo < 30) return '不久之前';
+
+    // 季节映射
+    const month = memoryDate.getMonth();  // 0-11
+    const seasons = [
+      '冬天', '冬末', '早春', '春天', '晚春', '初夏',
+      '夏天', '盛夏', '初秋', '秋天', '深秋', '初冬'
+    ];
+    const season = seasons[month];
+
+    if (daysAgo < 365) {
+      return season;
+    } else {
+      const yearDiff = now.getFullYear() - memoryDate.getFullYear();
+      if (yearDiff === 1) return `去年${season}`;
+      return `${yearDiff}年前的${season}`;
+    }
+  } catch (e) {
+    return '很久之前';
+  }
+}
+
+// 更新展示指标（display_count + last_shown_at）
+async function updateDisplayMetrics(memoryIds) {
+  if (memoryIds.length === 0) return;
+
+  try {
+    await axios.post(`${MEMORY_SERVICE_URL}/memories/increment_display_count`, {
+      memory_ids: memoryIds
+    });
+
+    await axios.post(`${MEMORY_SERVICE_URL}/memories/update_last_shown`, {
+      memory_ids: memoryIds,
+      timestamp: Date.now()
+    });
+  } catch (e) {
+    console.error('[DISPLAY_METRICS] 更新失败:', e.message);
+  }
+}
+
 
 // 执行工具调用
 // 把工具执行结果文本转成 Kelivo 原生"来源摘要卡"的 items（仅前端展示，不进 L0/上下文）。
@@ -528,7 +715,13 @@ async function executeTool(name, args) {
       });
       const memories = res.data.memories || [];
       if (memories.length === 0) return '未找到相关记忆。';
-      
+
+      // 更新 access_count（显式 recall）
+      const memoryIds = memories.map(m => m.id);
+      await axios.post(`${MEMORY_SERVICE_URL}/memories/increment_access_count`, {
+        memory_ids: memoryIds
+      }).catch(e => console.error('[ACCESS_COUNT] 更新失败:', e.message));
+
       let result = '';
       memories.forEach((m, i) => {
         const meta = m.metadata || {};
@@ -1150,7 +1343,17 @@ ${profile}
 - update_profile: 更新人格画像
 - bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）
 
-当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。`;
+当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。
+
+---
+
+记忆系统偶尔会浮现一些过去的片段——这些不是你必须处理的信息，而是偶然想起的痕迹。
+
+这是我们曾经共同经历过的一点痕迹。它们可能与当前话题有关，也可能无关。
+
+不要刻意复述它们，也不要让它们限制你对当下的理解。只有在它们真的相关、真的有助于理解当前交流时，才自然地用上。
+
+记忆片段只是部分提醒，不代表所有相关记忆都已列出。如果你觉得某个话题以前聊过但没看到相关片段，可以用 recall 去找。`;
 
     // 如果有 Custom Prompt，追加到 systemPrefix
     if (customPrompt) {

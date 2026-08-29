@@ -259,6 +259,20 @@ def init_db():
         if col not in cols:
             c.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0")
             print(f"[MIGRATE] {table}.{col} 已添加")
+
+    # 记忆理念工程化 + 随机触发：新增字段（display_count, last_shown_at, visibility, supersedes）
+    for col, coldef in (
+        ("display_count", "INTEGER DEFAULT 0"),
+        ("last_shown_at", "INTEGER"),  # Unix 时间戳（毫秒）
+        ("visibility", "REAL DEFAULT 1.0"),  # 0.0-1.0，软隐藏机制
+        ("supersedes", "INTEGER")  # 指向被修正的旧 feel 的 id
+    ):
+        try:
+            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
+            print(f"[MIGRATE] l1_memories.{col} 已添加")
+        except sqlite3.OperationalError:
+            pass  # 列已存在，跳过
+
     conn.commit()
     conn.close()
 
@@ -541,23 +555,130 @@ async def search_memories(req: SearchRequest):
         
         memories.sort(key=lambda m: (-m["metadata"].get("is_core", 0), -m["score"]))
 
-        # 更新 access_count
-        try:
-            conn_ac = sqlite3.connect(str(SQLITE_PATH))
-            c_ac = conn_ac.cursor()
-            for m in memories[:req.n]:
-                lid = m["id"].replace("l1_", "")
-                c_ac.execute('UPDATE l1_memories SET access_count = access_count + 1 WHERE id = ?', (lid,))
-            conn_ac.commit()
-            conn_ac.close()
-        except Exception:
-            pass
+        # 注意：access_count 不再自动更新。
+        # - recall 工具调用时由 gateway 调用 /memories/increment_access_count
+        # - memoryMenu 展示时由 gateway 调用 /memories/increment_display_count
+        # 这样区分"显式调用"和"被动展示"两种访问方式。
 
         return {"memories": memories[:req.n], "total": len(memories)}
 
     except Exception as e:
         print(f"Search error: {e}")
         return {"memories": [], "total": 0}
+
+
+# ========== 记忆理念工程化 + 随机触发：新增接口 ==========
+
+class IncrementCountRequest(BaseModel):
+    memory_ids: List[str]
+
+class UpdateLastShownRequest(BaseModel):
+    memory_ids: List[str]
+    timestamp: int
+
+class UpdateVisibilityRequest(BaseModel):
+    visibility: float
+
+@app.post("/memories/increment_access_count")
+async def increment_access_count(req: IncrementCountRequest):
+    """recall 工具显式调用时增加 access_count"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    for mid in req.memory_ids:
+        l1_id = mid.replace("l1_", "")
+        c.execute("UPDATE l1_memories SET access_count = access_count + 1 WHERE id = ?", (l1_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.post("/memories/increment_display_count")
+async def increment_display_count(req: IncrementCountRequest):
+    """memoryMenu 展示时增加 display_count"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    for mid in req.memory_ids:
+        l1_id = mid.replace("l1_", "")
+        c.execute("UPDATE l1_memories SET display_count = display_count + 1 WHERE id = ?", (l1_id,))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.post("/memories/update_last_shown")
+async def update_last_shown(req: UpdateLastShownRequest):
+    """更新 last_shown_at 时间戳（毫秒）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    for mid in req.memory_ids:
+        l1_id = mid.replace("l1_", "")
+        c.execute("UPDATE l1_memories SET last_shown_at = ? WHERE id = ?", (req.timestamp, l1_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok"}
+
+@app.put("/l1/{l1_id}/visibility")
+async def update_visibility(l1_id: int, req: UpdateVisibilityRequest):
+    """更新记忆可见度（0.0-1.0），用于软隐藏机制"""
+    from fastapi import HTTPException
+    if not 0.0 <= req.visibility <= 1.0:
+        raise HTTPException(400, "visibility must be between 0.0 and 1.0")
+
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    c.execute("UPDATE l1_memories SET visibility = ? WHERE id = ?", (req.visibility, l1_id))
+    conn.commit()
+    conn.close()
+    return {"status": "ok", "visibility": req.visibility}
+
+@app.post("/search_serendipity")
+async def search_serendipity(
+    min_arousal: float = 0.6,
+    cooldown_days: int = 7,
+    n: int = 10
+):
+    """无由来浮现：返回高情感强度或核心记忆，且满足冷却期"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+
+    import time
+    cooldown_ms = cooldown_days * 24 * 3600 * 1000
+    now_ms = int(time.time() * 1000)
+    cutoff_ms = now_ms - cooldown_ms
+
+    # 查询：(arousal >= min_arousal OR is_core = 1) AND (last_shown_at IS NULL OR last_shown_at < cutoff)
+    c.execute("""
+        SELECT id, content, quote, event_type, tags, ts, client, valence, arousal, is_core, last_shown_at
+        FROM l1_memories
+        WHERE status = 'active'
+          AND (arousal >= ? OR is_core = 1)
+          AND (last_shown_at IS NULL OR last_shown_at < ?)
+        ORDER BY RANDOM()
+        LIMIT ?
+    """, (min_arousal, cutoff_ms, n))
+
+    rows = c.fetchall()
+    conn.close()
+
+    memories = []
+    for row in rows:
+        memories.append({
+            "id": f"l1_{row[0]}",
+            "l1_summary": row[1],
+            "l0_context": get_l0_context(SQLITE_PATH, str(row[0])),
+            "quote": row[2] or "",
+            "metadata": {
+                "event_type": row[3] or "",
+                "tags": row[4] or "",
+                "ts": row[5] or "",
+                "client": row[6] or "",
+                "valence": row[7] if row[7] is not None else 0,
+                "arousal": row[8] if row[8] is not None else 0,
+                "is_core": row[9] or 0,
+                "last_shown_at": row[10]
+            },
+            "score": 1.0
+        })
+
+    return {"memories": memories, "total": len(memories)}
 
 
 def normalize_content(content):
