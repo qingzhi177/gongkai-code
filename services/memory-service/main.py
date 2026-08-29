@@ -1481,7 +1481,8 @@ async def reextract_l1(memory_id: int):
     )
     # call_deepseek 内部会拼上 EXTRACT_PROMPT；这里传"对话 + 重提取说明"作为正文
     try:
-        memories = call_deepseek(convo + reextract_hint, get_extract_provider())
+        mc = await get_model_config('l1_extract')
+        memories = call_deepseek(convo + reextract_hint, mc if mc.get('configured') else None)
     except Exception as e:
         conn.close()
         return JSONResponse(status_code=502, content={"status": "error", "detail": f"DeepSeek 提取失败: {e}"})
@@ -2481,8 +2482,14 @@ async def purge_all_data(confirmation: dict):
         c.execute("DELETE FROM l1_memories")
         c.execute("DELETE FROM shared_narrative")
         c.execute("DELETE FROM recent_summary")
-        c.execute("DELETE FROM user_profile")
-        c.execute("DELETE FROM ai_profile")
+        try:
+            c.execute("DELETE FROM user_profile")
+        except Exception:
+            pass
+        try:
+            c.execute("DELETE FROM ai_profile")
+        except Exception:
+            pass
         c.execute("DELETE FROM thinking_records")
         try:
             c.execute("DELETE FROM custom_prompts")

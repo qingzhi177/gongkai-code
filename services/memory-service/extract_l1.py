@@ -138,12 +138,13 @@ def call_deepseek(text, provider=None):
         print(f"DeepSeek error: {e}")
         return []
 
-def get_embedding(text):
+def get_embedding(text, provider=None):
     try:
+        base = ((provider or {}).get('base_url') or ALIBABA_BASE_URL).rstrip('/')
         response = httpx.post(
-            f"{ALIBABA_BASE_URL}/embeddings",
-            headers={"Authorization": f"Bearer {ALIBABA_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "text-embedding-v3", "input": text, "encoding_format": "float"},
+            f"{base}/embeddings",
+            headers={"Authorization": f"Bearer {(provider or {}).get('api_key') or ALIBABA_API_KEY}", "Content-Type": "application/json"},
+            json={"model": (provider or {}).get('model') or "text-embedding-v3", "input": text, "encoding_format": "float"},
             timeout=30.0
         )
         response.raise_for_status()
@@ -182,7 +183,7 @@ def save_l1(memory, conv_id, client, source_id):
         )
         l1_id = c.lastrowid
         conn.commit()
-        embedding = get_embedding(memory["content"])
+        embedding = get_embedding(memory["content"], resolve_purpose('embedding'))
         if embedding:
             l1_collection.add(
                 ids=[f"l1_{l1_id}"],
@@ -296,7 +297,7 @@ def main():
             text += f"[{prefix}] {content}\n"
             ids.append(mid)
         print(f"Processing {conv_id}: {len(msgs)} messages")
-        memories = call_deepseek(text, get_extract_provider())
+        memories = call_deepseek(text, resolve_purpose('l1_extract'))
         if memories:
             print(f"  Extracted {len(memories)} memories")
             for memory in memories:
@@ -308,8 +309,8 @@ def main():
     # 提取完成后检查是否需要更新 Narrative
     check_and_auto_update_narrative()
 
-def get_extract_provider():
-    """读取 providers 表 role='extract' 供应商（独立进程用），无则 None 回退 .env"""
+def resolve_purpose(purpose):
+    """按模块配置（model_configs→providers）解析：返回 {base_url, api_key, model} 或 None（回退 .env）"""
     try:
         import sqlite3 as _sq
         import json as _js
@@ -319,26 +320,25 @@ def get_extract_provider():
             return None
         conn = _sq.connect(_db)
         c = conn.cursor()
-        row = c.execute("SELECT id, base_url, api_key_enc, models FROM providers WHERE role='extract' ORDER BY id LIMIT 1").fetchone()
-        conn.close()
+        row = c.execute("SELECT provider_id, model_name FROM model_configs WHERE purpose=? AND enabled=1", (purpose,)).fetchone()
         if not row:
+            conn.close()
+            return None
+        prov = c.execute("SELECT base_url, api_key_enc FROM providers WHERE id=?", (row[0],)).fetchone()
+        conn.close()
+        if not prov:
             return None
         key = _os.environ.get('CONFIG_SECRET_KEY', '')
-        api = row[2] or ''
+        api = prov[1] or ''
         if key and api:
             try:
                 from cryptography.fernet import Fernet
                 api = Fernet(key.encode()).decrypt(api.encode()).decode()
             except Exception:
                 pass
-        models = []
-        try:
-            models = _js.loads(row[3] or '[]')
-        except Exception:
-            pass
-        return {'base_url': row[1], 'api_key': api, 'model': models[0] if models else None}
+        return {'base_url': prov[0], 'api_key': api, 'model': row[1]}
     except Exception as e:
-        print(f"get_extract_provider error: {e}")
+        print(f"resolve_purpose error: {e}")
         return None
 
 if __name__ == "__main__":
