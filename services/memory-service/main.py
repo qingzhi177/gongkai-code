@@ -1173,7 +1173,7 @@ async def get_viz_l0l1():
             'id': 'l1_' + str(mid), 'mid': mid, 'name': nm[:30],
             'domain': domain, 'importance': imp, 'pinned': bool(core),
             'created': (ts or '')[:10] + 'T00:00:00',
-            'content': (content or '')[:600],
+            'content': (content or ''),
             'batch': smid,
         })
         if smid is not None:
@@ -1186,7 +1186,7 @@ async def get_viz_l0l1():
             "SELECT role, content, ts FROM l0_messages WHERE status='active' AND id >= ? AND id < ? ORDER BY id LIMIT 60",
             (sid, nxt)).fetchall()
         batches[str(sid)] = [
-            {'role': rr[0], 'content': (rr[1] or '')[:400], 'ts': rr[2]} for rr in rows0
+            {'role': rr[0], 'content': (rr[1] or ''), 'ts': rr[2]} for rr in rows0
         ]
     conn.close()
     return {'stars': stars, 'batches': batches}
