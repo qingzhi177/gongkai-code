@@ -2450,6 +2450,14 @@ async def purge_all_data(confirmation: dict):
         c.execute("DELETE FROM user_profile")
         c.execute("DELETE FROM ai_profile")
         c.execute("DELETE FROM thinking_records")
+        try:
+            c.execute("DELETE FROM custom_prompts")
+        except Exception:
+            pass
+        try:
+            c.execute("DELETE FROM conv_settings")
+        except Exception:
+            pass
         c.execute("VACUUM")
         conn.commit()
         conn.close()
@@ -2457,6 +2465,8 @@ async def purge_all_data(confirmation: dict):
 
         # 2. 清空 ChromaDB（重建 collection）
         try:
+            chroma_client.delete_collection(name="l1_memories")
+            logger.info("ChromaDB l1_memories collection 已删除")
             chroma_client.delete_collection(name="memories")
             logger.info("ChromaDB collection 已删除")
         except Exception as e:
@@ -2464,8 +2474,23 @@ async def purge_all_data(confirmation: dict):
 
         # 重建空 collection
         chroma_client.get_or_create_collection(name="memories")
+        chroma_client.get_or_create_collection(name="l1_memories")
         logger.info("ChromaDB collection 已重建")
 
+        # 3. 清空本地面像文件（data/profile/*.md）
+        import os as _os
+        import glob as _glob
+        try:
+            _pdir = _os.path.join(_os.environ.get('MEMORY_DATA_DIR', str(Path.home() / 'memory-system' / 'data')), 'profile')
+            if _os.path.isdir(_pdir):
+                for _f in _glob.glob(_os.path.join(_pdir, '*.md')):
+                    try:
+                        _os.remove(_f)
+                    except Exception:
+                        pass
+                logger.info(f"Profile 文件已清空: {_pdir}")
+        except Exception as e:
+            logger.warning(f"清除 profile 文件失败: {e}")
         logger.warning("所有数据已硬清除完成")
         return {"status": "ok", "message": "所有数据已清空，可以重新导入对话"}
 
