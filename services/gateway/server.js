@@ -1250,6 +1250,7 @@ ${profile}
       // 流式分支独立兜底：头已发出，出错也不能冒泡到外层 catch（会撞 headers-sent 变成空回）
       try {
         // 工具循环：内部可跑多轮，但前端只看到一条消息
+        const thinkAcc = [];
         while (maxLoops > 0) {
           result = await streamRound({
             apiUrl, apiKey, requestModel, system: systemBlocks,
@@ -1271,6 +1272,8 @@ ${profile}
           }
 
           if (result.stop_reason !== 'tool_use') break;
+          const thinkBlocks = result.content.filter(c => c.type === 'thinking');
+          if (thinkBlocks.length) thinkAcc.push(thinkBlocks.map(c => c.thinking || '').join('\n'));
           const toolUseBlocks = result.content.filter(c => c.type === 'tool_use');
           if (toolUseBlocks.length === 0) break;
 
@@ -1299,6 +1302,18 @@ ${profile}
           '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens);
         // bug修复：记住本轮真实 usage，供随后可能到来的工具回环短路时返回（否则回环 0 会覆盖显示）
         rememberUsage(computeConvId(req), totalUsage);
+        if (thinkAcc.length && result) {
+          const replyText = extractAssistantText(result) || '';
+          const thinkText = thinkAcc.join('\n\n');
+          if (thinkText.trim()) {
+            try {
+              axios.post(MEMORY_SERVICE_URL + '/thinking', {
+                conv_id: computeConvId(req), thinking: thinkText,
+                answer_ref: replyText.slice(0, 200), full_reply: replyText
+              }).catch(function() {});
+            } catch (e) {}
+          }
+        }
         emitter.finish(result ? result.stop_reason : 'end_turn', totalUsage);
       } catch (streamErr) {
         console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);

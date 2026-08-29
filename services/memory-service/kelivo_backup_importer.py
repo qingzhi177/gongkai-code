@@ -145,11 +145,11 @@ def _import_conv(mem_conn, cid, messages, thinkings, mode):
     for t in thinkings:
         dup = mem_conn.execute(
             "SELECT 1 FROM thinking_records WHERE conv_id=? AND answer_ref=? LIMIT 1",
-            (cid, t['answer_ref'])).fetchone()
+            (cid, t['answer_ref'], t.get('full_reply'))).fetchone()
         if dup:
             continue
         mem_conn.execute(
-            "INSERT INTO thinking_records (conv_id, ts, thinking, answer_ref) VALUES (?,?,?,?)",
+            "INSERT INTO thinking_records (conv_id, ts, thinking, answer_ref, full_reply) VALUES (?,?,?,?,?)",
             (cid, t['ts'] or datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S'), t['thinking'], t['answer_ref']))
         t_saved += 1
     return saved, t_saved
@@ -221,6 +221,7 @@ def import_kelivo_backup(zip_path: str, mode: str = 'skip', memory_db_path: str 
                                 thinkings.append({
                                     'thinking': thinking_text,
                                     'answer_ref': text[:200],
+                                    'full_reply': text,
                                     'ts': _iso_ts(ts),
                                 })
                         except Exception:

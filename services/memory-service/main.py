@@ -239,6 +239,11 @@ def init_db():
         except sqlite3.OperationalError:
             pass
     # 思考链独立存储：不进入 L0 正文，按会话关联
+    try:
+        c.execute("ALTER TABLE thinking_records ADD COLUMN full_reply TEXT")
+        conn.commit()
+    except Exception:
+        pass
     c.execute('''CREATE TABLE IF NOT EXISTS thinking_records (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conv_id TEXT NOT NULL,
@@ -1253,6 +1258,20 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
             return {"status": "ok", "warning": "SQLite已更新但embedding生成失败，向量未同步"}
     return {"status": "ok"}
 
+@app.get("/viz/thinkings")
+async def viz_thinkings(limit: int = 500, offset: int = 0):
+    """思维潜流可视化：思考链 + 完整回复（full_reply 回填自 L0）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, conv_id, ts, thinking, answer_ref, full_reply FROM thinking_records ORDER BY id DESC LIMIT ? OFFSET ?",
+        (limit, offset)).fetchall()
+    conn.close()
+    return {"thinkings": [
+        {"id": r[0], "conv": r[1], "ts": str(r[2] or '')[:16], "thinking": r[3],
+         "answer_ref": r[4], "full_reply": r[5]} for r in rows
+    ]}
+
 @app.delete("/l1/{memory_id}")
 async def delete_l1(memory_id: int):
     """硬删 L1 记忆：SQLite DELETE + ChromaDB delete。
@@ -2018,14 +2037,15 @@ class ThinkingRecord(BaseModel):
     conv_id: str
     thinking: str
     answer_ref: Optional[str] = None
+    full_reply: Optional[str] = None
 
 @app.post("/thinking")
 async def save_thinking(req: ThinkingRecord):
     """思考链独立存储（不进 L0 正文）：供 Kelivo 端拉取后挂载显示"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    c.execute("INSERT INTO thinking_records (conv_id, thinking, answer_ref) VALUES (?,?,?)",
-              (req.conv_id, req.thinking, req.answer_ref))
+    c.execute("INSERT INTO thinking_records (conv_id, thinking, answer_ref, full_reply) VALUES (?,?,?,?)",
+              (req.conv_id, req.thinking, req.answer_ref, req.full_reply))
     conn.commit()
     tid = c.lastrowid
     conn.close()
@@ -2037,11 +2057,11 @@ async def conversation_thinkings(cid: str, after_id: int = 0, limit: int = 100):
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     rows = c.execute(
-        "SELECT id, ts, thinking, answer_ref FROM thinking_records WHERE conv_id=? AND id>? ORDER BY id ASC LIMIT ?",
+        "SELECT id, ts, thinking, answer_ref, full_reply FROM thinking_records WHERE conv_id=? AND id>? ORDER BY id ASC LIMIT ?",
         (cid, after_id, limit)).fetchall()
     conn.close()
     return {"conv_id": cid, "next_after_id": rows[-1][0] if rows else after_id, "thinkings": [
-        {"id": r[0], "ts": r[1], "thinking": r[2], "answer_ref": r[3]} for r in rows
+        {"id": r[0], "ts": r[1], "thinking": r[2], "answer_ref": r[3], "full_reply": r[4]} for r in rows
     ]}
 
 @app.get("/conversations/{cid}/messages")
