@@ -121,12 +121,12 @@ def group_by_conv(messages):
         groups[conv_id].append(msg)
     return groups
 
-def call_deepseek(text):
+def call_deepseek(text, provider=None):
     try:
         response = httpx.post(
-            "https://api.deepseek.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}], "temperature": 0.1},
+            (provider or {}).get('base_url') or "https://api.deepseek.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {(provider or {}).get('api_key') or DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
+            json={"model": (provider or {}).get('model') or 'deepseek-chat', "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}], "temperature": 0.1},
             timeout=60.0
         )
         response.raise_for_status()
@@ -296,7 +296,7 @@ def main():
             text += f"[{prefix}] {content}\n"
             ids.append(mid)
         print(f"Processing {conv_id}: {len(msgs)} messages")
-        memories = call_deepseek(text)
+        memories = call_deepseek(text, get_extract_provider())
         if memories:
             print(f"  Extracted {len(memories)} memories")
             for memory in memories:
@@ -307,6 +307,39 @@ def main():
     print(f"[{datetime.now()}] Complete.")
     # 提取完成后检查是否需要更新 Narrative
     check_and_auto_update_narrative()
+
+def get_extract_provider():
+    """读取 providers 表 role='extract' 供应商（独立进程用），无则 None 回退 .env"""
+    try:
+        import sqlite3 as _sq
+        import json as _js
+        import os as _os
+        _db = _os.environ.get('MEMORY_DATA_DIR', _os.path.expanduser('~/memory-system/data')) + '/sqlite/memory.db'
+        if not _os.path.exists(_db):
+            return None
+        conn = _sq.connect(_db)
+        c = conn.cursor()
+        row = c.execute("SELECT id, base_url, api_key_enc, models FROM providers WHERE role='extract' ORDER BY id LIMIT 1").fetchone()
+        conn.close()
+        if not row:
+            return None
+        key = _os.environ.get('CONFIG_SECRET_KEY', '')
+        api = row[2] or ''
+        if key and api:
+            try:
+                from cryptography.fernet import Fernet
+                api = Fernet(key.encode()).decrypt(api.encode()).decode()
+            except Exception:
+                pass
+        models = []
+        try:
+            models = _js.loads(row[3] or '[]')
+        except Exception:
+            pass
+        return {'base_url': row[1], 'api_key': api, 'model': models[0] if models else None}
+    except Exception as e:
+        print(f"get_extract_provider error: {e}")
+        return None
 
 if __name__ == "__main__":
     main()

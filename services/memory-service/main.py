@@ -152,8 +152,15 @@ def init_db():
         base_url TEXT NOT NULL,
         api_key_enc TEXT DEFAULT '',
         models TEXT DEFAULT '[]',
+        role TEXT DEFAULT 'chat',
         ts DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
+    # 已有表迁移：providers.role
+    try:
+        c.execute("ALTER TABLE providers ADD COLUMN role TEXT DEFAULT 'chat'")
+        conn.commit()
+    except Exception:
+        pass
     # 当前选中的供应商 + 模型（单行，key 固定为 1）
     c.execute('''CREATE TABLE IF NOT EXISTS active_config (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -1474,7 +1481,7 @@ async def reextract_l1(memory_id: int):
     )
     # call_deepseek 内部会拼上 EXTRACT_PROMPT；这里传"对话 + 重提取说明"作为正文
     try:
-        memories = call_deepseek(convo + reextract_hint)
+        memories = call_deepseek(convo + reextract_hint, get_extract_provider())
     except Exception as e:
         conn.close()
         return JSONResponse(status_code=502, content={"status": "error", "detail": f"DeepSeek 提取失败: {e}"})
@@ -1624,7 +1631,33 @@ async def delete_l0_conversation(conv_id: str):
 
 # ============ 功能6：供应商模型配置（CRUD + 加密） ============
 
+def get_extract_provider():
+    """从 providers 表找 role='extract' 的供应商（供 L1 提取），无则 None（回退 .env）"""
+    try:
+        conn = sqlite3.connect(str(SQLITE_PATH))
+        c = conn.cursor()
+        row = c.execute(
+            "SELECT id, name, base_url, api_key_enc, models FROM providers WHERE role='extract' ORDER BY id LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        models = []
+        try:
+            models = json.loads(row[4] or '[]')
+        except Exception:
+            pass
+        return {
+            'id': row[0], 'name': row[1], 'base_url': row[2],
+            'api_key': decrypt_secret(row[3]) if row[3] else '',
+            'model': models[0] if models else None,
+        }
+    except Exception as e:
+        print(f"get_extract_provider error: {e}")
+        return None
+
 class ProviderData(BaseModel):
+    role: Optional[str] = 'chat'
     name: str
     base_url: str
     api_key: Optional[str] = None   # 明文传入；为 None 表示不修改已存的 key
@@ -1643,7 +1676,7 @@ async def list_providers():
     """列出所有供应商。api_key 脱敏为 ***，不返回明文。"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    rows = c.execute("SELECT id, name, base_url, api_key_enc, models FROM providers ORDER BY id").fetchall()
+    rows = c.execute("SELECT id, name, base_url, api_key_enc, models, role FROM providers ORDER BY id").fetchall()
     active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
     conn.close()
     providers = []
@@ -1653,6 +1686,7 @@ async def list_providers():
             "api_key": _mask_key(r[3]),
             "has_key": bool(r[3]),
             "models": json.loads(r[4] or "[]"),
+            "role": r[5],
         })
     return {
         "providers": providers,
@@ -1665,8 +1699,8 @@ async def create_provider(req: ProviderData):
     c = conn.cursor()
     enc = encrypt_secret(req.api_key) if req.api_key else ""
     c.execute(
-        "INSERT INTO providers (name, base_url, api_key_enc, models) VALUES (?, ?, ?, ?)",
-        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False)),
+        "INSERT INTO providers (name, base_url, api_key_enc, models, role) VALUES (?, ?, ?, ?, ?)",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat'),
     )
     pid = c.lastrowid
     conn.commit()
@@ -1687,8 +1721,8 @@ async def update_provider(pid: int, req: ProviderData):
     else:
         enc = row[0]
     c.execute(
-        "UPDATE providers SET name = ?, base_url = ?, api_key_enc = ?, models = ? WHERE id = ?",
-        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), pid),
+        "UPDATE providers SET name = ?, base_url = ?, api_key_enc = ?, models = ?, role = ? WHERE id = ?",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat', pid),
     )
     conn.commit()
     conn.close()
