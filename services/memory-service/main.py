@@ -2499,6 +2499,11 @@ async def purge_all_data(confirmation: dict):
             c.execute("DELETE FROM conv_settings")
         except Exception:
             pass
+        # 重置自增计数器（id 从 1 重新开始，仅影响未来生成）
+        try:
+            c.execute("DELETE FROM sqlite_sequence")
+        except Exception:
+            pass
         conn.commit()  # 先提交删除（释放事务）
         c.execute("VACUUM")  # VACUUM 必须在事务外
         conn.commit()
