@@ -1618,6 +1618,7 @@
         function loadModelConfigs() {
             fetch(API + '/config/models').then(function(r) { return r.json(); }).then(function(d) {
                 var configs = d.configs || {};
+            window.__modelConfigs = configs;
                 var purposes = [
                     {key: 'chat', label: '主聊天模型'},
                     {key: 'l1_extract', label: 'L1 记忆提取'},
@@ -1676,6 +1677,9 @@
                     modelSelect.appendChild(opt);
                 });
             }
+            // 回填已保存的模型
+            var cfg2 = (window.__modelConfigs || {})[purpose];
+            if (cfg2 && cfg2.model) modelSelect.value = cfg2.model;
         }
 
         function saveModelConfig(purpose) {
