@@ -393,7 +393,7 @@ async def search_memories(req: SearchRequest):
     try:
         if req.mode == "exact":
             # FTS5 逐字检索
-            conn = sqlite3.connect(str(SQLITE_PATH))
+            conn = sqlite3.connect(str(SQLITE_PATH), timeout=30)
             c = conn.cursor()
             c.execute(
                 "SELECT id, content, quote, event_type, tags, ts, client, valence, arousal FROM l1_memories WHERE status='active' AND content LIKE ?",
@@ -2458,7 +2458,8 @@ async def purge_all_data(confirmation: dict):
             c.execute("DELETE FROM conv_settings")
         except Exception:
             pass
-        c.execute("VACUUM")
+        conn.commit()  # 先提交删除（释放事务）
+        c.execute("VACUUM")  # VACUUM 必须在事务外
         conn.commit()
         conn.close()
         logger.info("SQLite 数据库已清空")
@@ -2495,6 +2496,10 @@ async def purge_all_data(confirmation: dict):
         return {"status": "ok", "message": "所有数据已清空，可以重新导入对话"}
 
     except Exception as e:
+        try:
+            conn.close()
+        except Exception:
+            pass
         logger.error(f"硬清除失败: {e}", exc_info=True)
         return {"status": "error", "message": str(e)}
 
