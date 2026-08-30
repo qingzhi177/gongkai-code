@@ -124,19 +124,40 @@ def group_by_conv(messages):
 def call_deepseek(text, provider=None):
     try:
         raw_url = (provider or {}).get('base_url')
-        if raw_url:
-            base = raw_url.rstrip('/')
-            url = base if base.endswith('/chat/completions') else base + '/chat/completions'
+        fmt = (provider or {}).get('api_format') or 'openai'
+        api_key = (provider or {}).get('api_key') or DEEPSEEK_API_KEY
+        model = (provider or {}).get('model') or 'deepseek-chat'
+        content = None
+        if fmt == 'anthropic':
+            # Anthropic Messages 协议
+            base = (raw_url or "https://api.anthropic.com/v1").rstrip('/')
+            url = base if base.endswith('/messages') else (base + '/messages')
+            resp = httpx.post(
+                url,
+                headers={"x-api-key": api_key, "Authorization": f"Bearer {api_key}",
+                         "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                json={"model": model, "max_tokens": 4096,
+                      "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}]},
+                timeout=120.0
+            )
+            resp.raise_for_status()
+            blocks = resp.json().get("content", [])
+            content = "\n".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
         else:
-            url = "https://api.deepseek.com/v1/chat/completions"
-        response = httpx.post(
-            url,
-            headers={"Authorization": f"Bearer {(provider or {}).get('api_key') or DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
-            json={"model": (provider or {}).get('model') or 'deepseek-chat', "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}], "temperature": 0.1},
-            timeout=60.0
-        )
-        response.raise_for_status()
-        content = response.json()["choices"][0]["message"]["content"].strip()
+            # OpenAI 兼容协议
+            if raw_url:
+                base = raw_url.rstrip('/')
+                url = base if base.endswith('/chat/completions') else base + '/chat/completions'
+            else:
+                url = "https://api.deepseek.com/v1/chat/completions"
+            resp = httpx.post(
+                url,
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}], "temperature": 0.1},
+                timeout=60.0
+            )
+            resp.raise_for_status()
+            content = resp.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0]
         return json.loads(content)
@@ -330,7 +351,7 @@ def resolve_purpose(purpose):
         if not row:
             conn.close()
             return None
-        prov = c.execute("SELECT base_url, api_key_enc FROM providers WHERE id=?", (row[0],)).fetchone()
+        prov = c.execute("SELECT base_url, api_key_enc, api_format FROM providers WHERE id=?", (row[0],)).fetchone()
         conn.close()
         if not prov:
             return None
@@ -342,7 +363,7 @@ def resolve_purpose(purpose):
                 api = Fernet(key.encode()).decrypt(api.encode()).decode()
             except Exception:
                 pass
-        return {'base_url': prov[0], 'api_key': api, 'model': row[1]}
+        return {'base_url': prov[0], 'api_key': api, 'model': row[1], 'api_format': prov[2] or 'openai'}
     except Exception as e:
         print(f"resolve_purpose error: {e}")
         return None

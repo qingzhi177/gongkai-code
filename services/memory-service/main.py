@@ -153,11 +153,17 @@ def init_db():
         api_key_enc TEXT DEFAULT '',
         models TEXT DEFAULT '[]',
         role TEXT DEFAULT 'chat',
+        api_format TEXT DEFAULT 'openai',
         ts DATETIME DEFAULT CURRENT_TIMESTAMP
     )''')
     # 已有表迁移：providers.role
     try:
         c.execute("ALTER TABLE providers ADD COLUMN role TEXT DEFAULT 'chat'")
+        conn.commit()
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE providers ADD COLUMN api_format TEXT DEFAULT 'openai'")
         conn.commit()
     except Exception:
         pass
@@ -1659,6 +1665,7 @@ def get_extract_provider():
 
 class ProviderData(BaseModel):
     role: Optional[str] = 'chat'
+    api_format: Optional[str] = 'openai'
     name: str
     base_url: str
     api_key: Optional[str] = None   # 明文传入；为 None 表示不修改已存的 key
@@ -1677,7 +1684,7 @@ async def list_providers():
     """列出所有供应商。api_key 脱敏为 ***，不返回明文。"""
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
-    rows = c.execute("SELECT id, name, base_url, api_key_enc, models, role FROM providers ORDER BY id").fetchall()
+    rows = c.execute("SELECT id, name, base_url, api_key_enc, models, role, api_format FROM providers ORDER BY id").fetchall()
     active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
     conn.close()
     providers = []
@@ -1688,6 +1695,7 @@ async def list_providers():
             "has_key": bool(r[3]),
             "models": json.loads(r[4] or "[]"),
             "role": r[5],
+            "api_format": r[6],
         })
     return {
         "providers": providers,
@@ -1700,8 +1708,8 @@ async def create_provider(req: ProviderData):
     c = conn.cursor()
     enc = encrypt_secret(req.api_key) if req.api_key else ""
     c.execute(
-        "INSERT INTO providers (name, base_url, api_key_enc, models, role) VALUES (?, ?, ?, ?, ?)",
-        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat'),
+        "INSERT INTO providers (name, base_url, api_key_enc, models, role, api_format) VALUES (?, ?, ?, ?, ?, ?)",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat', req.api_format or 'openai'),
     )
     pid = c.lastrowid
     conn.commit()
@@ -1722,8 +1730,8 @@ async def update_provider(pid: int, req: ProviderData):
     else:
         enc = row[0]
     c.execute(
-        "UPDATE providers SET name = ?, base_url = ?, api_key_enc = ?, models = ?, role = ? WHERE id = ?",
-        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat', pid),
+        "UPDATE providers SET name = ?, base_url = ?, api_key_enc = ?, models = ?, role = ?, api_format = ? WHERE id = ?",
+        (req.name, req.base_url, enc, json.dumps(req.models, ensure_ascii=False), req.role or 'chat', req.api_format or 'openai', pid),
     )
     conn.commit()
     conn.close()
@@ -2674,21 +2682,19 @@ async def get_model_config(purpose: str):
 
     # 查供应商信息
     provider = c.execute(
-        "SELECT name, base_url, api_key_enc FROM providers WHERE id=?",
+        "SELECT name, base_url, api_key_enc, api_format FROM providers WHERE id=?",
         (config[0],)
     ).fetchone()
-
     conn.close()
-
     if not provider:
         return {"configured": False}
-
     return {
         "configured": True,
         "provider_name": provider[0],
         "base_url": provider[1],
         "api_key": decrypt_secret(provider[2]),
-        "model": config[1]
+        "model": config[1],
+        "api_format": provider[3] or 'openai'
     }
 
 @app.get("/config/models")
