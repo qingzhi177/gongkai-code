@@ -2833,48 +2833,72 @@ async def build_narrative_prompt(existing_narrative: str, new_memories: list) ->
     return {"system": system_prompt, "user": user_message}
 
 async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
-    """调用 LLM 生成 Narrative（system+user 两段式）"""
+    """调用 LLM 生成 Narrative（system+user 两段式），支持多轮续写（输出上限截断时自动继续）"""
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # claude 系列走 Anthropic 原生 /messages
-            if config['model'].startswith("claude"):
-                response = await client.post(
-                    f"{config['base_url']}/messages",
-                    headers={
-                        "x-api-key": config['api_key'],
-                        "Authorization": f"Bearer {config['api_key']}",
-                        "anthropic-version": "2023-06-01",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": config['model'],
-                        "system": prompt_parts["system"],
-                        "messages": [{"role": "user", "content": prompt_parts["user"]}],
-                        "max_tokens": 8000
-                    }
-                )
-                response.raise_for_status()
-                content = response.json().get("content", [])
-                return content[0].get("text", "") if content else ""
+            is_claude = (config['model'].startswith("claude")
+                         or "anthropic/" in config['model']
+                         or "claude-" in config['model']
+                         or "claude." in config['model'])
+            if is_claude:
+                system_text = prompt_parts["system"]
+                user_text = prompt_parts["user"]
+                full = ""
+                for _round in range(6):
+                    response = await client.post(
+                        f"{config['base_url']}/messages",
+                        headers={
+                            "x-api-key": config['api_key'],
+                            "Authorization": f"Bearer {config['api_key']}",
+                            "anthropic-version": "2023-06-01",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": config['model'],
+                            "system": system_text,
+                            "messages": [{"role": "user", "content": user_text}],
+                            "max_tokens": 8000
+                        }
+                    )
+                    response.raise_for_status()
+                    data = response.json()
+                    content = data.get("content", [])
+                    part_text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
+                    full += part_text
+                    if data.get("stop_reason") not in ("max_tokens", "long_context", "length"):
+                        break
+                    # 到输出上限 → 续写
+                    user_text = "请接着上一段继续写完整的叙事（不要重复，直接续写，保持语气与结构一致）："
+                return full
             else:
-                # 其他模型走 /chat/completions
-                response = await client.post(
-                    f"{config['base_url']}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {config['api_key']}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": config['model'],
-                        "messages": [
-                            {"role": "system", "content": prompt_parts["system"]},
-                            {"role": "user", "content": prompt_parts["user"]}
-                        ],
-                        "max_tokens": 4000
-                    }
-                )
-                response.raise_for_status()
-                return response.json()["choices"][0]["message"]["content"]
+                # 其他模型走 /chat/completions（含多轮续写）
+                full2 = ""
+                user_text2 = prompt_parts["user"]
+                for _round in range(6):
+                    response = await client.post(
+                        f"{config['base_url']}/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {config['api_key']}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": config['model'],
+                            "messages": [
+                                {"role": "system", "content": prompt_parts["system"]},
+                                {"role": "user", "content": user_text2}
+                            ],
+                            "max_tokens": 8000
+                        }
+                    )
+                    response.raise_for_status()
+                    data2 = response.json()
+                    msg = data2["choices"][0]["message"]
+                    full2 += msg.get("content") or ""
+                    fr = data2["choices"][0].get("finish_reason")
+                    if fr != "length" and str(fr) != "max_tokens":
+                        break
+                    user_text2 = "请接着上一段继续写完整的叙事（不要重复，直接续写，保持语气与结构一致）："
+                return full2
     except Exception as e:
         logger.error(f"LLM call error in narrative generation: {e}")
         return None
