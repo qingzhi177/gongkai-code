@@ -1884,8 +1884,42 @@ class NarrativeGenerateRequest(BaseModel):
 # 本次实际消费的最大 id），避免一次生成 prompt 过长。
 NARRATIVE_BATCH_LIMIT = 60
 
+_narr_job = {'running': False, 'result': None, 'error': None, 'started_at': None}
+
 @app.post("/narrative/generate")
 async def generate_narrative(req: NarrativeGenerateRequest):
+    """异步生成/增量演化 Shared Narrative（避免长 LLM 调用被网关/CF 超时掐断）"""
+    if _narr_job['running']:
+        return {"status": "running", "message": "已有生成任务进行中"}
+    _narr_job['running'] = True
+    _narr_job['result'] = None
+    _narr_job['error'] = None
+    _narr_job['started_at'] = datetime.now().isoformat()
+    import asyncio
+    asyncio.create_task(_run_narrative_job(req))
+    return {"status": "started", "message": "生成任务已启动，请轮询 /narrative/status"}
+
+async def _run_narrative_job(req):
+    try:
+        result = await _do_narrative(req)
+        _narr_job['result'] = result
+    except Exception as e:
+        _narr_job['error'] = str(e)
+        logger.error(f"narrative job error: {e}")
+    finally:
+        _narr_job['running'] = False
+
+@app.get("/narrative/status")
+async def narrative_status():
+    """生成任务状态（前端轮询用）"""
+    return {
+        "running": _narr_job['running'],
+        "result": _narr_job['result'],
+        "error": _narr_job['error'],
+        "started_at": _narr_job['started_at'],
+    }
+
+async def _do_narrative(req: NarrativeGenerateRequest):
     """生成/增量演化 Shared Narrative。
 
     更新检查周期.md：existing narrative + new important memories = updated
@@ -2816,7 +2850,7 @@ async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
                         "model": config['model'],
                         "system": prompt_parts["system"],
                         "messages": [{"role": "user", "content": prompt_parts["user"]}],
-                        "max_tokens": 4000
+                        "max_tokens": 8000
                     }
                 )
                 response.raise_for_status()

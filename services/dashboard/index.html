@@ -340,6 +340,7 @@
             </div>
             <div style="margin-bottom:15px;">
                 <button class="btn" onclick="generateNarrative()">生成/更新叙事</button>
+                <button class="btn" onclick="generateNarrative(true)" style="background:#8e6bb8;color:#fff;">♻️ 强制重新生成（全量重写）</button>
                 <button class="btn" onclick="editNarrative()" style="background:#28a745;">编辑</button>
                 <button class="btn" onclick="loadNarrativeHistory()" style="background:#6c757d;">查看历史</button>
                 <button class="btn" onclick="showNarrativeTimeline()" style="background:#6f42c1;">时间线</button>
@@ -1288,37 +1289,61 @@
             loadNarrative(); // 重新加载原始文本
         }
 
-        function generateNarrative() {
+        function generateNarrative(force) {
             var status = document.getElementById('narrative-status');
-            status.textContent = '🔄 正在调用 LLM 生成叙事（预计 30-90 秒）...';
+            status.textContent = '🔄 正在启动生成任务...';
             status.style.color = '#666';
             status.style.fontWeight = 'bold';
 
-            var startTime = Date.now();
-            var timerInterval = setInterval(function() {
-                var elapsed = Math.floor((Date.now() - startTime) / 1000);
-                status.textContent = '🔄 生成中... ' + elapsed + 's（LLM 推理中，请稍候）';
-            }, 1000);
+            var startedAt = null;
+            var pollTimer = null;
+            var tickTimer = null;
+
+            function pollStatus() {
+                fetch(API + '/narrative/status').then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.running) {
+                        var secs = startedAt ? Math.floor((Date.now() - startedAt) / 1000) : 0;
+                        status.textContent = '🔄 生成中... ' + secs + 's（LLM 推理中，请稍候）';
+                        return;
+                    }
+                    if (pollTimer) clearInterval(pollTimer);
+                    if (tickTimer) clearInterval(tickTimer);
+                    var r2 = d.result;
+                    if (r2 && r2.status === 'ok') {
+                        status.textContent = '✅ 生成成功！';
+                        status.style.color = '#28a745';
+                        loadNarrative();
+                        loadPipeline(true);
+                        setTimeout(function() { status.textContent = ''; }, 3000);
+                    } else if (r2 && r2.status === 'skipped') {
+                        status.textContent = 'ℹ️ ' + (r2.message || '没有新增重要记忆，无需更新');
+                        status.style.color = '#666';
+                    } else if (d.error) {
+                        status.textContent = '❌ 生成失败：' + d.error;
+                        status.style.color = '#dc3545';
+                    } else {
+                        status.textContent = '❌ 失败：' + ((r2 && r2.message) || '未知');
+                        status.style.color = '#dc3545';
+                    }
+                }).catch(function() { /* 轮询容错 */ });
+            }
 
             fetch(API + '/narrative/generate', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({trigger_type: 'manual', reason: 'Dashboard 手动触发'})
+                body: JSON.stringify({trigger_type: 'manual', reason: 'Dashboard 手动触发', force: !!force})
             })
             .then(function(r) { return r.json(); })
             .then(function(d) {
-                clearInterval(timerInterval);
-                var elapsed = Math.floor((Date.now() - startTime) / 1000);
-
-                if (d.status === 'ok') {
-                    status.textContent = '✅ 生成成功！（耗时 ' + elapsed + 's）';
-                    status.style.color = '#28a745';
-                    status.style.fontWeight = 'normal';
-                    setTimeout(function() {
-                        loadNarrative();
-                        loadPipeline(true); // 强制刷新 Pipeline 缓存
-                        status.textContent = '';
-                    }, 2000);
+                if (d.status === 'started' || d.status === 'running') {
+                    startedAt = Date.now();
+                    status.textContent = '🔄 生成中... 0s（LLM 推理中，请稍候）';
+                    pollTimer = setInterval(pollStatus, 2000);
+                    tickTimer = setInterval(function() {
+                        if (!startedAt) return;
+                        var secs = Math.floor((Date.now() - startedAt) / 1000);
+                        status.textContent = '🔄 生成中... ' + secs + 's（LLM 推理中，请稍候）';
+                    }, 1000);
                 } else if (d.status === 'skipped') {
                     status.textContent = 'ℹ️ ' + (d.message || '没有新增重要记忆，无需更新');
                     status.style.color = '#666';
@@ -1330,7 +1355,6 @@
                 }
             })
             .catch(function(e) {
-                clearInterval(timerInterval);
                 status.textContent = '❌ 请求失败：' + e.message;
                 status.style.color = '#dc3545';
                 status.style.fontWeight = 'normal';
