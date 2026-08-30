@@ -1179,6 +1179,116 @@ async def save_profile(req: ProfileData):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+_profile_job = {'running': False, 'result': None, 'error': None, 'started_at': None}
+
+@app.post("/profile/rebuild")
+async def profile_rebuild():
+    """基于 L0 全部原文分批提炼 → 汇总 → 重建三节画像（异步，防超时）"""
+    global _profile_job
+    if _profile_job['running']:
+        return {"status": "running", "message": "已有重建任务进行中"}
+    _profile_job['running'] = True
+    _profile_job['result'] = None
+    _profile_job['error'] = None
+    _profile_job['started_at'] = datetime.now().isoformat()
+    import asyncio
+    asyncio.create_task(_run_profile_job())
+    return {"status": "started", "message": "画像重建已启动，请轮询 /profile/rebuild/status"}
+
+async def _run_profile_job():
+    try:
+        result = await _do_profile_rebuild()
+        _profile_job['result'] = result
+    except Exception as e:
+        _profile_job['error'] = str(e)
+        logger.error(f"profile rebuild error: {e}")
+    finally:
+        _profile_job['running'] = False
+
+@app.get("/profile/rebuild/status")
+async def profile_rebuild_status():
+    return {
+        "running": _profile_job['running'],
+        "result": _profile_job['result'],
+        "error": _profile_job['error'],
+        "started_at": _profile_job['started_at'],
+    }
+
+async def _do_profile_rebuild():
+    # 1. 读全部 L0 原文
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    rows = c.execute(
+        "SELECT id, role, content FROM l0_messages WHERE status='active' ORDER BY id ASC"
+    ).fetchall()
+    conn.close()
+    if not rows:
+        return {"status": "error", "message": "L0 无原文，无法重建画像"}
+    # 2. 模型配置（复用 narrative 配置的 LLM）
+    config = await get_model_config("narrative")
+    if not config.get("configured"):
+        return {"status": "error", "message": "Narrative 模型未配置（请先在模块模型配置中设置）"}
+    # 3. 分批提炼要点
+    batch_size = 250
+    points = []
+    for i in range(0, len(rows), batch_size):
+        chunk = rows[i:i + batch_size]
+        text = "\n".join(
+            f"[{'她' if r[1] == 'user' else '我'}] {str(r[2] or '')[:400]}" for r in chunk
+        )
+        prompt = (
+            "以下是一段我们之间的对话记录（节选）。请提炼关于「她」以及她与我关系的重要信息点："
+            "性格、称呼、偏好、习惯、重要事件（尽量带日期）、互动模式、她说过的话中的关键片段。"
+            "每条一行要点，保留独特细节，不要泛泛而谈：\n\n" + text
+        )
+        out = await call_llm(config, prompt, 2500)
+        if out:
+            points.append(out)
+    all_points = "\n\n".join(points)
+    # 5. 汇总生成画像（三节）
+    final_prompt = (
+        "根据以下从我们完整对话中提炼的全部要点，写一份「画像」文档（Markdown），包含三节：\n"
+        "## 关于她      ## 关于我们      ## 关于我\n"
+        "要求：具体（保留称呼、日期、独特细节），温暖自然，只依据要点，不要编造没有提及的信息。\n\n"
+        + all_points
+    )
+    final = None
+    for _try in range(3):
+        final = await call_llm(config, final_prompt, 4000)
+        if final:
+            break
+        import asyncio as _aio
+        await _aio.sleep(12)
+    if not final or len(final.strip()) < 50:
+        return {"status": "error", "message": "画像生成失败（LLM 返回为空，请稍后重试或检查 OpenRouter 额度）"}
+    # 5. 按节拆分写文件（未匹配的兜底整段）
+    import re as _re
+    def _sec(content, title):
+        m = _re.search(rf"##\s*{title}[\s\S]*?(?=\n##\s|\Z)", content)
+        return m.group(0).strip() if m else ""
+    u = _sec(final, "关于她")
+    us = _sec(final, "关于我们")
+    ai = _sec(final, "关于我")
+    if not u and not us and not ai:
+        u, us, ai = final, "", ""
+    profile_dir = DATA_DIR / "profile"
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d%H%M%S")
+    for name in ("about_user.md", "about_us.md", "about_ai.md"):
+        f = profile_dir / name
+        if f.exists():
+            f.rename(profile_dir / f"{name}.bak_{ts}")
+    (profile_dir / "about_user.md").write_text(u, encoding="utf-8")
+    (profile_dir / "about_us.md").write_text(us, encoding="utf-8")
+    (profile_dir / "about_ai.md").write_text(ai, encoding="utf-8")
+    return {
+        "status": "ok",
+        "batches": len(points),
+        "l0_total": len(rows),
+        "chars": len(final),
+        "sections": {"user": len(u), "us": len(us), "ai": len(ai)},
+    }
+
 @app.get("/l0/messages")
 async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offset: int = 0):
     """浏览 L0 原文"""

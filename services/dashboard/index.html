@@ -194,8 +194,10 @@
             <div class="section"><h3>关于用户</h3><textarea id="profile-user"></textarea></div>
             <div class="section"><h3>关于AI</h3><textarea id="profile-ai"></textarea></div>
             <div class="section"><h3>关于我们</h3><textarea id="profile-us"></textarea></div>
-            <button class="btn" onclick="saveProfile()">保存</button>
-            <span id="profile-status"></span>
+             <button class="btn" onclick="saveProfile()">保存</button>
+             <button class="btn" onclick="rebuildProfile()" style="background:#8e6bb8;color:#fff;">🔄 基于全部对话重建画像</button>
+             <span id="profile-status"></span>
+             <div style="margin-top:8px;font-size:11px;color:#888;">重建会读取 L0 全部原文分批提炼后重写三节画像（旧版自动备份为 .bak_时间戳）。</div>
         </div>
 
         <div id="custom_prompt" class="panel">
@@ -798,6 +800,48 @@
                     loadL1('all');
                 })
                 .catch(function(e) { alert('重提取失败：' + e); });
+        }
+
+function rebuildProfile() {
+            var status = document.getElementById('profile-status');
+            status.textContent = '🔄 启动画像重建（后台任务）...';
+            status.style.color = '#666';
+            fetch(API + '/profile/rebuild', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}'})
+            .then(function(r) { return r.json(); })
+            .then(function(d) {
+                if (d.status === 'started' || d.status === 'running') {
+                    var t0 = Date.now();
+                    status.textContent = '🔄 重建中... 0s';
+                    var poll = setInterval(function() {
+                        fetch(API + '/profile/rebuild/status').then(function(r) { return r.json(); }).then(function(s) {
+                            if (s.running) {
+                                status.textContent = '🔄 重建中... ' + Math.floor((Date.now() - t0) / 1000) + 's（分批提炼+生成中）';
+                                return;
+                            }
+                            clearInterval(poll);
+                            var r2 = s.result;
+                            if (r2 && r2.status === 'ok') {
+                                status.textContent = '✅ 画像重建完成！（' + r2.batches + ' 批 · ' + r2.chars + ' 字）';
+                                status.style.color = '#28a745';
+                                loadProfile();
+                            } else if (s.error) {
+                                status.textContent = '❌ ' + s.error;
+                                status.style.color = '#dc3545';
+                            } else {
+                                status.textContent = '❌ ' + ((r2 && r2.message) || '失败');
+                                status.style.color = '#dc3545';
+                            }
+                        });
+                    }, 2000);
+                } else {
+                    status.textContent = '❌ ' + (d.message || '启动失败');
+                    status.style.color = '#dc3545';
+                }
+            })
+            .catch(function(e) {
+                status.textContent = '❌ 请求失败：' + e.message;
+                status.style.color = '#dc3545';
+            });
         }
 
         function loadProfile() {
