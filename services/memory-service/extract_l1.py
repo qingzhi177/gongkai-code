@@ -123,8 +123,14 @@ def group_by_conv(messages):
 
 def call_deepseek(text, provider=None):
     try:
+        raw_url = (provider or {}).get('base_url')
+        if raw_url:
+            base = raw_url.rstrip('/')
+            url = base if base.endswith('/chat/completions') else base + '/chat/completions'
+        else:
+            url = "https://api.deepseek.com/v1/chat/completions"
         response = httpx.post(
-            (provider or {}).get('base_url') or "https://api.deepseek.com/v1/chat/completions",
+            url,
             headers={"Authorization": f"Bearer {(provider or {}).get('api_key') or DEEPSEEK_API_KEY}", "Content-Type": "application/json"},
             json={"model": (provider or {}).get('model') or 'deepseek-chat', "messages": [{"role": "user", "content": EXTRACT_PROMPT + text}], "temperature": 0.1},
             timeout=60.0
