@@ -2808,6 +2808,7 @@ async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
                     f"{config['base_url']}/messages",
                     headers={
                         "x-api-key": config['api_key'],
+                        "Authorization": f"Bearer {config['api_key']}",
                         "anthropic-version": "2023-06-01",
                         "Content-Type": "application/json"
                     },
@@ -2854,6 +2855,7 @@ async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
                     f"{config['base_url']}/messages",
                     headers={
                         "x-api-key": config['api_key'],
+                        "Authorization": f"Bearer {config['api_key']}",
                         "anthropic-version": "2023-06-01",
                         "Content-Type": "application/json"
                     },
