@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
+import difflib
 
 load_dotenv()
 
@@ -319,11 +320,15 @@ async def get_embedding(text):
         return None
 
 def get_l0_context(sqlite_path, l1_id_str):
-    """根据 L1 ID 查找对应的 L0 上下文"""
+    """根据 L1 ID 查找对应的 L0 上下文
+
+    Bug4 修复：source_msg_id 是 l0_messages.id（主键），不是 msg_idx。
+    先用 source_id 查出对应行的 msg_idx，再用 msg_idx 做区间查询。
+    """
     try:
         conn = sqlite3.connect(str(sqlite_path))
         c = conn.cursor()
-        # 先找这条 L1 对应的 conv_id
+        # 先找这条 L1 对应的 conv_id 和 source_msg_id（l0_messages.id）
         c.execute('SELECT source_msg_id, conv_id FROM l1_memories WHERE id=?', (l1_id_str,))
         row = c.fetchone()
         if not row:
@@ -333,16 +338,24 @@ def get_l0_context(sqlite_path, l1_id_str):
         if not conv_id:
             conn.close()
             return ""
-        # 用 conv_id 查找上下文（source_msg_id 前后各2条）
+
+        # Bug4 修复：用 source_id（l0_messages.id）查出对应的 msg_idx，再做区间查询
         if source_id:
-            c.execute(
-                'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? AND msg_idx BETWEEN ? AND ? ORDER BY msg_idx ASC',
-                (conv_id, 'active', max(0, source_id - 3), source_id + 1)
-            )
+            anchor_row = c.execute(
+                'SELECT msg_idx FROM l0_messages WHERE id=?', (source_id,)
+            ).fetchone()
+            if anchor_row:
+                anchor_idx = anchor_row[0]
+                c.execute(
+                    'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? AND msg_idx BETWEEN ? AND ? ORDER BY msg_idx ASC',
+                    (conv_id, 'active', max(0, anchor_idx - 3), anchor_idx + 1)
+                )
+            else:
+                rows = []
         else:
             # 没有 source_msg_id，取对话的前5条
             c.execute(
-                'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC LIMIT5',
+                'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC LIMIT 5',
                 (conv_id, 'active')
             )
         rows = c.fetchall()
@@ -777,12 +790,90 @@ def _cascade_l1_on_version_switch(c, conv_id, superseded_old_ids):
     return l1_ids_to_purge
 
 
+def _cmp_key(role, content):
+    """生成用于序列对齐比较的键，与内容级去重保持一致：忽略换行差异"""
+    return role + "\x00" + re.sub(r'[\r\n]', '', content or '')
+
+def _merge_l0_sequence(c, conv_id, client, messages):
+    """把本轮 Kelivo 窗口消息（已去重、去 group_id 的那部分）与数据库里已有的
+    active 消息做整体序列对齐，而不是按数组下标做一一匹配。
+
+    使用 difflib.SequenceMatcher 识别：
+    - equal: 内容和相对位置都对得上，不做任何操作
+    - delete: 只存在于旧序列，大概率是窗口没带到，原样保留
+    - replace: 同一相对位置内容变了，视为编辑/版本替换
+    - insert: 只存在于新序列，是真正的新消息
+
+    返回 (saved_count, superseded_old_ids)
+    """
+    # 1) 取出数据库里现有的 active、无 group_id 的行，按现有顺序排好
+    rows = c.execute(
+        "SELECT id, msg_idx, role, content, extracted FROM l0_messages "
+        "WHERE conv_id=? AND status='active' AND (group_id IS NULL OR group_id='') "
+        "ORDER BY msg_idx ASC, id ASC",
+        (conv_id,)
+    ).fetchall()
+
+    old_ids = [r[0] for r in rows]
+    old_keys = [_cmp_key(r[2], r[3]) for r in rows]
+    old_extracted = {r[0]: r[4] for r in rows}
+
+    new_keys = [_cmp_key(m["role"], m["content"]) for m in messages]
+
+    sm = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
+    saved = 0
+    superseded_old_ids = []
+
+    # 构建合并后的最终顺序（id 列表）
+    final_order = []
+
+    for tag, a1, a2, b1, b2 in sm.get_opcodes():
+        if tag == 'equal':
+            # 内容和相对位置都对得上，保留旧行
+            final_order.extend(old_ids[a1:a2])
+        elif tag == 'delete':
+            # 只存在于旧序列：大概率是这次窗口没带到，不是真的被删，原样保留
+            final_order.extend(old_ids[a1:a2])
+        elif tag == 'replace':
+            # 同一相对位置内容变了：视为编辑/重新生成，旧的作废
+            for oid in old_ids[a1:a2]:
+                c.execute("UPDATE l0_messages SET status='superseded' WHERE id=?", (oid,))
+                if old_extracted.get(oid) == 1:
+                    superseded_old_ids.append(oid)
+            # 插入新消息
+            for m in messages[b1:b2]:
+                c.execute(
+                    'INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) '
+                    'VALUES (?,?,?,?,?,?,?)',
+                    (conv_id, -1, m["role"], m["content"], client, 'active', 0))
+                final_order.append(c.lastrowid)
+                saved += 1
+        elif tag == 'insert':
+            # 只存在于新序列：真正的新消息（不管它在这次窗口里下标是大是小）
+            for m in messages[b1:b2]:
+                c.execute(
+                    'INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) '
+                    'VALUES (?,?,?,?,?,?,?)',
+                    (conv_id, -1, m["role"], m["content"], client, 'active', 0))
+                final_order.append(c.lastrowid)
+                saved += 1
+
+    # 2) 按 final_order 重排 msg_idx，让它保持 0,1,2... 连续且反映真实对话顺序
+    for new_idx, row_id in enumerate(final_order):
+        c.execute("UPDATE l0_messages SET msg_idx=? WHERE id=?", (new_idx, row_id))
+
+    return saved, superseded_old_ids
+
 @app.post("/save_conversation")
 async def save_conversation(req: SaveRequest):
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     saved = 0
     superseded_old_ids = []   # 修复7：本轮因版本切换被 superseded 的旧 L0 id（含其 extracted 标志）
+
+    # Bug4 修复：收集没有 group_id 且没被内容级去重命中的消息，最后统一做序列对齐
+    no_group_messages = []
+
     try:
         for idx, msg in enumerate(req.messages):
             role = msg.get("role", "")
@@ -829,19 +920,17 @@ async def save_conversation(req: SaveRequest):
                 c.execute("UPDATE l0_messages SET group_anchor=? WHERE id=?", (nid, nid))
                 saved += 1
                 continue
-            c.execute('SELECT id, content, extracted FROM l0_messages WHERE conv_id=? AND msg_idx=? AND status=?',
-                      (req.conv_id, idx, 'active'))
-            existing = c.fetchone()
-            if existing:
-                if existing[1] == content:
-                    continue
-                c.execute('UPDATE l0_messages SET status=? WHERE id=?', ('superseded', existing[0]))
-                # 修复7：只有已提取过 L1 的旧消息才需要联动清理（extracted=1）
-                if existing[2] == 1:
-                    superseded_old_ids.append(existing[0])
-            c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) VALUES (?,?,?,?,?,?,?)',
-                      (req.conv_id, idx, role, content, req.client, 'active', 0))
-            saved += 1
+
+            # Bug4 修复：没有 group_id 的消息先收集，不再逐条按 idx 匹配
+            no_group_messages.append({"role": role, "content": content})
+
+        # Bug4 修复：统一处理没有 group_id 的消息（序列对齐）
+        if no_group_messages:
+            merge_saved, merge_superseded = _merge_l0_sequence(
+                c, req.conv_id, req.client, no_group_messages
+            )
+            saved += merge_saved
+            superseded_old_ids.extend(merge_superseded)
 
         # 修复7：L0 版本切换联动 L1（批次级）。
         # source_msg_id 是「该次 cron 提取批次首条消息的 id」，同批多条 L1 共享它，
@@ -1291,15 +1380,20 @@ async def _do_profile_rebuild():
 
 @app.get("/l0/messages")
 async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offset: int = 0):
-    """浏览 L0 原文"""
+    """浏览 L0 原文
+
+    Bug4 修复：conv_id 指定时按 msg_idx 排序（反映真实对话顺序），
+    而不是按 id 排序（只反映写入数据库的先后）。
+    """
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     if conv_id:
         c.execute(
-            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY id ASC LIMIT ? OFFSET ?',
+            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC, id ASC LIMIT ? OFFSET ?',
             (conv_id, 'active', limit, offset)
         )
     else:
+        # 全局列表按 ts DESC（最近活跃对话），不改动
         c.execute(
             'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE status=? ORDER BY ts DESC LIMIT ? OFFSET ?',
             ('active', limit, offset)
