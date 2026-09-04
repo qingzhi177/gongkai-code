@@ -1517,13 +1517,13 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     c = conn.cursor()
     if conv_id:
         c.execute(
-            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC, id ASC LIMIT ? OFFSET ?',
+            'SELECT id, msg_idx, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE conv_id=? AND status=? ORDER BY msg_idx ASC, id ASC LIMIT ? OFFSET ?',
             (conv_id, 'active', limit, offset)
         )
     else:
         # 全局列表按 ts DESC（最近活跃对话），不改动
         c.execute(
-            'SELECT id, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE status=? ORDER BY ts DESC LIMIT ? OFFSET ?',
+            'SELECT id, msg_idx, conv_id, role, content, ts, source, client, status FROM l0_messages WHERE status=? ORDER BY ts DESC LIMIT ? OFFSET ?',
             ('active', limit, offset)
         )
     rows = c.fetchall()
@@ -1533,9 +1533,9 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     messages = []
     for row in rows:
         messages.append({
-            "id": row[0], "conv_id": row[1], "role": row[2],
-            "content": row[3], "ts": row[4], "source": row[5],
-            "client": row[6], "status": row[7]
+            "id": row[0], "msg_idx": row[1], "conv_id": row[2], "role": row[3],
+            "content": row[4], "ts": row[5], "source": row[6],
+            "client": row[7], "status": row[8]
         })
     return {"messages": messages, "total": total}
 
