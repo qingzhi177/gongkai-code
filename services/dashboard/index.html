@@ -496,6 +496,42 @@
                     <button onclick="doImportFeel()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">导入 feel</button>
                     <span id="feel-status" style="margin-left:8px;font-size:12px;"></span>
                 </div>
+
+                <h4 style="margin-top:20px;">L1 记忆导出 / 导入</h4>
+                <div style="margin-bottom:12px;">
+                    <div style="font-size:12px;color:#666;margin-bottom:8px;">
+                        导出模式：
+                        <label style="margin-left:8px;"><input type="radio" name="l1-export-mode" value="full" checked> 完整版（带L0上下文，支持智能重映射）</label>
+                        <label style="margin-left:12px;"><input type="radio" name="l1-export-mode" value="simple"> 简化版（只L1内容，不保留关联）</label>
+                    </div>
+                    <div style="font-size:12px;color:#666;margin-bottom:8px;">
+                        筛选：
+                        <label style="margin-left:8px;"><input type="checkbox" id="l1-filter-core"> 只导出核心记忆</label>
+                        <label style="margin-left:12px;">
+                            按类型：
+                            <select id="l1-filter-type" style="padding:2px 6px;border:1px solid #ddd;border-radius:4px;">
+                                <option value="">全部类型</option>
+                                <option value="feel">feel（感受）</option>
+                                <option value="preference_change">preference_change（偏好）</option>
+                                <option value="relationship">relationship（关系）</option>
+                                <option value="fact">fact（事实）</option>
+                                <option value="event">event（事件）</option>
+                                <option value="plan">plan（计划）</option>
+                                <option value="general">general（一般）</option>
+                            </select>
+                        </label>
+                    </div>
+                    <button onclick="doExportL1()" style="padding:5px 14px;background:#10b981;color:#fff;border:none;border-radius:4px;">导出 L1 记忆</button>
+                    <span id="l1-export-status" style="margin-left:8px;font-size:12px;"></span>
+                </div>
+                <div>
+                    <input type="file" id="l1-file" accept=".json">
+                    <button onclick="doImportL1()" style="padding:5px 14px;background:#4f46e5;color:#fff;border:none;border-radius:4px;">导入 L1 记忆</button>
+                    <span id="l1-import-status" style="margin-left:8px;font-size:12px;"></span>
+                </div>
+                <div style="font-size:11px;color:#888;margin-top:8px;">
+                    💡 提示：完整版导入时会自动重映射 source_msg_id（按内容匹配L0）；简化版导入时 source_msg_id 设为 NULL
+                </div>
             </div>
         </div>
         <div id="logs" class="panel">
@@ -1988,6 +2024,86 @@ function rebuildProfile() {
                     .then(function(r) { return r.json(); })
                     .then(function(d) { document.getElementById('feel-status').textContent = '导入: ' + d.imported; })
                     .catch(function(e) { document.getElementById('feel-status').textContent = '失败: ' + e; });
+            };
+            rd.readAsText(f);
+        }
+
+        function doExportL1() {
+            var mode = document.querySelector('input[name="l1-export-mode"]:checked').value;
+            var filterCore = document.getElementById('l1-filter-core').checked;
+            var filterType = document.getElementById('l1-filter-type').value;
+
+            var url = '/export/l1?mode=' + mode;
+            if (filterCore) url += '&is_core=1';
+            if (filterType) url += '&event_type=' + filterType;
+
+            document.getElementById('l1-export-status').textContent = '导出中...';
+
+            fetch(url)
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.status === 'error') {
+                        document.getElementById('l1-export-status').textContent = '失败: ' + data.detail;
+                        return;
+                    }
+
+                    // 创建下载
+                    var blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+                    var url = URL.createObjectURL(blob);
+                    var a = document.createElement('a');
+                    a.href = url;
+                    a.download = 'l1_memories_' + mode + '_' + new Date().toISOString().slice(0, 10) + '.json';
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                    URL.revokeObjectURL(url);
+
+                    var count = data.l1_memories ? data.l1_memories.length : (data.memories ? data.memories.length : 0);
+                    document.getElementById('l1-export-status').textContent = '✓ 已导出 ' + count + ' 条';
+                })
+                .catch(function(e) {
+                    document.getElementById('l1-export-status').textContent = '失败: ' + e;
+                });
+        }
+
+        function doImportL1() {
+            var f = document.getElementById('l1-file').files[0];
+            if (!f) { alert('请选择 json 文件'); return; }
+
+            var rd = new FileReader();
+            rd.onload = function() {
+                try {
+                    var data = JSON.parse(rd.result);
+                    document.getElementById('l1-import-status').textContent = '导入中...';
+
+                    fetch('/import/l1', {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(data)
+                    })
+                        .then(function(r) { return r.json(); })
+                        .then(function(d) {
+                            if (d.status === 'error') {
+                                document.getElementById('l1-import-status').textContent = '失败: ' + d.detail;
+                                return;
+                            }
+
+                            // 显示统计
+                            var msg = '✓ 导入: ' + d.imported + ' 条';
+                            if (d.remapped !== undefined) {
+                                msg += ' | 重映射: ' + d.remapped + ' 条';
+                                if (d.orphaned > 0) msg += ' | 孤立: ' + d.orphaned + ' 条';
+                            }
+                            if (d.skipped > 0) msg += ' | 跳过: ' + d.skipped + ' 条';
+
+                            document.getElementById('l1-import-status').textContent = msg;
+                        })
+                        .catch(function(e) {
+                            document.getElementById('l1-import-status').textContent = '失败: ' + e;
+                        });
+                } catch (e) {
+                    document.getElementById('l1-import-status').textContent = '解析失败: ' + e.message;
+                }
             };
             rd.readAsText(f);
         }
