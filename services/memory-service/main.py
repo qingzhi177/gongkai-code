@@ -1165,6 +1165,93 @@ async def import_feel_api(req: FeelImportReq):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
+# ========== L1 记忆导出导入（完整版 + 简化版）==========
+
+@app.get("/export/l1")
+async def export_l1_api(
+    event_type: Optional[str] = None,
+    is_core: Optional[int] = None,
+    mode: str = "full"  # full=完整版（带L0上下文）, simple=简化版（只L1）
+):
+    """导出 L1 记忆
+
+    mode=full: 导出 L1 + L0 上下文，支持智能重映射
+    mode=simple: 只导出 L1，导入时 source_msg_id 设为 NULL
+
+    筛选参数：
+    - event_type: 只导出指定类型（如 "preference_change"）
+    - is_core: 只导出核心记忆（is_core=1）
+    """
+    try:
+        from memory_export import export_l1_with_context, export_l1_simple
+
+        filters = {}
+        if event_type:
+            filters['event_type'] = event_type
+        if is_core is not None:
+            filters['is_core'] = is_core
+
+        if mode == "simple":
+            data = export_l1_simple(str(SQLITE_PATH), filters)
+            return {"status": "ok", "format": "l1-simple", "memories": data}
+        else:
+            data = export_l1_with_context(str(SQLITE_PATH), filters)
+            return {"status": "ok", **data}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+@app.post("/import/l1")
+async def import_l1_api(req: dict):
+    """导入 L1 记忆
+
+    请求格式：
+    - 完整版: {"format": "l1-with-context", "l1_memories": [...], "l0_context": {...}}
+    - 简化版: {"format": "l1-simple", "memories": [...]} 或直接传数组
+
+    返回统计：
+    - 完整版: {"imported": 10, "remapped": 8, "orphaned": 2, "skipped": 5}
+    - 简化版: {"imported": 10}
+    """
+    try:
+        from memory_export import import_l1_with_context, import_l1_simple
+
+        # chroma_add 回调
+        async def chroma_add(l1_id, content):
+            embedding = await get_embedding(content)
+            if embedding:
+                try:
+                    l1_collection.add(
+                        ids=[f"l1_{l1_id}"],
+                        embeddings=[embedding],
+                        documents=[content],
+                        metadatas=[{"id": l1_id}]
+                    )
+                except Exception as e:
+                    print(f"ChromaDB 向量添加失败 l1_{l1_id}: {e}")
+
+        req_format = req.get('format', 'auto')
+
+        # 自动识别格式
+        if req_format == 'auto':
+            if 'l0_context' in req:
+                req_format = 'l1-with-context'
+            elif 'memories' in req:
+                req_format = 'l1-simple'
+            elif isinstance(req, list):
+                req_format = 'l1-simple'
+
+        if req_format == 'l1-with-context':
+            # 完整版导入
+            stats = import_l1_with_context(str(SQLITE_PATH), req, chroma_add=chroma_add)
+            return {"status": "ok", **stats}
+        else:
+            # 简化版导入
+            memories = req.get('memories', req) if isinstance(req, dict) else req
+            n = import_l1_simple(str(SQLITE_PATH), memories, chroma_add=chroma_add)
+            return {"status": "ok", "imported": n}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
 @app.post("/import/kelivo-backup/upload")
 async def upload_kelivo_backup(file: UploadFile):
     """上传备份 zip → 保存到临时目录 → 返回预览（会话列表）"""
