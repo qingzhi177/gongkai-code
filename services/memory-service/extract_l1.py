@@ -198,15 +198,24 @@ def get_l0_ts(source_id):
     finally:
         conn.close()
 
-def save_l1(memory, conv_id, client, source_id):
+def save_l1(memory, conv_id, client, source_id, event_msg_id=None):
+    """保存 L1 记忆到数据库和向量库
+
+    Args:
+        memory: 提取的记忆内容（dict）
+        conv_id: 会话 ID
+        client: 客户端标识
+        source_id: 批次首条消息 id（用于 source_msg_id，向后兼容）
+        event_msg_id: 真正触发提取的消息 id（通常是批次最后一条）
+    """
     ts = get_l0_ts(source_id) or datetime.now().isoformat()
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     try:
         c.execute(
-            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status, ts) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status, ts, event_msg_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
             (memory["content"], memory.get("quote", ""), source_id, conv_id, client, memory.get("event_type", "general"),
-             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"), 'active', ts)
+             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"), 'active', ts, event_msg_id)
         )
         l1_id = c.lastrowid
         conn.commit()
@@ -328,7 +337,8 @@ def main():
         if memories:
             print(f"  Extracted {len(memories)} memories")
             for memory in memories:
-                save_l1(memory, conv_id, msgs[0][4], msgs[0][0])
+                # 批次首条作为 source_id（向后兼容），批次最后一条作为 event_msg_id（真正触发提取的消息）
+                save_l1(memory, conv_id, msgs[0][4], msgs[0][0], event_msg_id=msgs[-1][0])
         else:
             print("  No memories")
         mark_extracted(ids)

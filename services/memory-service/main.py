@@ -287,6 +287,13 @@ def init_db():
         except sqlite3.OperationalError:
             pass  # 列已存在，跳过
 
+    # 叙事虚构修复：新增 event_msg_id 字段（指向真正触发提取的 L0 消息）
+    try:
+        c.execute("ALTER TABLE l1_memories ADD COLUMN event_msg_id INTEGER")
+        print("[MIGRATE] l1_memories.event_msg_id 已添加")
+    except sqlite3.OperationalError:
+        pass  # 列已存在，跳过
+
     conn.commit()
     conn.close()
 
@@ -415,20 +422,22 @@ def detect_intent(query: str) -> dict:
 
 @app.post("/search")
 async def search_memories(req: SearchRequest):
-    """检索记忆：向量 + BM25 RF 融合"""
+    """检索记忆：向量 + BM25 RRF 融合（semantic/emotion）或精确匹配（exact）"""
     try:
         if req.mode == "exact":
-            # FTS5 逐字检索
+            # 精确检索：搜索 L1 + L0（未提炼的原文）
             conn = sqlite3.connect(str(SQLITE_PATH), timeout=30)
             c = conn.cursor()
+
+            # 1. 搜索 L1 记忆
             c.execute(
                 "SELECT id, content, quote, event_type, tags, ts, client, valence, arousal FROM l1_memories WHERE status='active' AND content LIKE ?",
                 (f"%{req.query}%",)
             )
-            rows = c.fetchall()
-            conn.close()
+            l1_rows = c.fetchall()
+
             memories = []
-            for row in rows:
+            for row in l1_rows:
                 memories.append({
                     "id": f"l1_{row[0]}",
                     "l1_summary": row[1],
@@ -445,8 +454,40 @@ async def search_memories(req: SearchRequest):
                     },
                     "score": 1.0
                 })
-           
-        # 意图判断
+
+            # 2. 搜索 L0 原文（extracted=0，即未提炼进 L1 的消息）
+            c.execute(
+                "SELECT id, content, conv_id, ts, client FROM l0_messages WHERE status='active' AND extracted=0 AND content LIKE ? LIMIT ?",
+                (f"%{req.query}%", req.n)
+            )
+            l0_rows = c.fetchall()
+
+            for row in l0_rows:
+                memories.append({
+                    "id": f"l0_{row[0]}",
+                    "l1_summary": f"[原文片段] {row[1][:200]}",
+                    "l0_context": row[1],  # L0 自身就是原文
+                    "quote": "",
+                    "metadata": {
+                        "event_type": "",
+                        "tags": "",
+                        "ts": row[3] or "",
+                        "client": row[4] or "",
+                        "conv_id": row[2] or "",
+                        "valence": 0,
+                        "arousal": 0,
+                        "is_core": 0,
+                        "unprocessed": True  # 标记为未提炼
+                    },
+                    "score": 0.8  # 略低于 L1 分数
+                })
+
+            conn.close()
+
+            # exact 模式到此结束，直接返回
+            return {"memories": memories, "total": len(memories)}
+
+        # semantic 和 emotion 模式：向量 + BM25 融合
         intent = detect_intent(req.query)
         print(f"Intent detected: {intent}")
 
@@ -2232,15 +2273,15 @@ async def _do_narrative(req: NarrativeGenerateRequest):
 
         # 3. 如果是强制重生成，忽略增量，读取全部
         if req.force or not existing_narrative:
-            # 全量：读取所有重要记忆
+            # 全量：读取所有重要记忆（包含 event_msg_id 用于获取 L0 原文）
             new_memories = c.execute(
-                f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} ORDER BY id ASC LIMIT ?",
+                f"SELECT id, content, quote, ts, event_msg_id FROM l1_memories WHERE {IMPORTANT_L1_WHERE} ORDER BY id ASC LIMIT ?",
                 (NARRATIVE_BATCH_LIMIT,)
             ).fetchall()
         else:
-            # 增量：只读上次之后新增的重要记忆
+            # 增量：只读上次之后新增的重要记忆（包含 event_msg_id）
             new_memories = c.execute(
-                f"SELECT id, content, quote, ts FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
+                f"SELECT id, content, quote, ts, event_msg_id FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
                 (last_id, NARRATIVE_BATCH_LIMIT)
             ).fetchall()
 
@@ -2274,6 +2315,9 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         if not new_narrative:
             return {"status": "error", "message": "生成失败"}
 
+        # 6.5. 忠实度校验（检查是否编造）
+        verification = await verify_narrative_faithfulness(new_narrative, new_memories)
+
         # 7. 保存新版本 + 更新增量状态
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
@@ -2281,7 +2325,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
         new_version = last_version + 1
 
-        # 溯源信息：为何更新、基于哪些记忆（Dashboard Observatory 数据源）
+        # 溯源信息：为何更新、基于哪些记忆（Dashboard Observatory 数据源）+ 忠实度校验结果
         trigger_details = json.dumps({
             "timestamp": datetime.now().isoformat(),
             "reason": req.reason or ("强制全量重写" if req.force else
@@ -2290,6 +2334,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
             "mode": "full" if (req.force or not existing) else "incremental",
             "l1_ids": consumed_ids,
             "l1_count": len(consumed_ids),
+            "verification": verification  # 忠实度校验结果
         }, ensure_ascii=False)
 
         c.execute(
@@ -3086,6 +3131,51 @@ async def update_model_config(purpose: str, req: ModelConfigUpdate):
 
 # ============ Helper Functions ============
 
+def get_l0_context_by_msg_id(sqlite_path, msg_id):
+    """根据 L0 消息 id 获取前后上下文（用于叙事生成）
+
+    msg_id: l0_messages.id（事件触发消息）
+    返回：前后各2条消息的文本（共5条）
+    """
+    try:
+        conn = sqlite3.connect(str(sqlite_path))
+        c = conn.cursor()
+
+        # 先查出这条消息的 msg_idx 和 conv_id
+        row = c.execute(
+            'SELECT msg_idx, conv_id FROM l0_messages WHERE id=? AND status=?',
+            (msg_id, 'active')
+        ).fetchone()
+
+        if not row:
+            conn.close()
+            return ""
+
+        msg_idx, conv_id = row
+
+        # 前后各2条（共5条上下文）
+        rows = c.execute(
+            'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? AND msg_idx BETWEEN ? AND ? ORDER BY msg_idx ASC',
+            (conv_id, 'active', max(0, msg_idx - 2), msg_idx + 2)
+        ).fetchall()
+
+        conn.close()
+
+        if not rows:
+            return ""
+
+        # 格式化为对话片段
+        parts = []
+        for role, content in rows:
+            prefix = "你" if role == "user" else "我"
+            parts.append(f"{prefix}: {content[:300]}")  # 限制长度避免过长
+
+        return "\n".join(parts)
+    except Exception as e:
+        print(f"获取 L0 上下文失败 (msg_id={msg_id}): {e}")
+        return ""
+
+
 async def build_narrative_prompt(existing_narrative: str, new_memories: list) -> dict:
     """构建 Narrative 生成提示词，返回 {system, user} 两段。
 
@@ -3102,13 +3192,25 @@ async def build_narrative_prompt(existing_narrative: str, new_memories: list) ->
 按时间顺序分章节书写，保留时间锚点、情感转折点、共同经历、关系演化，
 重要的原话用引号保留。温暖但不矫饰、连贯流动。"""
 
-    # 构建记忆列表（带时间戳，构成时间线骨架）
+    # 构建记忆列表（带时间戳和 L0 原文，构成时间线骨架）
     memory_text = "### 核心记忆\n"
     for m in new_memories:
         ts_date = m[3][:10] if m[3] else "未知时间"
+        event_msg_id = m[4] if len(m) > 4 else None  # event_msg_id
+
         memory_text += f"- [{ts_date}] {m[1]}\n"
         if m[2]:
             memory_text += f"  > 原话：{m[2]}\n"
+
+        # 附上 L0 原文片段（防止编造）
+        if event_msg_id:
+            l0_context = get_l0_context_by_msg_id(SQLITE_PATH, event_msg_id)
+            if l0_context:
+                memory_text += f"  > 原文片段：\n    {l0_context.replace(chr(10), chr(10) + '    ')}\n"
+            else:
+                memory_text += f"  > 原文片段：(不可考，请浅写)\n"
+        else:
+            memory_text += f"  > 原文片段：(不可考，请浅写)\n"
 
     # 构建 user message（待处理内容）
     user_message = f"""请基于以下材料，更新我们的共同经历叙事。
@@ -3193,6 +3295,89 @@ async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
     except Exception as e:
         logger.error(f"LLM call error in narrative generation: {e}")
         return None
+
+async def verify_narrative_faithfulness(narrative: str, memories: list) -> dict:
+    """忠实度校验：检查叙事是否编造内容
+
+    Args:
+        narrative: 生成的叙事文本
+        memories: [(id, content, quote, ts, event_msg_id), ...]
+
+    Returns:
+        {
+            "status": "pass" | "warning" | "fail",
+            "issues": [...],  # 发现的问题列表
+            "score": 0.0-1.0  # 忠实度分数
+        }
+    """
+    try:
+        # 收集所有记忆的原文和提炼
+        all_l0_texts = []
+        all_l1_summaries = []
+
+        for mem in memories:
+            mem_id, content, quote, ts, event_msg_id = mem
+            all_l1_summaries.append(content)
+            if quote:
+                all_l1_summaries.append(quote)
+
+            # 获取 L0 原文
+            if event_msg_id:
+                l0_context = get_l0_context_by_msg_id(SQLITE_PATH, event_msg_id)
+                if l0_context:
+                    all_l0_texts.append(l0_context)
+
+        # 简单启发式检查（避免调用 LLM，节省成本）
+        issues = []
+
+        # 1. 检查引号内的话是否在原文中
+        import re
+        quoted_parts = re.findall(r'[「『""]([^」』""]+)[」』""]', narrative)
+
+        for quoted in quoted_parts:
+            # 去除标点和空格后检查
+            quoted_clean = re.sub(r'[，。！？、\s]', '', quoted)
+            found = False
+
+            for l0_text in all_l0_texts:
+                l0_clean = re.sub(r'[，。！？、\s]', '', l0_text)
+                if quoted_clean in l0_clean or len(quoted_clean) < 5:
+                    found = True
+                    break
+
+            if not found and len(quoted_clean) > 5:
+                issues.append(f"引号内容可能编造: {quoted[:50]}...")
+
+        # 2. 检查叙事长度 vs 素材量（过长可能有编造）
+        narrative_len = len(narrative)
+        material_len = sum(len(s) for s in all_l1_summaries) + sum(len(t) for t in all_l0_texts)
+
+        if material_len > 0 and narrative_len > material_len * 3:
+            issues.append(f"叙事长度 ({narrative_len}) 远超素材量 ({material_len})，可能有过度展开")
+
+        # 计算忠实度分数
+        score = 1.0
+        if len(issues) > 0:
+            score = max(0.0, 1.0 - len(issues) * 0.15)
+
+        status = "pass" if score >= 0.8 else ("warning" if score >= 0.6 else "fail")
+
+        return {
+            "status": status,
+            "issues": issues,
+            "score": round(score, 2),
+            "quoted_count": len(quoted_parts),
+            "material_length": material_len,
+            "narrative_length": narrative_len
+        }
+
+    except Exception as e:
+        logger.error(f"忠实度校验失败: {e}")
+        return {
+            "status": "error",
+            "issues": [f"校验失败: {str(e)}"],
+            "score": 0.0
+        }
 
 async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
     """通用 LLM 调用。claude 系列走 Anthropic 原生 /messages（与网关约定一致，
