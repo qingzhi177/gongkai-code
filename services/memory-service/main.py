@@ -265,6 +265,17 @@ def init_db():
         thinking TEXT NOT NULL,
         answer_ref TEXT
     )''')
+    # 复活 bug 修复：用户显式删除的 L0 消息黑名单。
+    # 单条删除已改真删（DELETE），但真删只清掉本地行，不留痕迹——Kelivo 客户端本地
+    # 仍保留这条消息，下次全量上报时 save_conversation 按 group_id 查不到任何记录，
+    # 会当成"全新消息"重新插入（新 id、新时间戳），也就是用户看到的"删了又出现，
+    # 时间戳还一直变"。这张表记录被删过的 group_id（或无 group 时的 conv+role+内容），
+    # 写入前先查这张黑名单，命中就跳过，防止复活。
+    c.execute('''CREATE TABLE IF NOT EXISTS l0_deleted_marks (
+        mark_key TEXT PRIMARY KEY,
+        conv_id TEXT,
+        ts DATETIME DEFAULT CURRENT_TIMESTAMP
+    )''')
     # 增量水位线：记录生成时已消费到的最大 id。
     # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
     # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
@@ -455,9 +466,13 @@ async def search_memories(req: SearchRequest):
                     "score": 1.0
                 })
 
-            # 2. 搜索 L0 原文（extracted=0，即未提炼进 L1 的消息）
+            # 2. 搜索 L0 原文
+            # 修复：原来限定 extracted=0（只搜"尚未被提炼进 L1"的消息），导致已被
+            # L1 提取批次处理过的消息（本库中占 68%）永久搜不到原文——哪怕 L1 摘要
+            # 遗漏了细节。exact 模式存在的意义就是"逐字搜原文"，不该被提炼状态限制，
+            # 搜索范围改为全部 active 消息。
             c.execute(
-                "SELECT id, content, conv_id, ts, client FROM l0_messages WHERE status='active' AND extracted=0 AND content LIKE ? LIMIT ?",
+                "SELECT id, content, conv_id, ts, client, extracted FROM l0_messages WHERE status='active' AND content LIKE ? LIMIT ?",
                 (f"%{req.query}%", req.n)
             )
             l0_rows = c.fetchall()
@@ -477,7 +492,7 @@ async def search_memories(req: SearchRequest):
                         "valence": 0,
                         "arousal": 0,
                         "is_core": 0,
-                        "unprocessed": True  # 标记为未提炼
+                        "unprocessed": row[5] == 0  # 是否尚未被提炼进 L1
                     },
                     "score": 0.8  # 略低于 L1 分数
                 })
@@ -900,9 +915,13 @@ def _merge_l0_sequence(c, conv_id, client, messages):
                 saved += 1
 
     # 2) 按 final_order 重排 msg_idx，让它保持连续且反映真实对话顺序
-    # 修复：从全局最大 msg_idx+1 开始分配，避免与有 group_id 的消息冲突
+    # 修复：起始 idx 从「带 group 的导入历史」的最大 msg_idx+1 算起，而不是全部
+    # active 的最大值。否则 final_order 里被保留(equal)的无 group 旧行本身就持有
+    # 当前最大 idx，每轮 max+1 会把整段尾部逐轮向上平移（drift/window 漂移）。
+    # 只以 group 区间为基准，无 group 尾部就稳定地紧接在导入历史之后。
     max_msg_idx_row = c.execute(
-        "SELECT MAX(msg_idx) FROM l0_messages WHERE conv_id=? AND status='active'",
+        "SELECT MAX(msg_idx) FROM l0_messages WHERE conv_id=? AND status='active' "
+        "AND group_id IS NOT NULL AND group_id!=''",
         (conv_id,)
     ).fetchone()
     start_idx = (max_msg_idx_row[0] + 1) if (max_msg_idx_row and max_msg_idx_row[0] is not None) else 0
@@ -936,8 +955,15 @@ async def save_conversation(req: SaveRequest):
             # 内容级去重：同 conv 同 role 同内容(忽略换行)已有 active → 跳过。
             # 修复 Kelivo 版本切换/重新生成导致的历史漂移：内容未变的消息不再
             # 被无谓 superseded 重插（superseded 垃圾由 7011 条降到最低）。
+            # 修复(thrash 根治)：内容级去重只针对「已带 group_id 的导入历史」。
+            # 原来对全部 active 去重，会把实时对话尾部（无 group）的消息在进入
+            # _merge_l0_sequence 序列对齐之前就剔掉，导致对齐器拿到残缺尾部 → 误判
+            # replace 把整段尾部 superseded、下一轮又复活挤回，形成互相顶替的 thrash
+            # （表现：最新消息不进 L0 / active 计数不对 / 连续同角色 / L1 被误删）。
+            # 无 group 的实时消息一律交给 _merge_l0_sequence 用 difflib 对齐处理去重。
             dup = c.execute(
                 "SELECT id FROM l0_messages WHERE conv_id=? AND role=? AND status='active' AND "
+                "group_id IS NOT NULL AND group_id!='' AND "
                 "REPLACE(REPLACE(content,char(10),''),char(13),'')=REPLACE(REPLACE(?,char(10),''),char(13),'') LIMIT 1",
                 (req.conv_id, role, content)).fetchone()
             if dup:
@@ -960,6 +986,13 @@ async def save_conversation(req: SaveRequest):
                                ts_val or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), gid, ver, anchor_val))
                     saved += 1
                     continue
+                # 复活 bug 修复：库里没有这个 group_id 的任何记录（可能是用户显式删过），
+                # 先查黑名单，命中就跳过——不然会被当成"全新消息"插回来，产生新 id/新时间戳
+                tomb = c.execute(
+                    "SELECT 1 FROM l0_deleted_marks WHERE mark_key=?", (gid,)
+                ).fetchone()
+                if tomb:
+                    continue
                 # 新 group：插入后回填 anchor=自身 id
                 c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted, ts, group_id, version) VALUES (?,?,?,?,?,?,?,?,?,?)',
                           (req.conv_id, idx, role, content, req.client, 'active', 0,
@@ -967,6 +1000,14 @@ async def save_conversation(req: SaveRequest):
                 nid = c.lastrowid
                 c.execute("UPDATE l0_messages SET group_anchor=? WHERE id=?", (nid, nid))
                 saved += 1
+                continue
+
+            # 复活 bug 修复：无 group_id 的消息也查黑名单（key = conv+role+内容）
+            no_gid_tomb = c.execute(
+                "SELECT 1 FROM l0_deleted_marks WHERE mark_key=?",
+                (f"{req.conv_id}\x00{role}\x00{content}",)
+            ).fetchone()
+            if no_gid_tomb:
                 continue
 
             # Bug4 修复：没有 group_id 的消息先收集，不再逐条按 idx 匹配
@@ -1922,11 +1963,15 @@ async def delete_l0_message(msg_id: int):
     c = conn.cursor()
     l1_ids_to_purge = []
     try:
-        row = c.execute('SELECT conv_id, extracted, status FROM l0_messages WHERE id=?',
+        row = c.execute('SELECT conv_id, extracted, status, group_id, role, content FROM l0_messages WHERE id=?',
                         (msg_id,)).fetchone()
         if not row:
             return {"status": "error", "detail": "message not found"}
-        conv_id, extracted, cur_status = row
+        conv_id, extracted, cur_status, group_id, role, content = row
+        # 复活 bug 修复：真删前先记黑名单，防止 Kelivo 下次全量上报时把这条消息当"新消息"插回来
+        mark_key = group_id if group_id else f"{conv_id}\x00{role}\x00{content}"
+        c.execute("INSERT OR IGNORE INTO l0_deleted_marks (mark_key, conv_id) VALUES (?,?)",
+                  (mark_key, conv_id))
         # 物理删除：软删标记会绕过 save 查重导致"复活"，用户显式删除应彻底移除
         c.execute('DELETE FROM l0_messages WHERE id=?', (msg_id,))
         # 只有已提取过 L1 的消息才需要联动（extracted=0 的没进过批次，无 L1）
@@ -2864,6 +2909,10 @@ async def purge_all_data(confirmation: dict):
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
         c.execute("DELETE FROM l0_messages")
+        try:
+            c.execute("DELETE FROM l0_deleted_marks")
+        except Exception:
+            pass
         c.execute("DELETE FROM l1_memories")
         c.execute("DELETE FROM shared_narrative")
         c.execute("DELETE FROM recent_summary")

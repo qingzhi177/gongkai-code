@@ -132,6 +132,16 @@ def _import_conv(mem_conn, cid, messages, thinkings, mode):
                     continue
                 mem_conn.execute("UPDATE l0_messages SET status='superseded' WHERE id=?", (old[0],))
                 anchor_val = old[2] if old[2] else old[0]
+            else:
+                # 复活 bug 修复：库里没有这个 group 的记录，可能是用户在 Dashboard
+                # 显式删过——查黑名单，命中就跳过，不然重新导入会把删过的消息导回来
+                try:
+                    tomb = mem_conn.execute(
+                        "SELECT 1 FROM l0_deleted_marks WHERE mark_key=?", (gid,)).fetchone()
+                    if tomb:
+                        continue
+                except Exception:
+                    pass  # 黑名单表不存在（旧库/未跑过 main.py 迁移）时不拦截，保持原行为
         cur = mem_conn.execute(
             "INSERT INTO l0_messages (conv_id, msg_idx, role, content, ts, client, status, extracted, group_id, version, group_anchor) "
             "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
