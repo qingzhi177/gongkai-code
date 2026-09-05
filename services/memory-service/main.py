@@ -899,9 +899,16 @@ def _merge_l0_sequence(c, conv_id, client, messages):
                 final_order.append(c.lastrowid)
                 saved += 1
 
-    # 2) 按 final_order 重排 msg_idx，让它保持 0,1,2... 连续且反映真实对话顺序
-    for new_idx, row_id in enumerate(final_order):
-        c.execute("UPDATE l0_messages SET msg_idx=? WHERE id=?", (new_idx, row_id))
+    # 2) 按 final_order 重排 msg_idx，让它保持连续且反映真实对话顺序
+    # 修复：从全局最大 msg_idx+1 开始分配，避免与有 group_id 的消息冲突
+    max_msg_idx_row = c.execute(
+        "SELECT MAX(msg_idx) FROM l0_messages WHERE conv_id=? AND status='active'",
+        (conv_id,)
+    ).fetchone()
+    start_idx = (max_msg_idx_row[0] + 1) if (max_msg_idx_row and max_msg_idx_row[0] is not None) else 0
+
+    for i, row_id in enumerate(final_order):
+        c.execute("UPDATE l0_messages SET msg_idx=? WHERE id=?", (start_idx + i, row_id))
 
     return saved, superseded_old_ids
 
