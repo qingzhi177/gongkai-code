@@ -16,6 +16,7 @@ from rank_bm25 import BM25Okapi
 from cryptography.fernet import Fernet
 import json
 import asyncio
+import numpy as np
 from contextlib import asynccontextmanager
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
@@ -118,6 +119,12 @@ except Exception as e:
 def init_db():
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
+    # H1：WAL 模式（持久化在库文件里，一次设置即可）。记忆服务和 cron 提取进程会同时写库，
+    # WAL 允许一写多读并发，配合 sqlite3 默认 5 秒 busy 等待，减少 "database is locked"。
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as e:
+        print(f"[MIGRATE] 设置 WAL 失败（不影响运行）: {e}")
     c.execute('''CREATE TABLE IF NOT EXISTS l0_messages (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         conv_id TEXT NOT NULL,
@@ -305,6 +312,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 列已存在，跳过
 
+    # B7：提取失败重试计数与错误信息（连续失败 3 次 → extracted=-1 死信，不再自动重试）
+    for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
+            print(f"[MIGRATE] l0_messages.{col} 已添加")
+        except sqlite3.OperationalError:
+            pass  # 列已存在，跳过
+
     conn.commit()
     conn.close()
 
@@ -316,6 +331,9 @@ class SearchRequest(BaseModel):
     event_type: Optional[str] = None
     after: Optional[str] = None
     before: Optional[str] = None
+    # B3 修复：网关 recall 工具声明了 emotion_valence，但模型里缺这个字段，
+    # mode=emotion 时访问 req.emotion_valence 会抛 AttributeError → 被吞掉 → 永远返回空。
+    emotion_valence: Optional[str] = None  # positive / negative
     n: int = 10
 
 class SaveRequest(BaseModel):
@@ -441,9 +459,12 @@ async def search_memories(req: SearchRequest):
             c = conn.cursor()
 
             # 1. 搜索 L1 记忆
+            # B5：转义 LIKE 通配符（用户输入里的 % _ 按字面匹配），新的在前
+            like_q = "%" + req.query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
             c.execute(
-                "SELECT id, content, quote, event_type, tags, ts, client, valence, arousal FROM l1_memories WHERE status='active' AND content LIKE ?",
-                (f"%{req.query}%",)
+                "SELECT id, content, quote, event_type, tags, ts, client, valence, arousal FROM l1_memories "
+                "WHERE status='active' AND content LIKE ? ESCAPE '\\' ORDER BY ts DESC LIMIT ?",
+                (like_q, max(req.n, 10))
             )
             l1_rows = c.fetchall()
 
@@ -472,8 +493,9 @@ async def search_memories(req: SearchRequest):
             # 遗漏了细节。exact 模式存在的意义就是"逐字搜原文"，不该被提炼状态限制，
             # 搜索范围改为全部 active 消息。
             c.execute(
-                "SELECT id, content, conv_id, ts, client, extracted FROM l0_messages WHERE status='active' AND content LIKE ? LIMIT ?",
-                (f"%{req.query}%", req.n)
+                "SELECT id, content, conv_id, ts, client, extracted FROM l0_messages "
+                "WHERE status='active' AND content LIKE ? ESCAPE '\\' ORDER BY id DESC LIMIT ?",
+                (like_q, req.n)
             )
             l0_rows = c.fetchall()
 
@@ -559,33 +581,73 @@ async def search_memories(req: SearchRequest):
         memories = []
         conn = sqlite3.connect(str(SQLITE_PATH))
         c = conn.cursor()
+        q_vec = np.asarray(query_embedding, dtype=np.float32)
+        q_norm = float(np.linalg.norm(q_vec)) or 1.0
 
-        for mid, rrf_score in sorted_ids[:req.n]:
+        # B4 修复：原来先截取 sorted_ids[:req.n] 再过滤，带 event_type/时间条件时结果会变少甚至为空。
+        # 现在遍历全部候选，攒够 req.n 条为止。
+        for mid, rrf_score in sorted_ids:
+            if len(memories) >= req.n:
+                break
 
-            # 获取 L1 内容和元数据
             l1_id_str = mid.replace("l1_", "")
 
-            # 重构：active 兜底校验（双保险）。L1 已改硬删，但若 ChromaDB 删向量失败
-            # 留下残留向量，仅靠向量检索仍可能命中。这里用 SQLite 核对该 L1 是否 active，
-            # 不是（已删/不存在）就跳过，保证删掉的记忆一定搜不出来。
+            # B2/B6 修复：元数据一律以 SQLite 为准（Chroma 元数据有多种形状且不随 update_l1 同步，
+            # 也没有 last_shown_at / display_count / visibility）。同时兼做 active 校验：
+            # 已删/不存在的 L1 即使 Chroma 残留向量也不会被返回。
             try:
                 _row = conn.execute(
-                    "SELECT status FROM l1_memories WHERE id=?", (l1_id_str,)
+                    "SELECT status, content, quote, event_type, tags, ts, client, conv_id, valence, arousal, "
+                    "is_core, display_count, last_shown_at, visibility, access_count "
+                    "FROM l1_memories WHERE id=?", (l1_id_str,)
                 ).fetchone()
             except Exception:
                 _row = None
             if not _row or _row[0] != 'active':
                 continue
+            (_status, s_content, s_quote, s_event_type, s_tags, s_ts, s_client, s_conv_id,
+             s_valence, s_arousal, s_is_core, s_display_count, s_last_shown_at, s_visibility, s_access_count) = _row
 
-            # 从 ChromaDB 获取元数据
-            try:
-                chroma_result = l1_collection.get(ids=[mid], include=["documents", "metadatas"])
-                if not chroma_result["ids"]:
-                    continue
-                doc = chroma_result["documents"][0]
-                meta = chroma_result["metadatas"][0]
-            except Exception:
+            # 软隐藏：visibility=0 不参与检索
+            visibility = 1.0 if s_visibility is None else float(s_visibility)
+            if visibility <= 0:
                 continue
+
+            # 从 ChromaDB 取文档与向量（只用来兜底文本和计算余弦相似度）
+            doc = s_content
+            chroma_meta = {}
+            vec_sim = None
+            try:
+                chroma_result = l1_collection.get(ids=[mid], include=["documents", "metadatas", "embeddings"])
+                if chroma_result["ids"]:
+                    doc = s_content or chroma_result["documents"][0]
+                    chroma_meta = chroma_result["metadatas"][0] or {}
+                    embs = chroma_result.get("embeddings")
+                    if embs is not None and len(embs) > 0:
+                        e_vec = np.asarray(embs[0], dtype=np.float32)
+                        e_norm = float(np.linalg.norm(e_vec)) or 1.0
+                        # B1：返回绝对相关度（余弦相似度），供网关做浮现门槛；RRF 分数只表示名次，
+                        # 最大约 0.016，不能当相关度阈值用。
+                        vec_sim = round(float(np.dot(q_vec, e_vec) / (q_norm * e_norm)), 4)
+            except Exception:
+                pass
+
+            meta = dict(chroma_meta)
+            meta.update({
+                "event_type": s_event_type or "",
+                "tags": s_tags or "",
+                "ts": s_ts or "",
+                "client": s_client or "",
+                "conv_id": s_conv_id or "",
+                "quote": s_quote or "",
+                "valence": s_valence or 0,
+                "arousal": s_arousal or 0,
+                "is_core": 1 if s_is_core else 0,
+                "display_count": s_display_count or 0,
+                "last_shown_at": s_last_shown_at,  # 毫秒时间戳或 None（网关冷却用）
+                "visibility": visibility,
+                "access_count": s_access_count or 0,
+            })
 
             # 过滤条件
             if req.event_type and meta.get("event_type") != req.event_type:
@@ -595,7 +657,7 @@ async def search_memories(req: SearchRequest):
             if req.before and meta.get("ts", "") > req.before:
                 continue
             if req.mode == "emotion" and req.emotion_valence:
-                v = meta.get("valence", 0)
+                v = meta.get("valence", 0) or 0
                 if req.emotion_valence == "positive" and v <= 0:
                     continue
                 if req.emotion_valence == "negative" and v >= 0:
@@ -603,7 +665,7 @@ async def search_memories(req: SearchRequest):
 
             # 情感过滤
             if intent["emotion_filter"]:
-                arousal = meta.get("arousal", 0)
+                arousal = meta.get("arousal", 0) or 0
                 if arousal < 0.3:  # 只保留情感强度较高的
                     continue
 
@@ -616,7 +678,9 @@ async def search_memories(req: SearchRequest):
                 "l0_context": l0_context,
                 "quote": meta.get("quote", ""),
                 "metadata": meta,
-                "score": rrf_score
+                "score": rrf_score * visibility,
+                "rrf_score": rrf_score,
+                "vec_sim": vec_sim
             })
 
         conn.close()
@@ -2395,9 +2459,13 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         )
 
         # 更新增量状态
+        # B12 修复：水位线必须是「本批最后一条已消费的 L1 id」，而不是全表 MAX(id)。
+        # 否则一次新增超过 NARRATIVE_BATCH_LIMIT 条重要记忆时，多出来的会被永久跳过；
+        # 同时与 shared_narrative.last_l1_id（自动检查用的水位线）保持一致。
+        # 剩余未消费的记忆会在下一次自动检查时继续处理。
         c.execute(
             "INSERT OR REPLACE INTO narrative_state (id, last_processed_l1_id, updated_at) VALUES (1, ?, ?)",
-            (latest_l1_id, datetime.now().isoformat())
+            (consumed_ids[-1], datetime.now().isoformat())
         )
         conn.commit()
         new_id = c.lastrowid
@@ -3536,4 +3604,27 @@ if DASHBOARD_DIR.exists():
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8001)
+    import socket
+
+    # S2 安全加固：只监听本机回环地址（IPv4 + IPv6），不再对公网开放 0.0.0.0:8001。
+    # 外部访问统一走 nginx（https://域名/import/ 等，带 basic auth）。
+    # 同时绑定 127.0.0.1 和 ::1，是因为 nginx / 网关用 "localhost" 连接时可能优先解析到 ::1。
+    # 如确需临时对外，可设置环境变量 MEMORY_BIND_HOSTS=0.0.0.0（不推荐）。
+    port = int(os.getenv("MEMORY_PORT", 8001))
+    hosts = [h.strip() for h in os.getenv("MEMORY_BIND_HOSTS", "127.0.0.1,::1").split(",") if h.strip()]
+    socks = []
+    for h in hosts:
+        fam = socket.AF_INET6 if ":" in h else socket.AF_INET
+        try:
+            sk = socket.socket(fam, socket.SOCK_STREAM)
+            sk.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            if fam == socket.AF_INET6:
+                sk.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+            sk.bind((h, port))
+            socks.append(sk)
+            print(f"[BIND] 监听 {h}:{port}")
+        except OSError as e:
+            print(f"[BIND] {h}:{port} 绑定失败: {e}")
+    if not socks:
+        raise SystemExit("[BIND] 没有可用的监听地址")
+    uvicorn.Server(uvicorn.Config(app, log_level="info")).run(sockets=socks)

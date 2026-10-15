@@ -104,6 +104,45 @@ EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的
 对话内容：
 '''
 
+LAST_EXTRACT_ERROR = ""
+MAX_EXTRACT_ATTEMPTS = 3  # 连续失败达到这个次数 → extracted=-1（死信），不再自动重试
+
+
+def ensure_columns():
+    """B7：确保重试计数列存在（记忆服务启动时也会建，这里兜底，防止 cron 先跑）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    try:
+        for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
+            try:
+                conn.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_failed(ids, error):
+    """B7：提取失败 → 不标记已提取，只累加失败次数；达到上限转为死信（extracted=-1）"""
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    for mid in ids:
+        c.execute(
+            "UPDATE l0_messages SET extract_attempts = COALESCE(extract_attempts, 0) + 1, extract_error = ? WHERE id=?",
+            (error, mid)
+        )
+        c.execute(
+            "UPDATE l0_messages SET extracted = -1 WHERE id=? AND extract_attempts >= ?",
+            (mid, MAX_EXTRACT_ATTEMPTS)
+        )
+    conn.commit()
+    dead = c.execute(
+        f"SELECT COUNT(*) FROM l0_messages WHERE extracted=-1 AND id IN ({','.join('?' * len(ids))})", ids
+    ).fetchone()[0] if ids else 0
+    conn.close()
+    return dead
+
+
 def get_unextracted():
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
@@ -160,10 +199,22 @@ def call_deepseek(text, provider=None):
             content = resp.json()["choices"][0]["message"]["content"].strip()
         if content.startswith("```"):
             content = content.split("\n", 1)[1].rsplit("```", 1)[0]
-        return json.loads(content)
+        data = json.loads(content)
+        # 兼容模型偶尔返回 {"memories": [...]} 这种包了一层的格式
+        if isinstance(data, dict):
+            for key in ("memories", "items", "results", "data"):
+                if isinstance(data.get(key), list):
+                    data = data[key]
+                    break
+        if not isinstance(data, list):
+            raise ValueError(f"返回的不是 JSON 数组: {type(data).__name__}")
+        return [m for m in data if isinstance(m, dict) and m.get("content")]
     except Exception as e:
+        # B7 修复：出错返回 None（而不是 []），让调用方区分「失败」和「这批确实没有可记的」
         print(f"DeepSeek error: {e}")
-        return []
+        global LAST_EXTRACT_ERROR
+        LAST_EXTRACT_ERROR = str(e)[:500]
+        return None
 
 def get_embedding(text, provider=None):
     try:
@@ -254,70 +305,9 @@ def mark_extracted(ids):
     conn.commit()
     conn.close()
 
-def check_and_auto_update_narrative():
-    """L1提取完成后检查是否需要自动更新 Narrative"""
-    try:
-        conn = sqlite3.connect(str(SQLITE_PATH))
-        c = conn.cursor()
-
-        # 读取配置
-        cfg = c.execute(
-            "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1 FROM narrative_config WHERE id=1"
-        ).fetchone()
-
-        if not cfg or not cfg[0]:  # auto_update_enabled = 0
-            conn.close()
-            return
-
-        threshold_turns = cfg[1] or 50
-        threshold_l1 = cfg[2] or 10
-
-        # 获取上次 Narrative 更新时间
-        last_narrative = c.execute(
-            "SELECT ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
-        ).fetchone()
-        last_ts = last_narrative[0] if last_narrative else None
-
-        # 统计上次更新后新增的 L1 数量
-        if last_ts:
-            new_l1_count = c.execute(
-                "SELECT COUNT(*) FROM l1_memories WHERE status='active' AND ts > ?", (last_ts,)
-            ).fetchone()[0]
-        else:
-            new_l1_count = c.execute(
-                "SELECT COUNT(*) FROM l1_memories WHERE status='active'"
-            ).fetchone()[0]
-
-        # 统计上次更新后新增的 L0 对话轮数
-        if last_ts:
-            new_turns = c.execute(
-                "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND ts > ? AND role='assistant'", (last_ts,)
-            ).fetchone()[0]
-        else:
-            new_turns = c.execute(
-                "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND role='assistant'"
-            ).fetchone()[0]
-
-        conn.close()
-
-        should_update = (new_l1_count >= threshold_l1) or (new_turns >= threshold_turns)
-        print(f"[NARRATIVE AUTO] 新增L1={new_l1_count}(阈值{threshold_l1}), 新增轮次={new_turns}(阈值{threshold_turns}), 触发={should_update}")
-
-        if should_update:
-            print("[NARRATIVE AUTO] 触发自动更新...")
-            import requests
-            requests.post(
-                "http://localhost:8001/narrative/generate",
-                json={"trigger_type": "auto_threshold", "force": False},
-                timeout=120
-            )
-            print("[NARRATIVE AUTO] 自动更新请求已发送")
-
-    except Exception as e:
-        print(f"[NARRATIVE AUTO] 检查失败: {e}")
-
 def main():
     print(f"[{datetime.now()}] L1 extraction starting...")
+    ensure_columns()
     messages = get_unextracted()
     if not messages:
         print("No new messages.")
@@ -334,6 +324,12 @@ def main():
             ids.append(mid)
         print(f"Processing {conv_id}: {len(msgs)} messages")
         memories = call_deepseek(text, resolve_purpose('l1_extract'))
+        if memories is None:
+            # B7 修复：调用失败时不再标记为已提取（以前会把这一批永久丢掉），下个周期重试
+            dead = mark_failed(ids, LAST_EXTRACT_ERROR or "unknown error")
+            print(f"  !! 提取失败，{len(ids)} 条消息保留为未提取，下次重试"
+                  + (f"；其中 {dead} 条已连续失败 {MAX_EXTRACT_ATTEMPTS} 次，转为死信(extracted=-1)" if dead else ""))
+            continue
         if memories:
             print(f"  Extracted {len(memories)} memories")
             for memory in memories:
@@ -343,8 +339,8 @@ def main():
             print("  No memories")
         mark_extracted(ids)
     print(f"[{datetime.now()}] Complete.")
-    # 提取完成后检查是否需要更新 Narrative
-    check_and_auto_update_narrative()
+    # B13：叙事自动更新只由记忆服务的 APScheduler 负责（check_and_update_narrative），
+    # 这里不再重复触发（以前两套触发阈值和比较方式不同，可能并发生成、版本互相覆盖）。
 
 def resolve_purpose(purpose):
     """按模块配置（model_configs→providers）解析：返回 {base_url, api_key, model} 或 None（回退 .env）"""
@@ -352,7 +348,8 @@ def resolve_purpose(purpose):
         import sqlite3 as _sq
         import json as _js
         import os as _os
-        _db = _os.environ.get('MEMORY_DATA_DIR', _os.path.expanduser('~/memory-system/data')) + '/sqlite/memory.db'
+        # B11：与文件顶部统一使用 DATA_DIR（以前这里读 MEMORY_DATA_DIR，和其余代码不一致）
+        _db = str(SQLITE_PATH)
         if not _os.path.exists(_db):
             return None
         conn = _sq.connect(_db)
