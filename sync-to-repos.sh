@@ -1,16 +1,27 @@
 #!/bin/bash
 # 一键同步到双仓库：脱敏检查 → 提交 → 推私有(origin) → 推公开(public)
-# 用法：cd ~/memory-system && ./sync-to-repos.sh
+# 用法：cd ~/memory-system && ./sync-to-repos.sh "提交说明"
 set -e
 cd "$(dirname "$0")"
 
 echo "[1/4] 脱敏检查..."
-FILES=$(git status --porcelain | awk '{print $2}' | grep -vE '(\.env$|venv/|node_modules/)' | head -60)
+# 检查范围：未提交的改动 + 还没推到公开仓库的提交里改过的文件
+# （MCP 运维会自动 git 快照提交，只查未提交文件会漏掉）
+git fetch -q public 2>/dev/null || true
+FILES=$( { git status --porcelain | awk '{print $NF}'; git diff --name-only public/main..HEAD 2>/dev/null; } \
+  | sort -u | grep -vE '(\.env$|venv/|node_modules/|\.leakcheck\.local$)' | while read -r f; do [ -f "$f" ] && echo "$f"; done | head -200)
+# 通用模式写在这里；个人专属的检查词（口令、编号等）放在不入库的 .leakcheck.local 里，每行一个正则。
+# 以前个人检查词直接写在本脚本里，而本脚本在公开仓库中 —— 检查本身就把要保护的内容公开了。
+PATTERNS='sk-[a-zA-Z0-9]{16,}|Bearer [A-Za-z0-9]{20,}'
+if [ -f .leakcheck.local ]; then
+  EXTRA=$(grep -vE '^[[:space:]]*(#|$)' .leakcheck.local | paste -sd'|' -)
+  [ -n "$EXTRA" ] && PATTERNS="$PATTERNS|$EXTRA"
+fi
 if [ -n "$FILES" ]; then
-  LEAK=$(grep -n -E 'sk-[a-zA-Z0-9]{16,}|qingzhi520525525|8989884128|Bearer [A-Za-z0-9]{20,}' $FILES 2>/dev/null | grep -v '^sync-to-repos.sh:' | head -5)
+  LEAK=$(echo "$FILES" | xargs -d '\n' grep -H -n -E "$PATTERNS" 2>/dev/null | grep -v '^sync-to-repos.sh:' | head -5)
   if [ -n "$LEAK" ]; then
-    echo "!! 发现疑似敏感信息，中止："
-    echo "$LEAK"
+    echo "!! 发现疑似敏感信息，中止（只显示文件和行号）："
+    echo "$LEAK" | cut -d: -f1,2
     exit 1
   fi
 fi
@@ -22,18 +33,7 @@ echo "通过"
 
 echo "[2/4] 暂存与提交..."
 git add -A
-MSG="$(date +%Y-%m-%d) 数据管理全家桶（备份导入/导出导入/feel）+ 和弦情绪锚点接入 + README 更新
-
-- 数据管理：
-  * Kelivo 备份导入（kelivo-backup v2 sqlite）：预览会话列表 / 版本折叠（version_selections 优先）/ 指定会话导入 / skip|append；旧版 JSON 导入保留
-  * 记忆库整体导出/导入（zip：L0/L1/thinking/narrative/summary/custom_prompt/conv_settings/profile + manifest）
-  * feel 单独导出/导入（?source=all|self|extracted；导入补 ChromaDB 向量）
-  * Dashboard「备份管理」面板（上传-预览-勾选-导入 / 导出下载）；nginx /import/ /export/ 直连记忆服务
-- 和弦情绪锚点（v0.1 接入）：
-  * l1_memories.anchor_json 列（幂等 migration）+ parse_anchor 解析（>情境行 + >和弦行 ·bpm ·力度）
-  * 网关 feel 工具描述引导规则（记录/回顾用，日常不用；≤4和弦；紧张系加动作词）
-  * recall 结果标注 feel 来源（AI自述/对话提取）
-- README：数据管理 + 和弦锚点 section；架构设计分析见《和弦锚点架构设计.md》"
+MSG="${1:-$(date +%Y-%m-%d) 同步}"   # 用法：./sync-to-repos.sh "提交说明"
 git commit -m "$MSG" --allow-empty
 
 echo "[3/4] 推送私有仓库 origin..."

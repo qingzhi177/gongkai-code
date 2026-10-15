@@ -1,14 +1,18 @@
-version: '3.8'
-
 services:
   chromadb:
     image: chromadb/chroma:latest
     container_name: memory-chromadb
     ports:
-      - "8000:8000"
+      # S3 安全加固：只绑定本机回环地址。Docker 发布的端口会直接写 iptables、绕过 ufw，
+      # 以前的 "8000:8000" 等于把向量库（含记忆原文）对公网开放。
+      - "127.0.0.1:8000:8000"
+      - "[::1]:8000:8000"
     volumes:
-      - ./data/chroma:/chroma/chroma
+      # 修复：新版 Chroma 镜像的数据目录是 /data（容器内 /config.yaml 的 persist_path），
+      # 以前挂载的 /chroma/chroma 实际没被使用 —— 向量只存在容器内部，重建容器就会丢失，也不在备份里。
+      - ./data/chroma:/data
     environment:
       - ANONYMIZED_TELEMETRY=False
-      - ALLOW_RESET=True
+      # S3：关闭 reset 接口（以前开着，任何能连上 8000 端口的人都能清空向量库）
+      - ALLOW_RESET=False
     restart: unless-stopped

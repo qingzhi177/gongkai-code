@@ -13,7 +13,11 @@ const PORT = process.env.PORT || 3000;
 
 // ========== 记忆浮现参数配置 ==========
 const SURFACE_PROBABILITY = 0.3;          // 30% 概率开放回忆
-const MIN_RELEVANCE = 0.15;               // RRF 分数阈值
+// B1 修复：以前用 RRF 分数做门槛（MIN_RELEVANCE=0.15），但 RRF 只表示名次，最大约 0.016，
+// 主通道因此几乎从不浮现。现在改用记忆服务返回的 vec_sim（查询与记忆的余弦相似度，0~1）。
+// 默认 0.55 来自少量样本（相关约 0.68~0.71，"嗯嗯"这类无关消息约 0.45~0.48），
+// 有了真实数据后看 gateway.log 里的 [SURFACE] 行再校准；可用环境变量 SURFACE_MIN_SIM 覆盖。
+const SURFACE_MIN_SIM = parseFloat(process.env.SURFACE_MIN_SIM || '0.55');
 const COOLDOWN_HOURS = 24;                // 主通道冷却时长（小时）
 const SERENDIPITY_PROBABILITY = 0.05;    // 5% 概率触发无由来浮现
 const SERENDIPITY_COOLDOWN_DAYS = 7;     // 无由来浮现冷却时长（天）
@@ -420,7 +424,7 @@ async function getCustomPrompt() {
 //   1. 当前北京时间 —— 给 LLM 时间锚点，避免把历史记忆里的相对时间（"过了十一天"）
 //      误当成当前状态（问题1）。
 //   2. 会话间隔感知 —— 距上次对话多久，像朋友那样感知"好久不见"（问题2，阈值触发）。
-async function getMemoryMenu(userMessage, convId) {
+async function getMemoryMenu(userMessage, convId, menuCtx) {
   // 1. 当前北京时间（UTC+8）。realNowMs 用真实 UTC epoch 算间隔，
   //    shifted 仅用于拼北京时间显示串——setHours 会改 epoch，
   //    若用 shifted.getTime() 算间隔会把每个间隔多算 8 小时。
@@ -479,8 +483,11 @@ async function getMemoryMenu(userMessage, convId) {
   // 7. 格式化为自然语言念头
   const formattedMemories = formatMemoriesAsThoughts(selectedMemories);
 
-  // 8. 更新展示指标
-  await updateDisplayMetrics(selectedMemories.map(m => m.id));
+  // 8. 展示指标：不在这里立即更新（以前组装菜单时就计数，请求失败/重新生成也会算"展示过"并进入冷却）。
+  //    把 id 交给调用方，等回复正常结束后再更新（见 chatCompletionsMain 里的 updateDisplayMetrics 调用）。
+  const shownIds = selectedMemories.map(m => m.id);
+  if (menuCtx) menuCtx.shownIds = shownIds;
+  else await updateDisplayMetrics(shownIds);
 
   return header + formattedMemories;
 }
@@ -495,8 +502,11 @@ async function relevanceDrivenSurfacing(userMessage) {
     });
     let memories = res.data.memories || [];
 
-    // 相关度过滤
-    memories = memories.filter(m => m.score >= MIN_RELEVANCE);
+    // 相关度过滤（B1：用余弦相似度 vec_sim 做绝对门槛）
+    // 校准用日志：只记 id 和分数，不记内容
+    console.log('[SURFACE] 候选 vec_sim:', memories.slice(0, 8).map(m => `${m.id}=${m.vec_sim}`).join(' '),
+      '| 门槛', SURFACE_MIN_SIM);
+    memories = memories.filter(m => typeof m.vec_sim === 'number' && m.vec_sim >= SURFACE_MIN_SIM);
 
     // 冷却过滤
     const cooldownMs = COOLDOWN_HOURS * 3600 * 1000;
@@ -711,8 +721,10 @@ async function executeTool(name, args) {
         event_type: args.event_type,
         after: args.after,
         before: args.before,
+        emotion_valence: args.emotion_valence,   // B3：以前工具声明了这个参数却没有转发
         n: 5
       });
+      if (res.data.error) return `记忆检索出错：${res.data.error}`;
       const memories = res.data.memories || [];
       if (memories.length === 0) return '未找到相关记忆。';
 
@@ -1307,9 +1319,10 @@ async function chatCompletionsMain(req, res) {
     }
 
     // 获取画像、记忆目录、Shared Narrative、Recent Summary、Custom Prompt（含时间锚点 + 会话间隔感知）
+    const menuCtx = { shownIds: [] };   // 本轮浮现的记忆 id，回复成功后再计入展示指标
     const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
       getProfile(),
-      getMemoryMenu(userContent, convIdForMenu),
+      getMemoryMenu(userContent, convIdForMenu, menuCtx),
       getSharedNarrative(),
       getRecentSummary(),
       getCustomPrompt()
@@ -1523,6 +1536,8 @@ if (thinkAcc.length && result) {
           }
         }
         emitter.finish(result ? result.stop_reason : 'end_turn', totalUsage);
+        // 回复正常结束后才计入展示指标（display_count / last_shown_at → 冷却）
+        if (!isTitleGenerationRequest(req)) updateDisplayMetrics(menuCtx.shownIds);
       } catch (streamErr) {
         console.error('[STREAM] 流式处理出错:', streamErr.response?.status || streamErr.message);
         // 已经发过头，只能在流内把错误信息作为正文吐出去并正常收尾，避免前端空回
@@ -1667,6 +1682,8 @@ if (thinkAcc.length && result) {
         client: client,
         messages: cleanedMessages
       }).catch(err => console.error('保存对话失败:', err.message));
+      // 回复成功后才计入展示指标
+      updateDisplayMetrics(menuCtx.shownIds);
     }
 
     // 根据请求来源决定返回格式
@@ -1886,10 +1903,25 @@ app.all('/api/*splat', async (req, res) => {
 });
 
 // 启动
-app.listen(PORT, async () => {
-  console.log(`Memory Gateway running on port ${PORT}`);
-  // 启动时拉取一次配置（失败不阻塞启动，转发逻辑会回退到 .env）
-  await loadActiveConfig();
-  // 启动时刷新一次模型列表缓存
-  await refreshModelsCache();
-});
+// S1 安全加固：只监听本机回环地址（IPv4 + IPv6），不再对公网开放 *:3000。
+// 外部客户端统一走 nginx（https://域名/v1/，nginx 校验 Bearer token 后转发到 localhost:3000）。
+// 如确需临时对外，可设置环境变量 GATEWAY_BIND_HOSTS=0.0.0.0（不推荐）。
+const BIND_HOSTS = (process.env.GATEWAY_BIND_HOSTS || '127.0.0.1,::1').split(',').map(h => h.trim()).filter(Boolean);
+let gatewayStarted = false;
+for (const host of BIND_HOSTS) {
+  const srv = app.listen(PORT, host, async () => {
+    console.log(`Memory Gateway running on ${host}:${PORT}`);
+    if (gatewayStarted) return;
+    gatewayStarted = true;
+    // 启动时拉取一次配置（失败不阻塞启动，转发逻辑会回退到 .env）
+    // 记忆服务和网关同时重启时，记忆服务可能还没起来 → 失败后每 5 秒重试，最多 6 次
+    let cfgState = await loadActiveConfig();
+    for (let i = 0; cfgState === 'error' && i < 6; i++) {
+      await new Promise(r => setTimeout(r, 5000));
+      cfgState = await loadActiveConfig();
+    }
+    // 启动时刷新一次模型列表缓存
+    await refreshModelsCache();
+  });
+  srv.on('error', e => console.error(`[BIND] ${host}:${PORT} 监听失败:`, e.message));
+}
