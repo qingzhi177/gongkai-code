@@ -503,6 +503,10 @@ async function getMemoryMenu(userMessage, convId, menuCtx) {
 
 // 相关度驱动的记忆浮现（主通道）
 async function relevanceDrivenSurfacing(userMessage) {
+  // 寒暄/极短回复（"嗯嗯""好呀""哈哈"）不走相关度召回：这类消息几乎和任何记忆都"有点像"
+  // （实测"嗯嗯"的 vec_sim 也能到 0.5 左右），召回出来只会显得突兀。无由来浮现通道不受影响。
+  const core = String(userMessage || '').replace(/[\s\p{P}\p{S}~～]/gu, '');
+  if (core.length <= 3) return [];
   try {
     const res = await axios.post(`${MEMORY_SERVICE_URL}/search`, {
       query: userMessage,

@@ -1,11 +1,11 @@
 # 记忆服务依赖（2026-10-16 按 VPS 实际运行环境的版本更新）
 # 以前这里缺少 rank_bm25 / cryptography / numpy，且版本与线上不一致（如 fastapi 写的是 0.109.0，实际是 0.138.0）
+# Phase 1：向量改存 SQLite、关键词检索改用 FTS5，已不再需要 chromadb 和 rank-bm25
+# （迁移脚本 scripts/migrate_chroma_to_sqlite.py 仍需要 chromadb，线上 venv 里保留着，迁移完可卸载）
 fastapi==0.138.0
 uvicorn==0.49.0
 pydantic==2.13.4
-chromadb==1.5.9
 jieba==0.42.1
-rank-bm25==0.2.2
 numpy==2.5.0
 httpx==0.28.1
 python-multipart==0.0.32

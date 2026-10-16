@@ -2,7 +2,6 @@ import sqlite3
 import os
 import json
 import httpx
-import chromadb
 from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
@@ -17,8 +16,9 @@ DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY")
 ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
-chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-l1_collection = chroma_client.get_or_create_collection(name="l1_memories")
+# Phase 1：向量改存 SQLite（与记忆服务共用 vector_store.VectorCollection，不再依赖 ChromaDB 容器）
+from vector_store import VectorCollection  # noqa: E402
+l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的记忆提取，像给未来的自己写便签。
 

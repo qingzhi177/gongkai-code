@@ -1,3 +1,5 @@
+# ⚠️ 2026-10-16 起（Phase 1）记忆库已不再使用 ChromaDB：向量存在 SQLite 的 vectors 表里（services/memory-service/vector_store.py）。
+# 容器已停止并设置为不随开机启动；这个文件只保留用于回滚。确认一段时间没问题后，可以删掉容器和 data/chroma/。
 services:
   chromadb:
     image: chromadb/chroma:latest

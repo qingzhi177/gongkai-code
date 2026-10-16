@@ -3,16 +3,14 @@ from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import List, Optional
-import chromadb
 import sqlite3
 import re
 import os
 from dotenv import load_dotenv
 import httpx
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 import jieba
-from rank_bm25 import BM25Okapi
 from cryptography.fernet import Fernet
 import json
 import asyncio
@@ -22,6 +20,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
 import difflib
+from vector_store import VectorCollection
+import text_index
 
 load_dotenv()
 
@@ -64,6 +64,15 @@ async def lifespan(app: FastAPI):
         id="check_narrative",
         max_instances=1,
         coalesce=True,
+    )
+    # Phase 1：索引对账（FTS 增量更新 + 向量补齐/清理孤儿），启动 20 秒后先跑一次
+    scheduler.add_job(
+        reconcile_indexes,
+        IntervalTrigger(minutes=5),
+        id="reconcile_indexes",
+        max_instances=1,
+        coalesce=True,
+        next_run_time=datetime.now() + timedelta(seconds=20),
     )
     scheduler.start()
     print(f"[SCHEDULER] 自动检查任务已启动（间隔 {AUTO_CHECK_INTERVAL_MIN} 分钟）")
@@ -110,11 +119,9 @@ GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:3000")
 SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
 SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-chroma_client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
-try:
-    l1_collection = chroma_client.get_or_create_collection(name="l1_memories")
-except Exception as e:
-    print(f"ChromaDB error: {e}")
+# Phase 1：向量改存 SQLite（vector_store.py），不再依赖 ChromaDB 容器。
+# VectorCollection 与原 chromadb Collection 接口兼容，下面所有 l1_collection.xxx 调用保持不变。
+l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 def init_db():
     conn = sqlite3.connect(str(SQLITE_PATH))
@@ -324,6 +331,8 @@ def init_db():
     conn.close()
 
 init_db()
+# Phase 1：L1 关键词检索索引（FTS5 + jieba，见 text_index.py），触发器保证跨进程的变更都能被对账发现
+text_index.ensure_schema(SQLITE_PATH)
 
 class SearchRequest(BaseModel):
     query: str
@@ -449,6 +458,55 @@ def detect_intent(query: str) -> dict:
     
     return intent
 
+RECONCILE_EMBED_LIMIT = 50  # 每次对账最多补嵌入多少条（防止一次性大量调用嵌入 API）
+
+
+async def reconcile_indexes():
+    """Phase 1：索引对账。不依赖每个写入点都记得同步索引：
+    - FTS：按 id + 内容哈希增量更新（text_index.reconcile）
+    - 向量：清理孤儿（L1 已删除或非 active），补齐缺失（新写入时嵌入失败、迁移遗漏等）
+    """
+    stats = {"fts_added": 0, "fts_removed": 0, "vec_orphans_removed": 0, "vec_embedded": 0, "vec_missing_left": 0}
+    try:
+        stats["fts_added"], stats["fts_removed"] = text_index.reconcile(SQLITE_PATH)
+    except Exception as e:
+        logger.error(f"[RECONCILE] FTS 对账失败: {e}")
+    try:
+        conn = sqlite3.connect(str(SQLITE_PATH), timeout=10)
+        active = dict(conn.execute("SELECT id, content FROM l1_memories WHERE status='active'").fetchall())
+        conn.close()
+        existing = l1_collection.existing_ids()
+        orphans = []
+        for oid in existing:
+            try:
+                ok = oid.startswith("l1_") and int(oid[3:]) in active
+            except ValueError:
+                ok = False
+            if not ok:
+                orphans.append(oid)
+        if orphans:
+            l1_collection.delete(ids=orphans)
+            stats["vec_orphans_removed"] = len(orphans)
+        missing = [lid for lid in active if f"l1_{lid}" not in existing]
+        for lid in missing[:RECONCILE_EMBED_LIMIT]:
+            emb = await get_embedding(active[lid])
+            if emb:
+                l1_collection.add(ids=[f"l1_{lid}"], embeddings=[emb], documents=[active[lid]])
+                stats["vec_embedded"] += 1
+        stats["vec_missing_left"] = max(0, len(missing) - stats["vec_embedded"])
+    except Exception as e:
+        logger.error(f"[RECONCILE] 向量对账失败: {e}")
+    if any(stats.values()):
+        logger.info(f"[RECONCILE] {stats}")
+    return stats
+
+
+@app.post("/index/reconcile")
+async def index_reconcile():
+    """手动触发一次索引对账（迁移后、排查问题时用）"""
+    return await reconcile_indexes()
+
+
 @app.post("/search")
 async def search_memories(req: SearchRequest):
     """检索记忆：向量 + BM25 RRF 融合（semantic/emotion）或精确匹配（exact）"""
@@ -540,21 +598,13 @@ async def search_memories(req: SearchRequest):
             include=["documents", "metadatas", "distances"]
         )
 
-        # 2. BM25 关键词检索
-        conn = sqlite3.connect(str(SQLITE_PATH))
-        c = conn.cursor()
-        c.execute("SELECT id, content FROM l1_memories WHERE status='active'")
-        all_memories = c.fetchall()
-        conn.close()
-
-        bm25_scores = {}
-        if all_memories:
-            corpus = [list(jieba.cut(m[1])) for m in all_memories]
-            bm25 = BM25Okapi(corpus)
-            query_tokens = list(jieba.cut(req.query))
-            scores = bm25.get_scores(query_tokens)
-            for i, m in enumerate(all_memories):
-                bm25_scores[f"l1_{m[0]}"] = scores[i]
+        # 2. 关键词检索（Phase 1：FTS5 + jieba 预分词，替代每次查询全量重建 BM25）
+        #    先做一次增量对账（版本没变时几乎零开销），保证索引与 L1 一致
+        try:
+            text_index.reconcile(SQLITE_PATH)
+        except Exception as e:
+            print(f"[FTS] 对账失败: {e}")
+        bm25_scores = {f"l1_{lid}": sc for lid, sc in text_index.search(SQLITE_PATH, req.query, limit=30)}
 
         # 3. RF 融合
         K = 60  # RF 常数
@@ -2993,6 +3043,12 @@ async def purge_all_data(confirmation: dict):
         except Exception:
             pass
         c.execute("DELETE FROM thinking_records")
+        # 修复：清空后自增 id 会从 1 重新开始，叙事增量水位线也必须归零，
+        # 否则新记忆的 id 要超过旧水位线（比如 247）之前都不会进入叙事
+        try:
+            c.execute("DELETE FROM narrative_state")
+        except Exception:
+            pass
         try:
             c.execute("DELETE FROM custom_prompts")
         except Exception:
@@ -3012,19 +3068,13 @@ async def purge_all_data(confirmation: dict):
         conn.close()
         logger.info("SQLite 数据库已清空")
 
-        # 2. 清空 ChromaDB（重建 collection）
+        # 2. 清空向量与关键词索引（Phase 1：向量已改存 SQLite vectors 表）
         try:
-            chroma_client.delete_collection(name="l1_memories")
-            logger.info("ChromaDB l1_memories collection 已删除")
-            chroma_client.delete_collection(name="memories")
-            logger.info("ChromaDB collection 已删除")
+            l1_collection.reset()
+            text_index.reconcile(SQLITE_PATH, force=True)
+            logger.info("向量与关键词索引已清空")
         except Exception as e:
-            logger.warning(f"删除 ChromaDB collection 失败（可能不存在）: {e}")
-
-        # 重建空 collection
-        chroma_client.get_or_create_collection(name="memories")
-        chroma_client.get_or_create_collection(name="l1_memories")
-        logger.info("ChromaDB collection 已重建")
+            logger.warning(f"清空向量/关键词索引失败: {e}")
 
         # 3. 清空本地面像文件（data/profile/*.md）
         import os as _os
