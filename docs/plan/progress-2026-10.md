@@ -48,3 +48,39 @@
 - **B8 / B9 / B10**（分段提取、quote 校验、证据指针）：放到 Phase 1 的提取流水线 v2 一起做。
 - **S4 备份脚本**：仍会复制 `.env` 并 `push -f` 到私有备份仓库，需要先和你确认备份方式。
 - 需要 sudo 才能做的：nginx `sites-enabled` 里有一份 `memory-system.bak`（重复的 server 块）；`ufw` 状态检查；`0.0.0.0:52528` 端口的归属确认。
+
+---
+
+## 2026-10-16（下午）· Phase 0 收尾 + Phase 1 第一步
+
+### 问题修复
+| 问题 | 原因 | 改动 |
+|---|---|---|
+| Anthropic 格式客户端拉不到模型列表 | nginx `/v1/` 只认 `Authorization: Bearer`，Anthropic 格式发的是 `x-api-key` → 一律 401；CORS 预检写死只放行两个头 | `deploy/nginx/fix-v1-auth.sh`（需 sudo 执行一次，脚本不含 token）：两种头任一匹配即可，预检放行浏览器实际请求的头；网关的 Anthropic 模型列表补 `has_more/first_id/last_id` |
+| Pluvia 会话前两句被存成单独会话 | Pluvia 只给"当前"消息加"（此刻：…）"时间戳，历史里不带 → 会话 id 兜底 MD5 前后不一致；同一条消息也被存两次 | 网关在算会话 id、存 L0、做浮现检索前剥掉时间戳（发给模型的原文不变）；已拆出的 3 个重复会话软删除 |
+| 清空数据后叙事长期不更新 | 清空后 L1 自增 id 从 1 开始，但 `narrative_state` 水位线还停在 247 | purge 时清空 `narrative_state`；当前库已归零 |
+| 叙事校验不拦截（B14） | 增量模式拿整篇叙事对照本批新素材，误报太多 | 只校验新增句子；fail 时存为 `rejected` 不发布（同批最多拦 2 次） |
+| 备份把 `.env` 推到 GitHub（S4） | — | `backup.sh` 不再复制 `.env`、不再 `push -f`，备份前做 `integrity_check` |
+
+### Phase 1 第一步：存储统一
+- **ChromaDB 退役**：向量存在 SQLite 的 `vectors` 表（`vector_store.py`，接口兼容原 Chroma Collection）。已迁移 7/7 条，容器已停止、不随开机启动（回滚：启动容器 + 回退代码）。
+- **关键词检索**：FTS5 + jieba 预分词（`text_index.py`），替代每次查询全量重建 BM25。
+- **索引对账**：`l1_memories` 触发器递增版本号；`reconcile_indexes` 每 5 分钟（及 `POST /index/reconcile`）增量更新 FTS、清理孤儿向量、补齐缺失向量。
+
+### 提取流水线 v2
+- 按会话分段（间隔 > 30 分钟或满 40 条切段），每段带前 6 条只读上下文。
+- **等会话安静 10 分钟再提取**（积压超过 60 分钟不再等）。所以聊天后约 10 分钟，记忆才会出现在 L1 里；Dashboard 的"立即提取"不等待。
+- 每行带行号，模型返回 `msg_refs`（依据的行号）和 `author`（`user_said` / `ai_said` / `co_created` / `ai_felt`）。
+- 原句校验：逐字命中 → `verified`；相似度 ≥ 0.9 → 用原文替换（`verified_fuzzy`）；否则清空原句（`unverified`）。
+- 新列 `evidence_json` / `evidence_status` / `author`。`get_l0_context` 以证据为中心取上下文。
+
+### 网关
+- 寒暄或极短回复（去标点后不超过 3 个字）不走相关度召回。实测"嗯嗯"的 vec_sim 也能到 0.5。
+
+### 待办（下一步）
+- **Pluvia 适配**：
+  1. 前端自有工具（如"拾贝"）目前会被网关当作未知工具在服务端执行，需要改成把 tool_use 交还给前端执行；
+  2. 建议 Pluvia 每次请求带上稳定的 `conversation_id`（body）或 `x-conversation-id` 头，以及 `x-client-name: pluvia`。
+- **浮现门槛校准**：等真实数据多一些后，看 `gateway.log` 里的 `[SURFACE]` 行，重新校准 `SURFACE_MIN_SIM`（当前 0.55）。
+- **Phase 1 剩余**：统一 UTC 时间、任务表 + worker（替代 cron）、迁移框架。
+- **Phase 2**：召回编排（`/compose/*`、投递账本、Reranker、分层注入）。
