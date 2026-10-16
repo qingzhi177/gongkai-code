@@ -74,6 +74,10 @@ function computeConvId(req) {
 // 不该存进 L0（否则模板 prompt + 标题会污染记忆、被 L1 提取、被 recall 搜到）。
 // 特征：user 消息里含 Kelivo 模板的固定英文句子。命中则跳过保存（标题照常返回）。
 function isTitleGenerationRequest(req) {
+  // 前端显式声明"这条请求不进记忆"（Pluvia 的标题生成、连接测试等）：
+  // body.memory_skip === true，或请求头 x-memory-skip: 1。命中后同样跳过保存与展示计数。
+  if (req.body && req.body.memory_skip === true) return true;
+  if (String(req.headers['x-memory-skip'] || '') === '1') return true;
   const msgs = req.body.messages || [];
   for (const m of msgs) {
     if (m.role !== 'user') continue;
