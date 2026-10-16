@@ -45,13 +45,22 @@ function rememberUsage(convId, usage) {
 //  且同一对话窗口内跨轮稳定。老代码只读 body，导致每轮用"首条user的MD5"生成 id，
 //  Kelivo 每轮只发当前消息 → 每轮 id 都不同 → 对话被打散成一堆单条）。
 // 都没有才 fallback 到首条 user 消息的 MD5（保底，理论上不会走到）。
+// Pluvia 会在"当前这条" user 消息末尾追加时间戳，如 "  （此刻：10月16日 周五 02:28）"，历史消息里则不带。
+// 不剥掉的话：① 首轮请求的首条消息带戳、后续轮不带戳 → MD5 兜底算出的会话 id 不同 → 前两句被存成单独会话；
+// ② 同一条消息先带戳存一次、下一轮不带戳再存一次 → L0 版本抖动（superseded 重复）。
+// 网关自己会注入时间头，所以存储、会话 id、检索查询都用剥掉戳的文本；发给模型的原文不动。
+const CLIENT_STAMP_RE = /\s*（此刻：[^（）\n]{1,40}）\s*$/;
+function stripClientStamp(text) {
+  return typeof text === 'string' ? text.replace(CLIENT_STAMP_RE, '') : text;
+}
+
 function resolveConvId(req) {
   if (req.body.conversation_id) return req.body.conversation_id;
   const headerConvId = req.headers['x-conversation-id'];
   if (headerConvId) return headerConvId;
   const client = req.headers['x-client-name'] || 'kelivo';
   const firstUserMsg = (req.body.messages || []).find(m => m.role === 'user');
-  const seed = firstUserMsg ? firstUserMsg.content : String(Date.now());
+  const seed = firstUserMsg ? stripClientStamp(toPlainText(firstUserMsg.content)) : String(Date.now());
   return client + '_' + crypto.createHash('md5').update(seed).digest('hex').substring(0, 8);
 }
 
@@ -153,7 +162,7 @@ function cleanMessagesForSave(messages, aiText) {
   const out = [];
   for (const m of (pre || [])) {
     if (!m || m.role === 'system') continue;
-    const text = toPlainText(m.content);
+    const text = m.role === 'user' ? stripClientStamp(toPlainText(m.content)) : toPlainText(m.content);
     if (!text) continue;
     const last = out[out.length - 1];
     // 相邻同 role 且空白无关内容相同 → 视为重复，保留先到的那条
@@ -1322,7 +1331,7 @@ async function chatCompletionsMain(req, res) {
     const menuCtx = { shownIds: [] };   // 本轮浮现的记忆 id，回复成功后再计入展示指标
     const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
       getProfile(),
-      getMemoryMenu(userContent, convIdForMenu, menuCtx),
+      getMemoryMenu(stripClientStamp(toPlainText(userContent)), convIdForMenu, menuCtx),
       getSharedNarrative(),
       getRecentSummary(),
       getCustomPrompt()
@@ -1845,9 +1854,13 @@ async function refreshModelsCache(force = false) {
 
 app.get('/v1/models', async (req, res) => {
   await refreshModelsCache();
-  if (req.headers['anthropic-version']) {
+  if (req.headers['anthropic-version'] || req.headers['x-api-key']) {
+    // Anthropic Models API 格式（补齐 has_more / first_id / last_id，部分客户端会校验这几个字段）
     return res.json({
-      data: modelsCache.map(id => ({ type: 'model', id, display_name: id, created_at: new Date(0).toISOString() }))
+      data: modelsCache.map(id => ({ type: 'model', id, display_name: id, created_at: new Date(0).toISOString() })),
+      has_more: false,
+      first_id: modelsCache[0] || null,
+      last_id: modelsCache[modelsCache.length - 1] || null
     });
   }
   res.json({ object: 'list', data: modelsCache.map(id => ({ id, object: 'model', created: 0, owned_by: 'gateway' })) });
