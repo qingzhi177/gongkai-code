@@ -2523,8 +2523,37 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         if not new_narrative:
             return {"status": "error", "message": "生成失败"}
 
-        # 6.5. 忠实度校验（检查是否编造）
-        verification = await verify_narrative_faithfulness(new_narrative, new_memories)
+        # 6.5. 忠实度校验（检查是否编造）。增量模式只校验新增句子（B14）
+        is_full = bool(req.force or not existing)
+        verification = await verify_narrative_faithfulness(
+            new_narrative, new_memories, "" if is_full else existing_narrative)
+
+        # B14：校验结果为 fail 时不发布——草稿存为 rejected（不替换线上版本、不推进水位线），下次自动检查重试。
+        # 同一批素材最多拦截 2 次，第 3 次照常发布并带上校验报告，避免无限重试消耗额度。强制重写不拦截。
+        if verification.get("status") == "fail" and not req.force:
+            conn = sqlite3.connect(str(SQLITE_PATH))
+            c = conn.cursor()
+            prev_rejects = c.execute(
+                "SELECT COUNT(*) FROM shared_narrative WHERE status='rejected' AND last_l1_id=?",
+                (consumed_ids[-1],)
+            ).fetchone()[0]
+            if prev_rejects < 2:
+                last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
+                c.execute(
+                    "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) "
+                    "VALUES (?, ?, ?, ?, 'rejected', ?)",
+                    (new_narrative, last_version + 1, req.trigger_type,
+                     json.dumps({"timestamp": datetime.now().isoformat(), "reason": "忠实度校验未通过，未发布",
+                                 "l1_ids": consumed_ids, "verification": verification}, ensure_ascii=False),
+                     consumed_ids[-1])
+                )
+                conn.commit()
+                conn.close()
+                logger.warning(f"[NARRATIVE] 校验未通过（第 {prev_rejects + 1} 次），草稿已存为 rejected：{verification.get('issues')}")
+                return {"status": "rejected", "message": "叙事忠实度校验未通过，线上版本保持不变",
+                        "verification": verification}
+            conn.close()
+            verification["published_after_rejects"] = prev_rejects
 
         # 7. 保存新版本 + 更新增量状态
         conn = sqlite3.connect(str(SQLITE_PATH))
@@ -3513,12 +3542,14 @@ async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
         logger.error(f"LLM call error in narrative generation: {e}")
         return None
 
-async def verify_narrative_faithfulness(narrative: str, memories: list) -> dict:
+async def verify_narrative_faithfulness(narrative: str, memories: list, existing_narrative: str = "") -> dict:
     """忠实度校验：检查叙事是否编造内容
 
     Args:
         narrative: 生成的叙事文本
         memories: [(id, content, quote, ts, event_msg_id), ...]
+        existing_narrative: 增量模式下的旧叙事。B14 修复：传入后只校验"新增的句子"——
+            以前拿整篇叙事去对照本批新素材，旧叙事里的引号、篇幅都会被误判为编造，导致校验结果没法用来拦截
 
     Returns:
         {
@@ -3544,11 +3575,21 @@ async def verify_narrative_faithfulness(narrative: str, memories: list) -> dict:
                 if l0_context:
                     all_l0_texts.append(l0_context)
 
+        # B14：增量模式只校验新增句子（旧叙事里已有的句子不再重复判定）
+        full_narrative = narrative
+        if existing_narrative:
+            def _sents(t):
+                return [x.strip() for x in re.split(r'[。！？!?\n]+', t or '') if x.strip()]
+            def _nk(t):
+                return re.sub(r'[\s，。！？、,.!?「」『』“”"]', '', t)
+            old_keys = {_nk(x) for x in _sents(existing_narrative)}
+            added = [x for x in _sents(narrative) if _nk(x) not in old_keys]
+            narrative = '。'.join(added)
+
         # 简单启发式检查（避免调用 LLM，节省成本）
         issues = []
 
-        # 1. 检查引号内的话是否在原文中
-        import re
+        # 1. 检查引号内的话是否在原文中（re 已在文件顶部导入；这里不能再局部 import，否则上面的嵌套函数取不到 re）
         quoted_parts = re.findall(r'[「『""]([^」』""]+)[」』""]', narrative)
 
         for quoted in quoted_parts:
@@ -3585,7 +3626,9 @@ async def verify_narrative_faithfulness(narrative: str, memories: list) -> dict:
             "score": round(score, 2),
             "quoted_count": len(quoted_parts),
             "material_length": material_len,
-            "narrative_length": narrative_len
+            "narrative_length": narrative_len,          # 增量模式下是"新增部分"的长度
+            "full_length": len(full_narrative),
+            "checked": "added_only" if existing_narrative else "full"
         }
 
     except Exception as e:
