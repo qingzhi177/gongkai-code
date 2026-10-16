@@ -77,10 +77,35 @@
 ### 网关
 - 寒暄或极短回复（去标点后不超过 3 个字）不走相关度召回。实测"嗯嗯"的 vec_sim 也能到 0.5。
 
+## 2026-10-17（凌晨）· Pluvia 接入约定 v0.2
+
+完整约定见 [`pluvia-gateway-contract.md`](pluvia-gateway-contract.md)。以后主要用 Pluvia，Kelivo 的路径保留不动。
+
+### 网关新增
+- `GET /v1/pluvia/contract`：能力协商，声明 `turn` / `tail` / `client_tools` / `tool_events` 四项。
+- **turn**：一条回复只在最后一轮存 L0，各轮文字合成一条；用户点「停」时中止上游、不存。
+- **tail**：按前端给的「此刻」原文精确剥离，没带时用放宽的兜底规则。
+- **client_tools**：网关只执行 5 个记忆工具，前端工具交回前端执行。交出时这一轮的上游状态（含思考签名、记忆工具结果）存 10 分钟，续问时原样接回，缓存可命中。
+- **tool_events**：记忆工具的执行过程以 `pluvia_tool` 事件推给前端显示，recall 结果去掉了内部打分。
+- **删除会话**：`POST /v1/pluvia/conversations/{id}/delete`（另有 DELETE 写法）。L0 软删，对应 L1 硬删。
+- **时间头开关**：`.env` 里的 `GATEWAY_TIME_HEADER=auto|on|off`，默认 auto。前端带了「此刻」，网关就不再加 `[当前时间]`；带了「离上一句」，就不再加 `[距上次对话]`。
+- **顺带修复**（对所有客户端生效）：
+  - 上游报错时，前端能看到真实原因（如「账户余额不足」）；4xx 不再白白重试 3 次。
+  - 工具循环回传上游时，保留被加密的思考块（`redacted_thinking`）。
+  - OpenAI 格式的 `tool_choice` 会转换成 Anthropic 格式。
+  - `cache_control` 超过 4 个时，自动去掉最早的几个。
+  - `role:"tool"` 的消息不再进 L0。
+
+### 测试
+- `tests/manual/pluvia_contract/run.sh`：假上游 + 假记忆服务 + 端口 3999 上的临时网关，49 项全部通过（含 Kelivo 路径不变的检查）。
+- 线上：Pluvia 格式的真实请求正常返回。
+
+### 发现的问题
+- **上游中转站余额已用完**，所有请求现在返回 403。充值后恢复。
+- 测试用的一条极短请求（带 `tool_choice: "none"` 和一个前端工具），中转站报了 **77,753 个输入 token**，同样大小的请求平常约 3 千，原因未明。充值后用同一条请求、分别带与不带 `tool_choice` 对比一次；如果确实和 `tool_choice: "none"` 有关，就让网关在第 5 轮改成不发工具列表。
+
 ### 待办（下一步）
-- **Pluvia 适配**：
-  1. 前端自有工具（如"拾贝"）目前会被网关当作未知工具在服务端执行，需要改成把 tool_use 交还给前端执行；
-  2. 建议 Pluvia 每次请求带上稳定的 `conversation_id`（body）或 `x-conversation-id` 头，以及 `x-client-name: pluvia`。
+- **Pluvia**：等前端答复约定第 7 节的三件事（系统提示词要不要生效、「工具记录」行的格式、历史里是否保留工具轮次）。
 - **浮现门槛校准**：等真实数据多一些后，看 `gateway.log` 里的 `[SURFACE]` 行，重新校准 `SURFACE_MIN_SIM`（当前 0.55）。
 - **Phase 1 剩余**：统一 UTC 时间、任务表 + worker（替代 cron）、迁移框架。
 - **Phase 2**：召回编排（`/compose/*`、投递账本、Reranker、分层注入）。
