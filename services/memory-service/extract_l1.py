@@ -1,6 +1,9 @@
 import sqlite3
 import os
 import json
+import re
+import difflib
+import unicodedata
 import httpx
 from datetime import datetime
 from pathlib import Path
@@ -87,15 +90,30 @@ EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的
    ✅ "她回来了，说好久不见"（只记事件）
    ✅ "7月15日她回来了"（用具体日期）
 
+10. 对话每行开头的 [#数字] 是行号。标着【只读上下文】的部分只用来理解前因后果，
+   不要从中提取记忆；只从【待提取】部分提取。
+   每条记忆在 msg_refs 里写出它依据的行号（1~3 个，必须是【待提取】部分的行号）。
+   如果对话没有行号，msg_refs 写 []。
+
+11. quote 必须从 msg_refs 指向的那几行里逐字复制，不要改写、不要把不同行拼在一起。
+
+12. author 表示这条记忆"是谁的"：
+   - user_said：她说的话、她的事、她的偏好
+   - ai_said：我说过的话、我答应过的事
+   - co_created：我们一起形成的约定、梗、称呼、共同经历
+   - ai_felt：我的感受（通常对应 event_type=feel）
+
 输出JSON格式：
 [
   {
     "content": "记忆内容（情感类用原句，信息类简短概括）",
-    "quote": "原文中最有质感的片段",
+    "quote": "原文中最有质感的片段（逐字复制）",
     "event_type": "类型",
     "tags": ["具体的词"],
     "valence": 0.5,
-    "arousal": 0.7
+    "arousal": 0.7,
+    "msg_refs": [3, 4],
+    "author": "user_said"
   }
 ]
 
@@ -115,6 +133,12 @@ def ensure_columns():
         for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
             try:
                 conn.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
+            except sqlite3.OperationalError:
+                pass
+        # 提取流水线 v2：证据（引用的 L0 id 列表）、证据校验状态、作者（E 轴）
+        for col, coldef in (("evidence_json", "TEXT"), ("evidence_status", "TEXT"), ("author", "TEXT")):
+            try:
+                conn.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
             except sqlite3.OperationalError:
                 pass
         conn.commit()
@@ -249,46 +273,43 @@ def get_l0_ts(source_id):
     finally:
         conn.close()
 
-def save_l1(memory, conv_id, client, source_id, event_msg_id=None):
+def save_l1(memory, conv_id, client, source_id, event_msg_id=None, evidence_ids=None,
+            evidence_status=None, ts=None):
     """保存 L1 记忆到数据库和向量库
 
     Args:
-        memory: 提取的记忆内容（dict）
+        memory: 提取的记忆内容（dict，quote 已经过校验/纠正）
         conv_id: 会话 ID
         client: 客户端标识
-        source_id: 批次首条消息 id（用于 source_msg_id，向后兼容）
-        event_msg_id: 真正触发提取的消息 id（通常是批次最后一条）
+        source_id: 分段首条消息 id（source_msg_id，版本切换级联按它定位"提取批次"，语义不能变）
+        event_msg_id: 最后一条依据消息的 id（叙事校验用它取原文）
+        evidence_ids: 这条记忆真正依据的 L0 id 列表（v2：来自 msg_refs）
+        evidence_status: verified / verified_fuzzy / unverified / no_quote
+        ts: 记忆时间（v2：第一条依据消息的时间；缺省用分段首条消息的时间）
     """
-    ts = get_l0_ts(source_id) or datetime.now().isoformat()
+    ts = ts or get_l0_ts(source_id) or datetime.now().isoformat()
+    author = memory.get("author")
+    if author not in ("user_said", "ai_said", "co_created", "ai_felt"):
+        author = None
     conn = sqlite3.connect(str(SQLITE_PATH))
     c = conn.cursor()
     try:
         c.execute(
-            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, status, ts, event_msg_id) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+            'INSERT INTO l1_memories (content, quote, source_msg_id, conv_id, client, event_type, tags, valence, arousal, '
+            'status, ts, event_msg_id, evidence_json, evidence_status, author) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
             (memory["content"], memory.get("quote", ""), source_id, conv_id, client, memory.get("event_type", "general"),
-             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"), 'active', ts, event_msg_id)
+             json.dumps(memory.get("tags", []), ensure_ascii=False), memory.get("valence"), memory.get("arousal"),
+             'active', ts, event_msg_id,
+             json.dumps(evidence_ids) if evidence_ids else None, evidence_status, author)
         )
         l1_id = c.lastrowid
         conn.commit()
         embedding = get_embedding(memory["content"], resolve_purpose('embedding'))
         if embedding:
-            l1_collection.add(
-                ids=[f"l1_{l1_id}"],
-                embeddings=[embedding],
-                documents=[memory["content"]],
-                metadatas=[{
-                    "ts": ts,
-                    "event_type": memory.get("event_type", "general"),
-                    "tags": json.dumps(memory.get("tags", []), ensure_ascii=False),
-                    "quote": memory.get("quote", ""),
-                    "conv_id": conv_id,
-                    "client": client,
-                    "is_core": 0,
-                    "valence": memory.get("valence") or 0,
-                    "arousal": memory.get("arousal") or 0
-                }]
-            )
-            print(f"  Saved: {memory['content'][:50]}")
+            l1_collection.add(ids=[f"l1_{l1_id}"], embeddings=[embedding], documents=[memory["content"]])
+        else:
+            print("  （向量生成失败，记忆服务的定时对账会自动补上）")
+        print(f"  Saved[{evidence_status}]: {memory['content'][:50]}")
         return l1_id
     except Exception as e:
         print(f"Save error: {e}")
@@ -296,6 +317,7 @@ def save_l1(memory, conv_id, client, source_id, event_msg_id=None):
         return None
     finally:
         conn.close()
+
 
 def mark_extracted(ids):
     conn = sqlite3.connect(str(SQLITE_PATH))
@@ -305,42 +327,179 @@ def mark_extracted(ids):
     conn.commit()
     conn.close()
 
-def main():
-    print(f"[{datetime.now()}] L1 extraction starting...")
+# ================= 提取流水线 v2：分段 · 行号 · 证据 · 原句校验 =================
+QUIET_MINUTES = int(os.getenv("EXTRACT_QUIET_MINUTES", 10))       # 会话安静这么久之后才提取（避免聊到一半就提取）
+BACKLOG_MINUTES = int(os.getenv("EXTRACT_BACKLOG_MINUTES", 60))   # 但最早的未提取消息超过这么久，就不再等
+GAP_MINUTES = int(os.getenv("EXTRACT_GAP_MINUTES", 30))           # 相邻消息间隔超过这么久，切成新的一段
+MAX_SEG_MESSAGES = int(os.getenv("EXTRACT_MAX_SEG_MESSAGES", 40))  # 每段最多多少条（超出后在下一条 user 消息处切开）
+CONTEXT_MESSAGES = 6                                              # 每段前面附带几条只读上下文
+MAX_SEGMENTS_PER_RUN = int(os.getenv("EXTRACT_MAX_SEGMENTS_PER_RUN", 6))
+
+
+def _parse_ts(ts):
+    if not ts:
+        return None
+    try:
+        return datetime.fromisoformat(str(ts).replace("Z", "").replace("T", " ")[:19])
+    except ValueError:
+        return None
+
+
+def get_pending_segments(force=False):
+    """按会话取未提取消息并切段。返回 [(conv_id, client, context_rows, segment_rows)]，row=(id, role, content, ts)
+
+    - 只处理"已经安静了 QUIET_MINUTES 分钟"的会话；最早的未提取消息超过 BACKLOG_MINUTES 时不再等。force=True 忽略等待
+    - 同一会话按 id 顺序（与版本切换级联的批次定位一致），相邻间隔 > GAP_MINUTES 或段长达到上限时切段
+    """
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    try:
+        convs = conn.execute(
+            "SELECT conv_id, MIN(ts), MAX(ts) FROM l0_messages WHERE extracted=0 AND status='active' GROUP BY conv_id"
+        ).fetchall()
+        segments = []
+        for conv_id, oldest_ts, _ in convs:
+            if not force:
+                last_ts = conn.execute(
+                    "SELECT MAX(ts) FROM l0_messages WHERE conv_id=? AND status='active'", (conv_id,)
+                ).fetchone()[0]
+                # datetime() 统一归一化时间格式（L0 的 ts 可能是 "YYYY-MM-DD HH:MM:SS" 也可能是带 T / Z 的 ISO 串）
+                quiet = conn.execute("SELECT datetime(?) <= datetime('now', ?)", (last_ts, f"-{QUIET_MINUTES} minutes")).fetchone()[0]
+                backlog = conn.execute("SELECT datetime(?) <= datetime('now', ?)", (oldest_ts, f"-{BACKLOG_MINUTES} minutes")).fetchone()[0]
+                if not (quiet or backlog):
+                    continue
+            rows = conn.execute(
+                "SELECT id, role, content, ts, client FROM l0_messages "
+                "WHERE conv_id=? AND extracted=0 AND status='active' ORDER BY id ASC", (conv_id,)
+            ).fetchall()
+            if not rows:
+                continue
+            client = rows[0][4]
+            cur = []
+            for r in rows:
+                row = r[:4]
+                if cur:
+                    prev_t, this_t = _parse_ts(cur[-1][3]), _parse_ts(row[3])
+                    gap = (this_t - prev_t).total_seconds() / 60 if (prev_t and this_t) else 0
+                    too_long = len(cur) >= MAX_SEG_MESSAGES and row[1] == "user"
+                    if gap > GAP_MINUTES or too_long or len(cur) >= MAX_SEG_MESSAGES * 2:
+                        segments.append((conv_id, client, cur))
+                        cur = []
+                cur.append(row)
+            if cur:
+                segments.append((conv_id, client, cur))
+        out = []
+        for conv_id, client, seg in segments[:MAX_SEGMENTS_PER_RUN]:
+            ctx = conn.execute(
+                "SELECT id, role, content, ts FROM l0_messages WHERE conv_id=? AND status='active' AND id < ? "
+                "ORDER BY id DESC LIMIT ?", (conv_id, seg[0][0], CONTEXT_MESSAGES)
+            ).fetchall()[::-1]
+            out.append((conv_id, client, ctx, seg))
+        return out
+    finally:
+        conn.close()
+
+
+def build_segment_text(ctx, seg):
+    """带行号的提取文本。返回 (text, line_map)，line_map: 行号 → (l0_id, content)，只含待提取部分"""
+    lines, line_map, n = [], {}, 1
+    if ctx:
+        lines.append("【只读上下文：仅供理解，不要从这里提取】")
+        for mid, role, content, ts in ctx:
+            lines.append(f"[#{n}][{'你' if role == 'user' else '我'}] {content}")
+            n += 1
+        lines.append("【待提取】")
+    for mid, role, content, ts in seg:
+        lines.append(f"[#{n}][{'你' if role == 'user' else '我'}] {content}")
+        line_map[n] = (mid, content)
+        n += 1
+    return "\n".join(lines) + "\n", line_map
+
+
+def _norm(text):
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    return re.sub(r"[\s\W_]+", "", text, flags=re.UNICODE)
+
+
+def verify_quote(quote, ref_texts, all_texts):
+    """quote 校验（B9）：归一化后是原文子串 → verified；否则在原文里找最相近的片段，相似度 ≥ 0.9 → 用原文片段替换
+    （verified_fuzzy）；都不行 → 清空 quote（unverified）。返回 (quote, status, matched_text)"""
+    q = (quote or "").strip()
+    if not q:
+        return "", "no_quote", None
+    nq = _norm(q)
+    if not nq:
+        return "", "no_quote", None
+    for t in list(ref_texts) + list(all_texts):
+        if nq in _norm(t):
+            return q, "verified", t
+    best = (0.0, None, None)
+    for t in (ref_texts or all_texts):
+        L = len(q)
+        if len(t) < max(4, L // 2):
+            continue
+        for i in range(0, max(1, len(t) - L + 1)):
+            w = t[i:i + L]
+            sm = difflib.SequenceMatcher(None, q, w)
+            if sm.quick_ratio() < 0.9:
+                continue
+            r = sm.ratio()
+            if r > best[0]:
+                best = (r, w, t)
+    if best[0] >= 0.9:
+        return best[1], "verified_fuzzy", best[2]
+    return "", "unverified", None
+
+
+def main(force=False):
+    print(f"[{datetime.now()}] L1 extraction starting (v2{', force' if force else ''})...")
     ensure_columns()
-    messages = get_unextracted()
-    if not messages:
-        print("No new messages.")
+    segments = get_pending_segments(force=force)
+    if not segments:
+        print("No segments ready.")
         return
-    print(f"Found {len(messages)} messages.")
-    groups = group_by_conv(messages)
-    for conv_id, msgs in groups.items():
-        text = ""
-        ids = []
-        for msg in msgs:
-            mid, _, role, content, client, ts = msg
-            prefix = "你" if role == "user" else "我"
-            text += f"[{prefix}] {content}\n"
-            ids.append(mid)
-        print(f"Processing {conv_id}: {len(msgs)} messages")
+    for conv_id, client, ctx, seg in segments:
+        ids = [r[0] for r in seg]
+        text, line_map = build_segment_text(ctx, seg)
+        print(f"Processing {conv_id}: {len(seg)} messages (+{len(ctx)} context)")
         memories = call_deepseek(text, resolve_purpose('l1_extract'))
         if memories is None:
-            # B7 修复：调用失败时不再标记为已提取（以前会把这一批永久丢掉），下个周期重试
+            # B7：调用失败时不标记已提取，下个周期重试；连续失败转死信
             dead = mark_failed(ids, LAST_EXTRACT_ERROR or "unknown error")
             print(f"  !! 提取失败，{len(ids)} 条消息保留为未提取，下次重试"
                   + (f"；其中 {dead} 条已连续失败 {MAX_EXTRACT_ATTEMPTS} 次，转为死信(extracted=-1)" if dead else ""))
             continue
-        if memories:
-            print(f"  Extracted {len(memories)} memories")
-            for memory in memories:
-                # 批次首条作为 source_id（向后兼容），批次最后一条作为 event_msg_id（真正触发提取的消息）
-                save_l1(memory, conv_id, msgs[0][4], msgs[0][0], event_msg_id=msgs[-1][0])
-        else:
-            print("  No memories")
+        seg_texts = [r[2] for r in seg]
+        ts_by_id = {r[0]: r[3] for r in seg}
+        stats = {}
+        for memory in memories:
+            refs = memory.get("msg_refs") or []
+            ref_ids, ref_texts = [], []
+            for x in refs if isinstance(refs, list) else []:
+                try:
+                    k = int(x)
+                except (TypeError, ValueError):
+                    continue
+                if k in line_map and line_map[k][0] not in ref_ids:
+                    ref_ids.append(line_map[k][0])
+                    ref_texts.append(line_map[k][1])
+            quote, status, matched = verify_quote(memory.get("quote", ""), ref_texts, seg_texts)
+            memory["quote"] = quote
+            if not ref_ids and matched is not None:
+                # 模型没给（或给错了）行号，但原句能在某一行里找到 → 用那一行作为证据
+                for mid, content in line_map.values():
+                    if content == matched:
+                        ref_ids = [mid]
+                        break
+            stats[status] = stats.get(status, 0) + 1
+            first_ts = ts_by_id.get(ref_ids[0]) if ref_ids else None
+            save_l1(memory, conv_id, client, ids[0],
+                    event_msg_id=(max(ref_ids) if ref_ids else ids[-1]),
+                    evidence_ids=sorted(ref_ids) or None, evidence_status=status, ts=first_ts)
+        print(f"  Extracted {len(memories)} memories {stats if stats else ''}")
         mark_extracted(ids)
     print(f"[{datetime.now()}] Complete.")
-    # B13：叙事自动更新只由记忆服务的 APScheduler 负责（check_and_update_narrative），
-    # 这里不再重复触发（以前两套触发阈值和比较方式不同，可能并发生成、版本互相覆盖）。
+    # B13：叙事自动更新只由记忆服务的 APScheduler 负责（check_and_update_narrative），这里不再重复触发。
+
 
 def resolve_purpose(purpose):
     """按模块配置（model_configs→providers）解析：返回 {base_url, api_key, model} 或 None（回退 .env）"""
@@ -376,4 +535,5 @@ def resolve_purpose(purpose):
         return None
 
 if __name__ == "__main__":
-    main()
+    import sys as _sys
+    main(force="--force" in _sys.argv)

@@ -1,4 +1,4 @@
-"""Phase 0 冒烟测试：提取失败不丢批（B7）、检索修复（B1/B2/B3/B4/B5/B6）
+"""Phase 0/1 冒烟测试：提取失败不丢批（B7）、提取流水线 v2（证据/原句校验）、检索修复（B1~B6）、SQLite 向量与 FTS
 
 用法（在 services/memory-service 目录、用 venv 的 python 运行）：
     cd ~/memory-system/services/memory-service
@@ -61,20 +61,27 @@ def main():
         ex.LAST_EXTRACT_ERROR = "simulated failure (phase0 smoke test)"
         return None
     ex.call_deepseek = fake_fail
-    ex.main()
+    ex.main(force=True)   # v2：提取默认要等会话安静 10 分钟，测试里用 force 立即提取
     ex.call_deepseek = real
     with db() as c:
         rows = c.execute(f"SELECT extracted, extract_attempts FROM l0_messages WHERE id IN ({','.join('?'*len(ids))})", ids).fetchall()
     results.append(check("失败后消息仍为未提取、失败次数 +1",
                          all(r[0] == 0 and (r[1] or 0) >= 1 for r in rows), str(rows[:2])))
 
-    print("[3] 真实提取（DeepSeek）")
-    ex.main()
+    print("[3] 真实提取（DeepSeek，流水线 v2）")
+    ex.main(force=True)
     with db() as c:
         rows = c.execute(f"SELECT extracted FROM l0_messages WHERE id IN ({','.join('?'*len(ids))})", ids).fetchall()
         l1 = c.execute("SELECT id, content, event_type, valence, arousal FROM l1_memories WHERE conv_id=? AND status='active'", (CONV,)).fetchall()
+        ev = c.execute("SELECT id, evidence_json, evidence_status, author, quote FROM l1_memories WHERE conv_id=? AND status='active'", (CONV,)).fetchall()
     results.append(check("提取成功后标记为已提取", all(r[0] == 1 for r in rows)))
     results.append(check("生成了 L1", len(l1) > 0, f"{len(l1)} 条"))
+    results.append(check("v2：每条 L1 都有证据校验状态", all(e[2] for e in ev), str([e[2] for e in ev])))
+    results.append(check("v2：带原句的记忆都绑定了证据消息", all(e[1] for e in ev if e[4]), str([e[1] for e in ev])))
+    print("     作者(E 轴):", [e[3] for e in ev])
+    ctx = call("POST", "/search", {"query": "面试", "mode": "semantic", "n": 1}).get("memories", [{}])
+    if ctx:
+        print("     证据为中心的上下文:", (ctx[0].get("l0_context") or "")[:80].replace("\n", " / "))
     for r in l1:
         print("     ·", r)
 

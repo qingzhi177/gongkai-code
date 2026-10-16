@@ -319,6 +319,14 @@ def init_db():
     except sqlite3.OperationalError:
         pass  # 列已存在，跳过
 
+    # 提取流水线 v2：证据（引用的 L0 id 列表 JSON）、证据校验状态、作者（E 轴：user_said/ai_said/co_created/ai_felt）
+    for col, coldef in (("evidence_json", "TEXT"), ("evidence_status", "TEXT"), ("author", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
+            print(f"[MIGRATE] l1_memories.{col} 已添加")
+        except sqlite3.OperationalError:
+            pass
+
     # B7：提取失败重试计数与错误信息（连续失败 3 次 → extracted=-1 死信，不再自动重试）
     for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
         try:
@@ -374,15 +382,46 @@ def get_l0_context(sqlite_path, l1_id_str):
         conn = sqlite3.connect(str(sqlite_path))
         c = conn.cursor()
         # 先找这条 L1 对应的 conv_id 和 source_msg_id（l0_messages.id）
-        c.execute('SELECT source_msg_id, conv_id FROM l1_memories WHERE id=?', (l1_id_str,))
+        c.execute('SELECT source_msg_id, conv_id, evidence_json FROM l1_memories WHERE id=?', (l1_id_str,))
         row = c.fetchone()
         if not row:
             conn.close()
             return ""
-        source_id, conv_id = row
+        source_id, conv_id, evidence_json = row
         if not conv_id:
             conn.close()
             return ""
+
+        # 提取流水线 v2：有证据（真正依据的 L0 id）时，以证据为中心取上下文（前 2 条 ~ 后 1 条），
+        # 比以前以"批次首条"为锚点准确得多
+        ev_ids = []
+        if evidence_json:
+            try:
+                ev_ids = [int(x) for x in json.loads(evidence_json) if x is not None]
+            except Exception:
+                ev_ids = []
+        if ev_ids:
+            q = ",".join("?" * len(ev_ids))
+            idx_rows = c.execute(
+                f"SELECT msg_idx FROM l0_messages WHERE id IN ({q}) AND conv_id=?", ev_ids + [conv_id]
+            ).fetchall()
+            if idx_rows:
+                lo = min(r[0] for r in idx_rows)
+                hi = max(r[0] for r in idx_rows)
+                c.execute(
+                    'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? AND msg_idx BETWEEN ? AND ? ORDER BY msg_idx ASC',
+                    (conv_id, 'active', max(0, lo - 2), hi + 1)
+                )
+                rows = c.fetchall()
+                conn.close()
+                if rows:
+                    parts = []
+                    for role, content in rows:
+                        prefix = "你" if role == "user" else "我"
+                        parts.append(prefix + ": " + content[:200])
+                    return "\n".join(parts)
+                conn = sqlite3.connect(str(sqlite_path))
+                c = conn.cursor()
 
         # Bug4 修复：用 source_id（l0_messages.id）查出对应的 msg_idx，再做区间查询
         if source_id:
@@ -648,7 +687,7 @@ async def search_memories(req: SearchRequest):
             try:
                 _row = conn.execute(
                     "SELECT status, content, quote, event_type, tags, ts, client, conv_id, valence, arousal, "
-                    "is_core, display_count, last_shown_at, visibility, access_count "
+                    "is_core, display_count, last_shown_at, visibility, access_count, evidence_status, author "
                     "FROM l1_memories WHERE id=?", (l1_id_str,)
                 ).fetchone()
             except Exception:
@@ -656,7 +695,8 @@ async def search_memories(req: SearchRequest):
             if not _row or _row[0] != 'active':
                 continue
             (_status, s_content, s_quote, s_event_type, s_tags, s_ts, s_client, s_conv_id,
-             s_valence, s_arousal, s_is_core, s_display_count, s_last_shown_at, s_visibility, s_access_count) = _row
+             s_valence, s_arousal, s_is_core, s_display_count, s_last_shown_at, s_visibility, s_access_count,
+             s_evidence_status, s_author) = _row
 
             # 软隐藏：visibility=0 不参与检索
             visibility = 1.0 if s_visibility is None else float(s_visibility)
@@ -697,6 +737,8 @@ async def search_memories(req: SearchRequest):
                 "last_shown_at": s_last_shown_at,  # 毫秒时间戳或 None（网关冷却用）
                 "visibility": visibility,
                 "access_count": s_access_count or 0,
+                "evidence_status": s_evidence_status or "",   # v2：verified / verified_fuzzy / unverified / no_quote
+                "author": s_author or "",                     # v2：user_said / ai_said / co_created / ai_felt
             })
 
             # 过滤条件
@@ -3162,7 +3204,8 @@ async def extract_now():
         venv_python = Path(__file__).parent / "venv" / "bin" / "python"
 
         # 在后台运行提取脚本
-        subprocess.Popen([str(venv_python), str(script_path)])
+        # 手动触发时不等待会话安静（--force），立即提取所有未提取的消息
+        subprocess.Popen([str(venv_python), str(script_path), "--force"], cwd=str(Path(__file__).parent))
 
         return {"status": "ok", "message": "提取任务已启动"}
     except Exception as e:
