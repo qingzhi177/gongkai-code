@@ -153,10 +153,12 @@ function dedupKey(s) {
 // opts.stripStamp（默认 true）：对 user 消息套用「此刻」兜底剥离；已按 pluvia.tail 精确剥过时传 false。
 // opts.mergeAssistant：相邻的几条 assistant 合成一条（Pluvia：一条回复中间夹着工具调用时，
 //   前端历史里可能拆成几条；L0 里只存一条，和网关在最后一轮存的保持一致）。
+// opts.pluviaDecor：assistant 消息去掉 Pluvia 加的工具记录 / 链接卡片（约定 8.2），只留正文。
 // role 'tool'（OpenAI 格式的工具结果）一律不进 L0。
 function cleanMessagesForSave(messages, aiText, opts = {}) {
   const stripStamp = opts.stripStamp !== false;
   const mergeAssistant = !!opts.mergeAssistant;
+  const pluviaDecor = !!opts.pluviaDecor;
   // 工具轮后重发去重：assistant(文本A) → user(tool_result) → assistant(文本A 相同)
   // → 跳过第二条 A（保留先发的）。L0 不存工具轮，去掉这种冗余让上下文更干净。
   const pre = [];
@@ -184,13 +186,14 @@ function cleanMessagesForSave(messages, aiText, opts = {}) {
   const out = [];
   for (const m of (pre || [])) {
     if (!m || m.role === 'system' || m.role === 'tool') continue;
-    const text = (m.role === 'user' && stripStamp) ? stripClientStamp(toPlainText(m.content)) : toPlainText(m.content);
+    let text = (m.role === 'user' && stripStamp) ? stripClientStamp(toPlainText(m.content)) : toPlainText(m.content);
+    if (pluviaDecor && m.role === 'assistant') text = stripPluviaAssistantDecor(text).trim();
     if (!text) continue;
     const last = out[out.length - 1];
     // 相邻同 role 且空白无关内容相同 → 视为重复，保留先到的那条
     if (last && last.role === m.role && dedupKey(last.content) === dedupKey(text)) continue;
     if (mergeAssistant && last && last.role === 'assistant' && m.role === 'assistant') {
-      last.content += '\n' + text;
+      last.content += '\n\n' + text;
       continue;
     }
     out.push({ role: m.role, content: text });
@@ -236,7 +239,11 @@ function pluviaCtx(req) {
     const turn = (t && typeof t === 'object' && t.id != null && String(t.id))
       ? { id: String(t.id), round: Math.max(1, parseInt(t.round, 10) || 1), regen_of: t.regen_of || null }
       : null;
-    ctx = { v: String(p.v || ''), turn, tail: typeof p.tail === 'string' ? p.tail : null };
+    ctx = {
+      v: String(p.v || ''), turn, tail: typeof p.tail === 'string' ? p.tail : null,
+      system: p.system === 'append' ? 'append' : 'ignore',                      // 约定 8.1
+      aux: (typeof p.aux === 'string' && p.aux.trim()) ? p.aux.trim() : null    // 约定 8.5
+    };
   }
   req._pv = ctx;
   return ctx;
@@ -249,6 +256,52 @@ function isServerTool(name) {
 }
 function toolNameOf(t) {
   return t ? (t.function ? t.function.name : t.name) : undefined;
+}
+// 客户端发来的 system（OpenAI 的 role:"system" 消息；Anthropic 的 system 字段已在 /v1/messages 入口转成同样的消息）→ 文本块
+function clientSystemBlocks(messages) {
+  const out = [];
+  for (const m of messages || []) {
+    if (!m || m.role !== 'system') continue;
+    if (typeof m.content === 'string') { if (m.content.trim()) out.push({ type: 'text', text: m.content }); continue; }
+    if (!Array.isArray(m.content)) continue;
+    for (const b of m.content) {
+      if (typeof b === 'string') { if (b.trim()) out.push({ type: 'text', text: b }); continue; }
+      if (b && b.type === 'text' && typeof b.text === 'string' && b.text.trim()) {
+        const blk = { type: 'text', text: b.text };
+        if (b.cache_control) blk.cache_control = b.cache_control;
+        out.push(blk);
+      }
+    }
+  }
+  return out;
+}
+// Pluvia 历史里 assistant 消息的固定格式（约定 8.2）：[图片：…] 行 + HEAD（[工具记录 · …] 行）+ 正文 + TAIL（链接卡片 / 整帖）。
+// 存 L0 只要正文，和网关在最后一轮存的保持一致；发给模型的原文不动。
+const PV_HEAD_RE = /^(?:\[(?:工具记录 · [^\n]*|图片：[^\n]*)\]\n)+/;
+const PV_TAIL_RE = /(?:^|\n)\[(?:链接卡片|整帖) · /;
+function stripPluviaAssistantDecor(text) {
+  if (typeof text !== 'string') return text;
+  let s = text.replace(PV_HEAD_RE, '');
+  const cut = s.search(PV_TAIL_RE);
+  if (cut >= 0) s = s.slice(0, cut);
+  return s;
+}
+// 确定转发目标（与 chatCompletionsMain 里的逻辑一致：Dashboard 配置优先，.env 兜底）
+function resolveUpstreamTarget(model) {
+  const claudeBaseUrl = process.env.CLAUDE_BASE_URL || 'https://api.anthropic.com/v1';
+  const defaultModel = process.env.DEFAULT_MODEL || 'deepseek-chat';
+  if (activeConfig && activeConfig.base_url && activeConfig.api_key) {
+    const base = activeConfig.base_url.replace(/\/$/, '');
+    return { apiUrl: base.endsWith('/messages') ? base : base + '/messages', apiKey: activeConfig.api_key,
+      requestModel: model || activeConfig.model || defaultModel };
+  }
+  if (model && model.includes('deepseek')) {
+    return { apiUrl: 'https://api.deepseek.com/v1/chat/completions', apiKey: process.env.DEEPSEEK_API_KEY, requestModel: model };
+  }
+  if (model && (model.includes('claude') || model.includes('opus') || model.includes('sonnet'))) {
+    return { apiUrl: claudeBaseUrl + '/messages', apiKey: process.env.CLAUDE_API_KEY, requestModel: model };
+  }
+  return { apiUrl: claudeBaseUrl + '/messages', apiKey: process.env.CLAUDE_API_KEY, requestModel: defaultModel };
 }
 
 // 按 pluvia.tail 原文精确剥掉「此刻」。返回 { content, ok }。
@@ -434,35 +487,45 @@ function toAnthropicToolChoice(tc) {
   }
   return undefined;
 }
-// Anthropic 一次请求最多 4 个 cache_control 断点。网关 system 自己最多用 3 个，前端在消息/工具上再打标记时可能超；
-// 超了就从最早的消息断点开始去掉（越靠后的断点命中越多）。不超时什么都不改。
+// Anthropic 一次请求最多 4 个 cache_control 断点。网关 system 自己用 1–3 个，Pluvia 的 system 接在后面再占 1 个，
+// 前端在消息里还会打 1 个，可能超。超了按这个顺序去掉（越靠后的断点覆盖的前缀越长、越值得留）：
+// 较早的消息断点 → 工具上的 → 较早的 system 断点 → 最后一个消息断点 → 最后一个 system 断点。不超时什么都不改。
 function capCacheControl(system, messages, tools, max = 4) {
-  let fixed = 0;
-  (system || []).forEach(b => { if (b && b.cache_control) fixed++; });
-  const msgRefs = [], toolRefs = [];
+  const sysRefs = [], msgRefs = [], toolRefs = [];
+  (system || []).forEach((b, i) => { if (b && b.cache_control) sysRefs.push(i); });
   (messages || []).forEach((m, i) => {
     if (m && Array.isArray(m.content)) m.content.forEach((b, j) => { if (b && typeof b === 'object' && b.cache_control) msgRefs.push([i, j]); });
   });
   (tools || []).forEach((t, i) => { if (t && t.cache_control) toolRefs.push(i); });
-  let excess = fixed + msgRefs.length + toolRefs.length - max;
+  let excess = sysRefs.length + msgRefs.length + toolRefs.length - max;
   if (excess <= 0) return 0;
+  const order = [
+    ...msgRefs.slice(0, -1).map(r => ['m', r]),
+    ...toolRefs.map(i => ['t', i]),
+    ...sysRefs.slice(0, -1).map(i => ['s', i]),
+    ...msgRefs.slice(-1).map(r => ['m', r]),
+    ...sysRefs.slice(-1).map(i => ['s', i])
+  ];
   let removed = 0;
-  for (const [i, j] of msgRefs) {
+  for (const [kind, ref] of order) {
     if (excess <= 0) break;
-    const m = messages[i];
-    const content = m.content.slice();
-    const { cache_control, ...rest } = content[j];
-    content[j] = rest;
-    messages[i] = { ...m, content };
+    if (kind === 'm') {
+      const [i, j] = ref;
+      const m = messages[i];
+      const content = m.content.slice();
+      const { cache_control, ...rest } = content[j];
+      content[j] = rest;
+      messages[i] = { ...m, content };
+    } else if (kind === 't') {
+      const { cache_control, ...rest } = tools[ref];
+      tools[ref] = rest;
+    } else {
+      const { cache_control, ...rest } = system[ref];
+      system[ref] = rest;
+    }
     excess--; removed++;
   }
-  for (const i of toolRefs) {
-    if (excess <= 0) break;
-    const { cache_control, ...rest } = tools[i];
-    tools[i] = rest;
-    excess--; removed++;
-  }
-  console.log('[CACHE] cache_control 断点超过', max, '个，去掉了最早的', removed, '个');
+  console.log('[CACHE] cache_control 断点超过', max, '个，去掉了', removed, '个');
   return removed;
 }
 // 把动态的记忆目录 / 时间头注入一条 user 消息。afterCacheMarker：消息里有 cache_control 块时
@@ -1528,12 +1591,13 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
     model: requestModel,
     system,   // 功能5：数组分段（稳定前缀带 cache_control）
     messages,
-    tools,
     max_tokens: maxTokens || 4096,
     stream: true
   };
+  // 没有工具时不带 tools / tool_choice（Pluvia 的辅助请求）；Kelivo 路径总有记忆工具，不受影响
+  if (tools && tools.length) body.tools = tools;
   // 功能7补丁：透传 tool_choice，让强制工具调用生效
-  if (toolChoice) body.tool_choice = toolChoice;
+  if (toolChoice && body.tools) body.tool_choice = toolChoice;
   if (thinking) {
     body.thinking = thinking;
     // adaptive 格式没有 budget_tokens；前端调的预算被 Kelivo 换算成 output_config.effort。
@@ -1543,6 +1607,7 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   }
   // 功能2补丁：透传 output_config（effort），让前端的思考预算调节真正生效。
   if (outputConfig) body.output_config = outputConfig;
+  logUpstreamBody(body);
   // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
   let upstream = null;
   let lastErr = null;
@@ -1685,6 +1750,18 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   });
 }
 
+// 记一行上游请求体的规模（只记大小，不记内容），用来核对中转站报的 token 数
+function logUpstreamBody(body) {
+  try {
+    const sysChars = JSON.stringify(body.system || '').length;
+    const msgChars = JSON.stringify(body.messages || []).length;
+    const toolChars = JSON.stringify(body.tools || []).length;
+    console.log('[UPSTREAM] 请求体：system', sysChars, '字符 | 消息', (body.messages || []).length, '条', msgChars, '字符 | 工具',
+      (body.tools || []).length, '个', toolChars, '字符 | tool_choice', body.tool_choice ? JSON.stringify(body.tool_choice) : '无',
+      '| thinking', body.thinking ? JSON.stringify(body.thinking) : '无');
+  } catch (_) {}
+}
+
 // 读出 axios 错误里的响应体（流式请求时它是一个流），最多 4KB、最多等 3 秒
 async function readErrorBody(e) {
   const d = e && e.response && e.response.data;
@@ -1709,14 +1786,16 @@ function upstreamErrorMessage(raw) {
 
 // 非流式跑一次上游（Pluvia 非流式用），返回结构与 streamRound 一致
 async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal }) {
-  const body = { model: requestModel, system, messages, tools, max_tokens: maxTokens || 4096 };
-  if (toolChoice) body.tool_choice = toolChoice;
+  const body = { model: requestModel, system, messages, max_tokens: maxTokens || 4096 };
+  if (tools && tools.length) body.tools = tools;
+  if (toolChoice && body.tools) body.tool_choice = toolChoice;
   if (thinking) {
     body.thinking = thinking;
     const budget = thinking.budget_tokens || 1024;
     if (body.max_tokens <= budget) body.max_tokens = budget + 4096;
   }
   if (outputConfig) body.output_config = outputConfig;
+  logUpstreamBody(body);
   const r = await axios.post(apiUrl, body, {
     headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
     timeout: 120000,
@@ -1736,6 +1815,26 @@ function addUsageTo(total, u) {
     total.cache_read_input_tokens = (total.cache_read_input_tokens || 0) + u.cache_read_input_tokens;
 }
 
+// ============ Pluvia 辅助请求（约定 8.5：翻译思考链等，body 带 pluvia.aux） ============
+// 不检索记忆；不注入记忆库的 system、记忆目录和时间头；system 只用前端给的；不带网关的记忆工具；不存 L0。
+async function runPluviaAux(req, res, pv) {
+  const messages = req.body.messages || [];
+  const { apiUrl, apiKey, requestModel } = resolveUpstreamTarget(req.body.model);
+  const systemBlocks = clientSystemBlocks(messages);
+  const upstreamMessages = req.body._anthropicFormat
+    ? messages.filter(m => m && m.role !== 'system').map(m => ({ ...m }))
+    : oaMessagesToAnthropic(messages);
+  const tools = (req.body.tools || []).map(toAnthropicTool);
+  capCacheControl(systemBlocks, upstreamMessages, tools);
+  console.log('[PLUVIA] 辅助请求 aux=' + pv.aux + '：不检索、不注入、不存');
+  return await runPluvia({
+    req, res, pv, stream: !!req.body.stream, isAnthropic: !!req.body._anthropicFormat,
+    apiUrl, apiKey, requestModel, systemBlocks: systemBlocks.length ? systemBlocks : undefined,
+    messages: upstreamMessages, allTools: tools, toolChoice: toAnthropicToolChoice(req.body.tool_choice),
+    menuCtx: { shownIds: [] }, convId: resolveConvId(req), continued: false
+  });
+}
+
 // ============ Pluvia v0.2 主流程（turn / tail / client_tools / tool_events） ============
 // 和 Kelivo 路径的区别：
 //  - 记忆工具在网关执行，过程用 pluvia_tool 事件告诉前端；不发 Kelivo 那两张变通卡片；
@@ -1745,7 +1844,7 @@ function addUsageTo(total, u) {
 async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, requestModel, systemBlocks, messages, allTools, toolChoice, menuCtx, convId, continued }) {
   const key = pv.turn ? turnKey(convId, pv.turn.id) : null;
   const prev = (key && continued) ? turnStoreGet(key) : null;   // 本条回复前几轮的累计（文字、思考、浮现的记忆）
-  const skipMemory = isTitleGenerationRequest(req);
+  const skipMemory = isTitleGenerationRequest(req) || !!pv.aux;   // 辅助请求（翻译思考链等）不进记忆
   const ac = new AbortController();
   let clientGone = false;
   res.on('close', () => {
@@ -1788,7 +1887,7 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
       result = stream ? await streamRound({ ...args, emitter }) : await upstreamOnce(args);
       addUsageTo(totalUsage, result.usage);
       if (emitter) emitter.closeBlock();
-      const t = extractAssistantText(result);
+      const t = extractAssistantText(result).trim();
       if (t) roundTexts.push(t);
       const th = result.content.filter(c => c.type === 'thinking').map(c => c.thinking || '').join('\n');
       if (th) thinkTexts.push(th);
@@ -1879,12 +1978,14 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
   if (!prev && pv.turn && pv.turn.round > 1) {
     // 没有存档（过期/重启）：前几轮的文字从前端回传的 assistant 里取
     const tail = memMsgs.slice(turnCut(memMsgs, pv.turn.round)).filter(m => m && m.role === 'assistant')
-      .map(m => toPlainText(m.content)).filter(Boolean);
+      .map(m => stripPluviaAssistantDecor(toPlainText(m.content)).trim()).filter(Boolean);
     priorTexts = [...tail, ...roundTexts];
   }
-  const aiText = priorTexts.join('\n');
+  // 各轮正文用空行连接，和前端历史里的写法一致（约定 8.2）
+  const aiText = priorTexts.join('\n\n');
   const cut = pv.turn ? turnCut(memMsgs, pv.turn.round) : memMsgs.length;
-  const cleaned = cleanMessagesForSave(memMsgs.slice(0, cut), aiText, { stripStamp: !req._tailOk, mergeAssistant: true });
+  const cleaned = cleanMessagesForSave(memMsgs.slice(0, cut), aiText,
+    { stripStamp: !req._tailOk, mergeAssistant: true, pluviaDecor: true });
   axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
     conv_id: convId, client: req.headers['x-client-name'] || 'pluvia', messages: cleaned
   }).catch(err => console.error('保存对话失败:', err.message));
@@ -1908,7 +2009,7 @@ function sendPluviaNonStream(res, { isAnthropic, requestModel, result, usage, to
     if (toolEvents.length) out.pluvia_tools = toolEvents;
     return res.json(out);
   }
-  const message = { role: 'assistant', content: texts.join('\n') };
+  const message = { role: 'assistant', content: texts.join('\n\n') };
   if (handoff) {
     message.tool_calls = clientUses.map(u => ({
       id: u.id, type: 'function', function: { name: u.name, arguments: JSON.stringify(u.input || {}) }
@@ -2024,6 +2125,9 @@ async function chatCompletionsMain(req, res) {
       return;
     }
 
+    // Pluvia 辅助请求（约定 8.5）：完全不走记忆，单独处理
+    if (pv && pv.aux) return await runPluviaAux(req, res, pv);
+
     // 获取用户最新消息（检索用「给记忆用」的版本：剥掉 Pluvia 的「此刻」）
     let lastUserIdx = -1;
     for (let i = messages.length - 1; i >= 0; i--) {
@@ -2136,6 +2240,17 @@ ${profile}
 
     // 功能5：把动态的相关记忆目录注入到最新一条 user 消息前面（保持 system 前缀稳定）。
     // content 可能是字符串或 Anthropic 块数组，两种都处理。
+    // Pluvia 约定 8.1：pluvia.system = "append" 时，把前端的 system 接在记忆库 system 后面。
+    // 前端自己打的缓存标记去掉，统一在最后一块放一个 1 小时断点（和网关 system 的其它断点一致）。
+    if (pv && pv.system === 'append') {
+      const cs = clientSystemBlocks(messages).map(({ cache_control, ...b }) => b);
+      if (cs.length) {
+        cs[0] = { ...cs[0], text: '\n\n---\n\n' + cs[0].text };
+        cs[cs.length - 1].cache_control = { type: 'ephemeral', ttl: '1h' };
+        systemBlocks.push(...cs);
+      }
+    }
+
     // Pluvia：OpenAI 格式先转成 Anthropic 格式（工具调用/工具结果/图片），续问时直接用接回的那一轮。
     const augmentedMessages = cont ? cont.messages
       : (pvClient && !req.body._anthropicFormat) ? oaMessagesToAnthropic(messages)

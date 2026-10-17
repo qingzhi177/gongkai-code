@@ -134,7 +134,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
       && s.tools[1].content.includes('一起听过晴天') && !s.tools[1].content.includes('valence'), 'T4 pluvia_tool running→done，结果里没有内部打分', s.tools);
     ok(upReqs(d).length === 2 && JSON.stringify(upReqs(d)[1].messages.slice(-1)).includes('toolu_rec1'), 'T4 第二次上游带上了 recall 的结果');
     const sv = saves(d);
-    ok(sv.length === 1 && sv[0].b.messages.slice(-1)[0].content === '我想想\n好啦，弄好了', 'T4 L0 存一次，整条回复合成一条', sv.map(x => x.b));
+    ok(sv.length === 1 && sv[0].b.messages.slice(-1)[0].content === '我想想\n\n好啦，弄好了', 'T4 L0 存一次，整条回复合成一条', sv.map(x => x.b));
   }
 
   console.log('T5 OpenAI 流式：记忆工具 + 前端工具混合，两轮');
@@ -178,7 +178,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(JSON.stringify(up.messages[0].content).includes('21:40'), 'T5 续问用的是第 1 轮发给模型的原样（缓存可命中）');
     const sv = saves(d2);
     ok(sv.length === 1 && sv[0].b.messages.length === 2 && sv[0].b.messages[0].content === '放首歌 [C]' &&
-      sv[0].b.messages[1].content === '我去看看\n好啦，弄好了', 'T5 最后一轮存 L0：不含工具消息/附图，回复合成一条', sv.map(x => x.b));
+      sv[0].b.messages[1].content === '我去看看\n\n好啦，弄好了', 'T5 最后一轮存 L0：不含工具消息/附图，回复合成一条', sv.map(x => x.b));
   }
 
   console.log('T6 Anthropic 流式：前端工具连续两轮（index 连续、思考块成块）');
@@ -215,7 +215,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(upReqs(d3)[0].messages.length === 5, 'T6 第 3 轮上游 5 条（前两轮都接回）', upReqs(d3)[0].messages.map(x => x.role));
     const sv = saves(d3);
     ok(sv.length === 1 && sv[0].b.messages.length === 2 && sv[0].b.messages[0].content === '来点歌 [D]' &&
-      sv[0].b.messages[1].content === '放首歌\n再存一下\n好啦，弄好了', 'T6 存 L0 一次', sv.map(x => x.b));
+      sv[0].b.messages[1].content === '放首歌\n\n再存一下\n\n好啦，弄好了', 'T6 存 L0 一次', sv.map(x => x.b));
   }
 
   console.log('T7 用户点停：前端断开 → 不存、上游被中止');
@@ -260,7 +260,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     await sleep(400);
     const sv = saves(since(m));
     ok(j2.choices[0].finish_reason === 'stop' && j2.choices[0].message.content === '好啦，弄好了', 'T9 第 2 轮', j2);
-    ok(sv.length === 1 && sv[0].b.messages[1].content === '我去看看\n好啦，弄好了', 'T9 存 L0 一次', sv.map(x => x.b));
+    ok(sv.length === 1 && sv[0].b.messages[1].content === '我去看看\n\n好啦，弄好了', 'T9 存 L0 一次', sv.map(x => x.b));
   }
 
   console.log('T10 存档丢失时的兜底续问（按前端回传的历史转换，去掉 thinking）');
@@ -277,7 +277,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(s.text === '好啦，弄好了' && up.messages.length === 3 && up.messages[1].content.some(b => b.type === 'tool_use') &&
       up.messages[2].content[0].type === 'tool_result' && up.thinking === undefined, 'T10 转换正确、不带 thinking', up);
     const sv = saves(d);
-    ok(sv.length === 1 && sv[0].b.messages.length === 2 && sv[0].b.messages[1].content === '我去看看\n好啦，弄好了', 'T10 存 L0', sv.map(x => x.b));
+    ok(sv.length === 1 && sv[0].b.messages.length === 2 && sv[0].b.messages[1].content === '我去看看\n\n好啦，弄好了', 'T10 存 L0', sv.map(x => x.b));
   }
 
   console.log('T11 memory_skip 不存');
@@ -336,6 +336,77 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
       body: JSON.stringify({ model: 'fake-model', stream: true, messages: [{ role: 'user', content: '在吗 [E]' }] }) })));
     await sleep(300);
     ok(s2.text.includes('账户余额不足（测试）') && upReqs(since(m2)).length === 1, 'T15 Kelivo 路径同样显示真实原因', s2);
+  }
+
+  console.log('T16 pluvia.system = append / ignore（约定 8.1）');
+  {
+    const m = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sys',
+      pluvia: { v: '0.2', turn: { id: 'tsys1', round: 1 }, tail: '', system: 'append' },
+      messages: [{ role: 'system', content: '我是 Pluvia 的提示词' }, { role: 'user', content: '嗨 [A]' }] }));
+    await sleep(300);
+    const up = upReqs(since(m))[0];
+    const last = up.system[up.system.length - 1];
+    ok(up.system.length >= 2 && up.system[0].text.includes('记忆系统') && last.text.includes('我是 Pluvia 的提示词') &&
+      last.cache_control && last.cache_control.ttl === '1h', 'T16 append：接在记忆库 system 后面，带 1 小时断点',
+      up.system.map(b => ({ t: b.text.slice(0, 16), cc: b.cache_control })));
+    const m2 = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sys',
+      pluvia: { v: '0.2', turn: { id: 'tsys2', round: 1 }, tail: '', system: 'ignore' },
+      messages: [{ role: 'system', content: '我是 Pluvia 的提示词' }, { role: 'user', content: '嗨 [A]' }] }));
+    await sleep(300);
+    ok(!JSON.stringify(upReqs(since(m2))[0].system).includes('我是 Pluvia 的提示词'), 'T16 ignore：不带前端 system');
+  }
+
+  console.log('T17 Anthropic 格式 append：前端 system 数组带缓存标记');
+  {
+    const m = mark();
+    await (await post('/v1/messages', { model: 'fake-model', stream: false, max_tokens: 500, conversation_id: 'conv-sys2',
+      system: [{ type: 'text', text: '端点提示词' }, { type: 'text', text: '会话提示词', cache_control: { type: 'ephemeral' } }],
+      pluvia: { v: '0.2', turn: { id: 'tsys3', round: 1 }, tail: '', system: 'append' },
+      messages: [{ role: 'user', content: [{ type: 'text', text: '嗨 [A]', cache_control: { type: 'ephemeral' } }] }] },
+      { 'x-api-key': 'x', 'anthropic-version': '2023-06-01' })).json();
+    const up = upReqs(since(m))[0];
+    const n = up.system.length;
+    ok(up.system[n - 2].text.includes('端点提示词') && !up.system[n - 2].cache_control && up.system[n - 1].text === '会话提示词' &&
+      up.system[n - 1].cache_control.ttl === '1h' && countCC(up) <= 4, 'T17 只在最后一块留 1 小时断点',
+      up.system.map(b => ({ t: b.text.slice(0, 12), cc: b.cache_control })));
+  }
+
+  console.log('T18 辅助请求（pluvia.aux，约定 8.5）：不走记忆');
+  {
+    const m = mark();
+    const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, memory_skip: true,
+      tools: oaTools, pluvia: { v: '0.2', client: 'pluvia', aux: 'translate', system: 'append' },
+      messages: [{ role: 'system', content: '把下面的思考过程翻译成中文' }, { role: 'user', content: 'I think [A]' }] })));
+    await sleep(300);
+    const d = since(m); const up = upReqs(d)[0];
+    ok(s.text === '你好呀' && up.system.length === 1 && up.system[0].text === '把下面的思考过程翻译成中文' &&
+      !JSON.stringify(up.messages).includes('[当前时间') && up.messages[0].content === 'I think [A]',
+      'T18 system 只用前端的，不注入记忆目录 / 时间头', up);
+    ok(up.tools.length === 1 && up.tools[0].name === 'music_tool', 'T18 不带网关的记忆工具', up.tools && up.tools.map(t => t.name));
+    ok(!d.mem.some(x => x.k === 'search' || x.k === 'save' || x.k === 'thinking'), 'T18 不检索、不存', d.mem.map(x => x.k));
+    const m2 = mark();
+    await (await post('/v1/chat/completions', { model: 'fake-model', stream: false, memory_skip: true,
+      pluvia: { v: '0.2', aux: 'translate' }, messages: [{ role: 'system', content: '翻译' }, { role: 'user', content: 'hi [A]' }] })).json();
+    const up2 = upReqs(since(m2))[0];
+    ok(!('tools' in up2) && !('tool_choice' in up2), 'T18 没有工具时不带 tools 字段', Object.keys(up2));
+  }
+
+  console.log('T19 存 L0 时去掉工具记录 / 链接卡片（约定 8.2）');
+  {
+    const m = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-head',
+      pluvia: { v: '0.2', turn: { id: 'th1', round: 1 }, tail: '' },
+      messages: [
+        { role: 'user', content: '放首歌吧 [A]' },
+        { role: 'assistant', content: '[图片：晴天.jpg]\n[工具记录 · 听歌 · 晴天]\n[工具记录 · 拾贝 · 一张照片]\n放好了\n\n好听吗\n[链接卡片 · B站] 晴天 · @周 · 摘要 · 1万' },
+        { role: 'user', content: '好听 [A]' }
+      ] }));
+    await sleep(300);
+    const d = since(m); const sv = saves(d);
+    ok(sv.length === 1 && sv[0].b.messages[1].content === '放好了\n\n好听吗' && sv[0].b.messages[3].content === '你好呀', 'T19 L0 只存正文', sv.map(x => x.b));
+    ok(JSON.stringify(upReqs(d)[0].messages[1]).includes('[工具记录 · 听歌 · 晴天]'), 'T19 发给模型的原文不变');
   }
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);
