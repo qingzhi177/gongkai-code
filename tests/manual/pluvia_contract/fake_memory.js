@@ -16,7 +16,7 @@ app.get('/last_session', (q, r) => r.json({ last_ts: '2026-10-14 01:00:00' }));
 app.post('/search', (q, r) => {
   log('search', q.body);
   r.json({ memories: [{ id: 7, l1_summary: '一起听过晴天', vec_sim: 0.9, score: 1,
-    metadata: { ts: '2026-10-01T10:00:00', event_type: 'event', client: 'pluvia', valence: 0.5, arousal: 0.6 },
+    metadata: { ts: '2026-10-01 20:30:00', event_type: 'event', client: 'pluvia', valence: 0.5, arousal: 0.6 },
     l0_context: '用户：晴天\nAI：好' }] });
 });
 app.post('/search_serendipity', (q, r) => r.json({ memories: [] }));

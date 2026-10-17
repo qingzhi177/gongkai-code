@@ -66,6 +66,52 @@ function stripClientStamp(text) {
   return out.replace(CLIENT_STAMP_RE, '');
 }
 
+// ============ 时间（Phase 1：统一 UTC） ============
+// 记忆服务里的时间一律按 UTC 存（'YYYY-MM-DD HH:MM:SS'，不带时区标记）；给模型看的地方换算成用户时区
+// （.env 的 USER_TZ，默认 Asia/Shanghai）。以前有的地方把 UTC 当北京时间用，日期会差 8 小时（凌晨的事被算成前一天）。
+const USER_TZ = process.env.USER_TZ || 'Asia/Shanghai';
+const USER_TZ_LABEL = USER_TZ === 'Asia/Shanghai' ? '北京时间' : USER_TZ;
+const WEEKDAY_CN = { Mon: '周一', Tue: '周二', Wed: '周三', Thu: '周四', Fri: '周五', Sat: '周六', Sun: '周日' };
+// 解析库里存的时间：不带时区的当 UTC，带 Z / 偏移的按本身，也支持毫秒时间戳。解析不了返回 null。
+function parseStoredTs(v) {
+  if (v == null || v === '') return null;
+  if (v instanceof Date) return isNaN(v.getTime()) ? null : v;
+  if (typeof v === 'number') return new Date(v > 1e12 ? v : v * 1000);
+  let s = String(v).trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
+    s += 'T00:00:00Z';
+  } else {
+    if (/^\d{4}-\d{2}-\d{2} \d/.test(s)) s = s.replace(' ', 'T');
+    if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?$/.test(s)) s += 'Z';
+  }
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+const LOCAL_FMT = new Intl.DateTimeFormat('en-US', {
+  timeZone: USER_TZ, year: 'numeric', month: '2-digit', day: '2-digit',
+  hour: '2-digit', minute: '2-digit', second: '2-digit', hourCycle: 'h23', weekday: 'short'
+});
+function localParts(d) {
+  const p = {};
+  for (const x of LOCAL_FMT.formatToParts(d)) p[x.type] = x.value;
+  return p;
+}
+// 'YYYY-MM-DD HH:MM'（用户时区）；seconds 加秒，weekday 加「周几」，time:false 只要日期
+function fmtLocal(v, { time = true, seconds = false, weekday = false } = {}) {
+  const d = parseStoredTs(v);
+  if (!d) return '';
+  const p = localParts(d);
+  let s = `${p.year}-${p.month}-${p.day}`;
+  if (time) s += ` ${p.hour}:${p.minute}` + (seconds ? `:${p.second}` : '');
+  if (weekday) s += ' ' + (WEEKDAY_CN[p.weekday] || '');
+  return s;
+}
+// 用户时区的日历天编号（按日历天算今天 / 昨天）
+function localDayNumber(d) {
+  const p = localParts(d);
+  return Math.floor(Date.UTC(+p.year, +p.month - 1, +p.day) / 86400000);
+}
+
 function resolveConvId(req) {
   if (req.body.conversation_id) return req.body.conversation_id;
   const headerConvId = req.headers['x-conversation-id'];
@@ -892,13 +938,9 @@ async function getCustomPrompt() {
 async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
   const showClock = TIME_HEADER_MODE === 'on' || (TIME_HEADER_MODE !== 'off' && !clock.hasClock);
   const showGap = TIME_HEADER_MODE === 'on' || (TIME_HEADER_MODE !== 'off' && !clock.hasGap);
-  // 1. 当前北京时间（UTC+8）。realNowMs 用真实 UTC epoch 算间隔，
-  //    shifted 仅用于拼北京时间显示串——setHours 会改 epoch，
-  //    若用 shifted.getTime() 算间隔会把每个间隔多算 8 小时。
+  // 1. 当前时间（用户时区，带周几）。realNowMs 是真实的 UTC 毫秒数，用来算间隔。
   const realNowMs = Date.now();
-  const shifted = new Date(realNowMs);
-  shifted.setHours(shifted.getHours() + 8);
-  const currentDateStr = shifted.toISOString().substring(0, 16).replace('T', ' ');
+  const currentDateStr = fmtLocal(new Date(realNowMs), { weekday: true });
 
   // 2. 距上次对话的间隔感知（阈值触发）
   let sessionNote = '';
@@ -909,8 +951,8 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
     );
     const lastTs = sessionRes.data.last_ts;
     if (lastTs) {
-      // SQLite 存的是 UTC（"YYYY-MM-DD HH:MM:SS"）。空格换 T 再补 Z 才能被稳定解析成 UTC。
-      const lastDate = new Date(lastTs.replace(' ', 'T') + 'Z');
+      // 库里存的是 UTC（"YYYY-MM-DD HH:MM:SS"），parseStoredTs 按 UTC 解析；解析不了会在下一行抛错、被外层跳过
+      const lastDate = parseStoredTs(lastTs);
       const gapHours = (realNowMs - lastDate.getTime()) / (1000 * 60 * 60);
       if (gapHours >= SESSION_GAP_THRESHOLD_HOURS && gapHours < 24) {
         sessionNote = `距上次对话约${Math.round(gapHours)}小时`;
@@ -926,7 +968,7 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
 
   // 3. 构建头部（时间锚点 + 可选的间隔感知）；两项都不加时头部为空，没有浮现记忆就整段不注入
   const headerLines = [];
-  if (showClock) headerLines.push(`[当前时间：${currentDateStr}（北京时间）]`);
+  if (showClock) headerLines.push(`[当前时间：${currentDateStr}（${USER_TZ_LABEL}）]`);
   if (sessionNote) headerLines.push(`[${sessionNote}]`);
   const header = headerLines.join('\n');
 
@@ -1019,7 +1061,7 @@ async function serendipitousSurfacing(convId) {
     const weights = candidates.map(m => {
       const arousal = m.metadata.arousal || 0;
       const coreBonus = m.metadata.is_core ? 0.5 : 0;
-      const memoryDate = new Date(m.metadata.ts);
+      const memoryDate = parseStoredTs(m.metadata.ts) || new Date();
       const daysAgo = (Date.now() - memoryDate.getTime()) / (24 * 3600 * 1000);
       const timeDecay = Math.max(0.3, 1 - daysAgo / 365);
       return (arousal + coreBonus) * timeDecay;
@@ -1096,29 +1138,33 @@ function toFuzzyTime(isoTimestamp) {
   if (!isoTimestamp) return '不知何时';
 
   try {
-    const memoryDate = new Date(isoTimestamp);
+    // 按用户时区的日历天算（以前按「过了几个 24 小时」，昨天傍晚的事会被说成「今天早些时候」，
+    // 而且把 UTC 当本地时间解析，又差了 8 小时）
+    const memoryDate = parseStoredTs(isoTimestamp);
+    if (!memoryDate) return '很久之前';
     const now = new Date();
-    const daysAgo = Math.floor((now - memoryDate) / (24 * 3600 * 1000));
+    const dayDiff = localDayNumber(now) - localDayNumber(memoryDate);
 
-    if (daysAgo < 1) return '今天早些时候';
-    if (daysAgo < 3) return '前两天';
-    if (daysAgo < 7) return '最近';
-    if (daysAgo < 14) return '前阵子';
-    if (daysAgo < 30) return '不久之前';
+    if (dayDiff <= 0) return '今天早些时候';
+    if (dayDiff === 1) return '昨天';
+    if (dayDiff === 2) return '前天';
+    if (dayDiff < 7) return '最近';
+    if (dayDiff < 14) return '前阵子';
+    if (dayDiff < 30) return '不久之前';
 
-    // 季节映射
-    const month = memoryDate.getMonth();  // 0-11
+    // 季节映射（用户时区的月份）
+    const month = +localParts(memoryDate).month - 1;  // 0-11
     const seasons = [
       '冬天', '冬末', '早春', '春天', '晚春', '初夏',
       '夏天', '盛夏', '初秋', '秋天', '深秋', '初冬'
     ];
     const season = seasons[month];
 
-    if (daysAgo < 365) {
+    if (dayDiff < 365) {
       return season;
     } else {
-      const yearDiff = now.getFullYear() - memoryDate.getFullYear();
-      if (yearDiff === 1) return `去年${season}`;
+      const yearDiff = +localParts(now).year - +localParts(memoryDate).year;
+      if (yearDiff <= 1) return `去年${season}`;
       return `${yearDiff}年前的${season}`;
     }
   } catch (e) {
@@ -1211,7 +1257,7 @@ async function executeTool(name, args) {
       memories.forEach((m, i) => {
         const meta = m.metadata || {};
         result += `\n━━ 记忆 #${i + 1} ━━\n`;
-        const ts = meta.ts ? meta.ts.substring(0, 10) : '未知时间';
+        const ts = fmtLocal(meta.ts) || '未知时间';   // 用户时区的日期和时刻（以前直接截 UTC 日期）
         const feelSrc = (meta.event_type === 'feel')
           ? ((meta.client === 'ai_self') ? 'AI自述' : '对话提取') : '';
         result += `📅 ${ts} | 🏷️ ${meta.event_type || ''} | 📍 ${meta.client || ''}${feelSrc ? '（' + feelSrc + '）' : ''}\n`;
@@ -1268,9 +1314,7 @@ async function executeTool(name, args) {
   
   // Kelivo 常用工具兼容（前端实际传的时间工具名是 get_time_info）
   if (name === 'get_current_time' || name === 'get_time' || name === 'get_time_info') {
-    const now = new Date();
-    now.setHours(now.getHours() + 8);
-    return '当前时间：' + now.toISOString().substring(0, 19).replace('T', ' ') + '（北京时间）';
+    return '当前时间：' + fmtLocal(new Date(), { seconds: true, weekday: true }) + '（' + USER_TZ_LABEL + '）';
   }
 
   // 功能7：博查 API 联网搜索（显式可控的搜索工具）

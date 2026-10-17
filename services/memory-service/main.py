@@ -22,6 +22,7 @@ import logging
 import difflib
 from vector_store import VectorCollection
 import text_index
+import timeutil   # Phase 1：存储一律 UTC，给人 / 模型看时换算成用户时区
 
 load_dotenv()
 
@@ -783,9 +784,10 @@ async def search_memories(req: SearchRequest):
             for m in memories:
                 ts = m["metadata"].get("ts", "")
                 if ts:
-                    from datetime import datetime
                     try:
-                        days_ago = (datetime.now() - datetime.fromisoformat(ts)).days
+                        days_ago = timeutil.days_since(ts)   # 以前拿北京时间的 now 减 UTC 的 ts，差 8 小时
+                        if days_ago is None:
+                            continue
                         time_boost = max(0, 1 - days_ago / 365) * intent["time_weight"]
                         m["score"] = m["score"] * (1 + time_boost)
                     except:
@@ -1107,7 +1109,8 @@ async def save_conversation(req: SaveRequest):
             ver = int(msg.get("version") or 0)
             ts_val = (msg.get("ts") or "").strip()
             if ts_val:
-                ts_val = ts_val.replace("T", " ")[:19]  # 统一为 "YYYY-MM-DD HH:MM:SS"
+                # 统一成 UTC 的 "YYYY-MM-DD HH:MM:SS"；客户端发来的不带时区的时间按用户时区理解
+                ts_val = timeutil.to_utc_str(ts_val, naive_tz=timeutil.USER_TZ) or ""
             # 内容级去重：同 conv 同 role 同内容(忽略换行)已有 active → 跳过。
             # 修复 Kelivo 版本切换/重新生成导致的历史漂移：内容未变的消息不再
             # 被无谓 superseded 重插（superseded 垃圾由 7011 条降到最低）。
@@ -1139,7 +1142,7 @@ async def save_conversation(req: SaveRequest):
                     anchor_val = old[3] if old[3] else old[0]
                     c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted, ts, group_id, version, group_anchor) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
                               (req.conv_id, idx, role, content, req.client, 'active', 0,
-                               ts_val or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), gid, ver, anchor_val))
+                               ts_val or timeutil.utc_now_str(), gid, ver, anchor_val))
                     saved += 1
                     continue
                 # 复活 bug 修复：库里没有这个 group_id 的任何记录（可能是用户显式删过），
@@ -1152,7 +1155,7 @@ async def save_conversation(req: SaveRequest):
                 # 新 group：插入后回填 anchor=自身 id
                 c.execute('INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted, ts, group_id, version) VALUES (?,?,?,?,?,?,?,?,?,?)',
                           (req.conv_id, idx, role, content, req.client, 'active', 0,
-                           ts_val or datetime.now().strftime('%Y-%m-%d %H:%M:%S'), gid, ver))
+                           ts_val or timeutil.utc_now_str(), gid, ver))
                 nid = c.lastrowid
                 c.execute("UPDATE l0_messages SET group_anchor=? WHERE id=?", (nid, nid))
                 saved += 1
@@ -1297,7 +1300,7 @@ async def save_feel(req: FeelRequest):
                 embeddings=[embedding],
                 documents=[req.content],
                 metadatas=[{
-                    "ts": datetime.now().isoformat(),
+                    "ts": timeutil.utc_now_str(),
                     "event_type": "feel",
                     "tags": '["感受"]',
                     "quote": req.content,
@@ -1549,16 +1552,9 @@ async def import_conversation(req: ImportRequest):
             if not content or role == "system":
                 continue
             raw_ts = msg.get("timestamp") or req.conv_date or ""
-            if raw_ts:
-                try:
-                    from datetime import timedelta
-                    dt = datetime.fromisoformat(raw_ts.replace('Z', ''))
-                    dt_utc = dt - timedelta(hours=8)
-                    ts = dt_utc.isoformat()
-                except:
-                    ts = raw_ts
-            else:
-                ts = datetime.utcnow().isoformat()
+            # 导入文件里不带时区的时间按用户时区理解，带 Z / 偏移的按其本身，统一存 UTC。
+            # （以前把带 Z 的 UTC 时间也减了 8 小时，而且存成带 T 的格式，和其它行排序对不上）
+            ts = (timeutil.to_utc_str(raw_ts, naive_tz=timeutil.USER_TZ) if raw_ts else None) or timeutil.utc_now_str()
             c.execute(
                 'INSERT INTO l0_messages (conv_id, msg_idx, role, content, ts, source, client, status, extracted) VALUES (?,?,?,?,?,?,?,?,?)',
                 (conv_id, idx, role, content, ts,'import', req.client, 'active', 0)
@@ -1611,7 +1607,7 @@ async def profile_rebuild():
     _profile_job['running'] = True
     _profile_job['result'] = None
     _profile_job['error'] = None
-    _profile_job['started_at'] = datetime.now().isoformat()
+    _profile_job['started_at'] = timeutil.utc_now_str()
     import asyncio
     asyncio.create_task(_run_profile_job())
     return {"status": "started", "message": "画像重建已启动，请轮询 /profile/rebuild/status"}
@@ -1847,7 +1843,7 @@ async def get_viz_l0l1():
         stars.append({
             'id': 'l1_' + str(mid), 'mid': mid, 'name': nm[:30],
             'domain': domain, 'importance': imp, 'pinned': bool(core),
-            'created': (ts or '')[:10] + 'T00:00:00',
+            'created': (timeutil.local_date(ts) or (ts or '')[:10]) + 'T00:00:00',
             'content': (content or ''),
             'batch': smid,
         })
@@ -1938,7 +1934,7 @@ async def viz_thinkings(limit: int = 500, offset: int = 0):
         (limit, offset)).fetchall()
     conn.close()
     return {"thinkings": [
-        {"id": r[0], "conv": r[1], "ts": str(r[2] or '')[:16], "thinking": r[3],
+        {"id": r[0], "conv": r[1], "ts": timeutil.local_str(r[2]) or str(r[2] or '')[:16], "thinking": r[3],
          "answer_ref": r[4], "full_reply": r[5]} for r in rows
     ]}
 
@@ -2034,7 +2030,7 @@ async def reextract_l1(memory_id: int):
                             content={"status": "error", "detail": "重提取未产生记忆，旧记忆已保留（未删除）"})
     new_mem = memories[0]  # 只取一条
 
-    new_ts = (src_ts_row[0] if src_ts_row and src_ts_row[0] else datetime.now().isoformat())
+    new_ts = (src_ts_row[0] if src_ts_row and src_ts_row[0] else timeutil.utc_now_str())
     tags_json = json.dumps(new_mem.get("tags", []), ensure_ascii=False)
 
     # SQLite 事务：插新 + 删旧一起提交（原子），成功后再写/删 ChromaDB
@@ -2464,7 +2460,7 @@ async def generate_narrative(req: NarrativeGenerateRequest):
     _narr_job['running'] = True
     _narr_job['result'] = None
     _narr_job['error'] = None
-    _narr_job['started_at'] = datetime.now().isoformat()
+    _narr_job['started_at'] = timeutil.utc_now_str()
     import asyncio
     asyncio.create_task(_run_narrative_job(req))
     return {"status": "started", "message": "生成任务已启动，请轮询 /narrative/status"}
@@ -2573,7 +2569,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
                     "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) "
                     "VALUES (?, ?, ?, ?, 'rejected', ?)",
                     (new_narrative, last_version + 1, req.trigger_type,
-                     json.dumps({"timestamp": datetime.now().isoformat(), "reason": "忠实度校验未通过，未发布",
+                     json.dumps({"timestamp": timeutil.utc_now_str(), "reason": "忠实度校验未通过，未发布",
                                  "l1_ids": consumed_ids, "verification": verification}, ensure_ascii=False),
                      consumed_ids[-1])
                 )
@@ -2594,7 +2590,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
 
         # 溯源信息：为何更新、基于哪些记忆（Dashboard Observatory 数据源）+ 忠实度校验结果
         trigger_details = json.dumps({
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": timeutil.utc_now_str(),
             "reason": req.reason or ("强制全量重写" if req.force else
                                      "首次生成" if not existing else
                                      f"新增 {len(consumed_ids)} 条重要记忆"),
@@ -2616,7 +2612,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         # 剩余未消费的记忆会在下一次自动检查时继续处理。
         c.execute(
             "INSERT OR REPLACE INTO narrative_state (id, last_processed_l1_id, updated_at) VALUES (1, ?, ?)",
-            (consumed_ids[-1], datetime.now().isoformat())
+            (consumed_ids[-1], timeutil.utc_now_str())
         )
         conn.commit()
         new_id = c.lastrowid
@@ -2761,7 +2757,7 @@ async def update_custom_prompt(req: CustomPromptUpdate):
     conn = sqlite3.connect(str(SQLITE_PATH))
     conn.execute(
         "INSERT OR REPLACE INTO custom_prompts (id, content, enabled, updated_at) VALUES (1, ?, ?, ?)",
-        (req.content, req.enabled, datetime.now().isoformat())
+        (req.content, req.enabled, timeutil.utc_now_str())
     )
     conn.commit()
     conn.close()
@@ -2807,7 +2803,7 @@ async def put_conv_settings(cid: str, req: ConvSettingsUpdate):
         "window_mode=excluded.window_mode, window_n=excluded.window_n, "
         "window_tokens=excluded.window_tokens, effort=excluded.effort, "
         "model=excluded.model, updated_at=excluded.updated_at",
-        (cid, cur["window_mode"], cur["window_n"], cur["window_tokens"], cur["effort"], cur["model"], datetime.now().isoformat()))
+        (cid, cur["window_mode"], cur["window_n"], cur["window_tokens"], cur["effort"], cur["model"], timeutil.utc_now_str()))
     conn.commit()
     conn.close()
     return {"status": "ok"}
@@ -3471,7 +3467,7 @@ async def build_narrative_prompt(existing_narrative: str, new_memories: list) ->
     # 构建记忆列表（带时间戳和 L0 原文，构成时间线骨架）
     memory_text = "### 核心记忆\n"
     for m in new_memories:
-        ts_date = m[3][:10] if m[3] else "未知时间"
+        ts_date = timeutil.local_date(m[3]) or "未知时间"   # 用户时区的日期（以前直接截 UTC，凌晨的事会算成前一天）
         event_msg_id = m[4] if len(m) > 4 else None  # event_msg_id
 
         memory_text += f"- [{ts_date}] {m[1]}\n"
@@ -3718,7 +3714,13 @@ async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
 def build_summary_prompt(messages: list) -> str:
     """构建 Summary 提示词"""
     msg_text = ""
+    last_day = None
     for msg in reversed(messages[-100:]):  # 最近100条，倒序
+        # 换天的地方插一行日期（用户时区）：下面要求「每天发生的事各自成句」，没有日期模型分不出哪天是哪天
+        day = timeutil.local_day_label(msg[2]) if len(msg) > 2 else ""
+        if day and day != last_day:
+            msg_text += f"—— {day} ——\n\n"
+            last_day = day
         role = "用户" if msg[0] == "user" else "AI"
         msg_text += f"{role}: {msg[1][:500]}\n\n"
 

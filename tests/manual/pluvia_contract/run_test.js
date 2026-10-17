@@ -132,6 +132,8 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(s.text === '我想想好啦，弄好了' && s.finish === 'stop', 'T4 两次上游调用合成一条回复', s);
     ok(s.tools.length === 2 && s.tools[0].status === 'running' && s.tools[1].status === 'done' && s.tools[1].name === 'recall'
       && s.tools[1].content.includes('一起听过晴天') && !s.tools[1].content.includes('valence'), 'T4 pluvia_tool running→done，结果里没有内部打分', s.tools);
+    ok(s.tools[1].content.includes('2026-10-02 04:30'), 'T4 recall 里的时间换算成北京时间（库里存的是 UTC 2026-10-01 20:30）',
+      s.tools[1].content.slice(0, 120));
     ok(upReqs(d).length === 2 && JSON.stringify(upReqs(d)[1].messages.slice(-1)).includes('toolu_rec1'), 'T4 第二次上游带上了 recall 的结果');
     const sv = saves(d);
     ok(sv.length === 1 && sv[0].b.messages.slice(-1)[0].content === '我想想\n\n好啦，弄好了', 'T4 L0 存一次，整条回复合成一条', sv.map(x => x.b));

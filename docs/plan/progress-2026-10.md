@@ -145,10 +145,34 @@
 - **顺带修了一个暴露**：以前有 Dashboard 密码的人，能通过 `/api/config/current` 拿到当前中转的明文密钥。现在 `/api` 代理拦掉了 `/config/current` 和 `/config/chat_targets`，网关自己在本机直接调用，不受影响。
 - `check_relay_system.py` 改成逐个测所有聊天中转（要用记忆服务的 Python 运行）。这次 4 个全部正常；fuse 在 Cloudflare 后面，会拦 Python 默认的 User-Agent（403 error code: 1010），脚本已经自带 UA，网关用的 axios 不受影响。
 
+## 2026-10-18（凌晨）· Phase 1：统一时间（UTC）
+
+### 问题
+- VPS 的时区是北京时间。代码里有的地方用 `datetime.now()`（北京时间）写库，有的用 `CURRENT_TIMESTAMP`（UTC），读的时候又当成同一种。
+- 后果：
+  - recall 给模型看的日期直接截 UTC，北京时间凌晨 0–8 点的事被标成前一天；
+  - 网关的模糊时间把 UTC 当本地时间解析（差 8 小时），而且按「过了几个 24 小时」算，昨天傍晚的事会被说成「今天早些时候」；
+  - 导入接口把带 Z 的 UTC 时间也减了 8 小时，还存成带 T 的格式，和其它行排序对不上；
+  - 近期摘要要求「每天发生的事各自成句」，可喂给模型的对话里没有日期；提取提示词要求「用具体日期」，模型也不知道今天是哪天。
+- 现有数据都是实时聊天写入的，本来就是 UTC，**不用迁移旧数据**。
+
+### 改法
+- 新增 `services/memory-service/timeutil.py`：存储一律用 UTC 的 `YYYY-MM-DD HH:MM:SS`（和 SQLite 的 `datetime('now')` 一致）；只在给人或模型看的地方，按 `.env` 的 `USER_TZ`（默认 `Asia/Shanghai`）换算。
+- 记忆服务：所有 `datetime.now()` 写库的地方改成 UTC；导入时不带时区的时间按用户时区理解；叙事素材的日期、思考记录的显示改成北京时间；近期摘要的对话在换天处插一行「—— 10月18日 周日 ——」。
+- 提取：每段对话前加一行「这段对话发生在 2026-10-18 00:12 至 00:45（北京时间）」。冒烟测试里，「下周三要去面试」被提取成了「她10月21日要去面试」。
+- 网关：
+  - 新增 `parseStoredTs` / `fmtLocal`，按 `USER_TZ` 换算；
+  - recall 结果显示北京时间的日期和时刻；
+  - 模糊时间按北京时间的日历天算（今天早些时候 / 昨天 / 前天 / 最近……）；
+  - 时间头和 get_current_time 带上周几。
+
+### 测试
+- `tests/manual/test_timeutil.py` 13 项；网关假上游 65 项（新增：recall 里的时间换算成北京时间）；`phase0_smoke.py` 全部通过。
+
 ### 待办（下一步）
+- **Phase 1 剩余**：数据库连接统一（`get_conn`：WAL、busy_timeout）+ 迁移框架；任务表 + worker（替代 cron 和 APScheduler 里的生成任务），Dashboard 显示队列和死信。
 - **Pluvia**：前端按约定第 9 节联调；有对不上的地方再看前端代码。
 - **中转站**：如果经常出现提示词被替换，联系中转站或换一个分组 / 渠道（先用 `check_relay_system.py` 确认）。
 - **自动切换**：要不要调备用顺序（openrouter 一般按官方价计费，可能比中转贵；fuse 和 fusev1 在同一个站，一个挂了另一个大概也会挂）。
 - **浮现门槛校准**：等真实数据多一些后，看 `gateway.log` 里的 `[SURFACE]` 行，重新校准 `SURFACE_MIN_SIM`（当前 0.55）。
-- **Phase 1 剩余**：统一 UTC 时间、任务表 + worker（替代 cron）、迁移框架。
 - **Phase 2**：召回编排（`/compose/*`、投递账本、Reranker、分层注入）。

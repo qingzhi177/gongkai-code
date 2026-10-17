@@ -21,6 +21,7 @@ ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 
 # Phase 1：向量改存 SQLite（与记忆服务共用 vector_store.VectorCollection，不再依赖 ChromaDB 容器）
 from vector_store import VectorCollection  # noqa: E402
+import timeutil  # noqa: E402  存储一律 UTC，给模型看时换算成用户时区
 l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的记忆提取，像给未来的自己写便签。
@@ -287,7 +288,7 @@ def save_l1(memory, conv_id, client, source_id, event_msg_id=None, evidence_ids=
         evidence_status: verified / verified_fuzzy / unverified / no_quote
         ts: 记忆时间（v2：第一条依据消息的时间；缺省用分段首条消息的时间）
     """
-    ts = ts or get_l0_ts(source_id) or datetime.now().isoformat()
+    ts = ts or get_l0_ts(source_id) or timeutil.utc_now_str()
     author = memory.get("author")
     if author not in ("user_said", "ai_said", "co_created", "ai_felt"):
         author = None
@@ -402,6 +403,14 @@ def get_pending_segments(force=False):
 def build_segment_text(ctx, seg):
     """带行号的提取文本。返回 (text, line_map)，line_map: 行号 → (l0_id, content)，只含待提取部分"""
     lines, line_map, n = [], {}, 1
+    # 这段对话的时间（用户时区）：提示词第 9 条要求记忆里用具体日期，模型得知道「今天」是哪天
+    if seg:
+        t0 = timeutil.local_str(seg[0][3])
+        t1 = timeutil.local_str(seg[-1][3])
+        if t0:
+            span = t0 if (not t1 or t1 == t0) else t0 + " 至 " + (t1[11:] if t1[:10] == t0[:10] else t1)
+            lines.append(f"【这段对话发生在 {span}（{timeutil.USER_TZ_LABEL}）。对话里的「今天」「昨晚」指这个时间附近；"
+                         f"记忆里要写时间，就换算成具体日期】")
     if ctx:
         lines.append("【只读上下文：仅供理解，不要从这里提取】")
         for mid, role, content, ts in ctx:
