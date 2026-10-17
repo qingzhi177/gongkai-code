@@ -24,6 +24,7 @@ from vector_store import VectorCollection
 import text_index
 import timeutil   # Phase 1：存储一律 UTC，给人 / 模型看时换算成用户时区
 import db         # Phase 1：统一的数据库连接 + 迁移（db.py、migrations/）
+import jobs       # Phase 1：后台任务队列（jobs.py；执行在 worker.py）
 
 load_dotenv()
 
@@ -47,25 +48,65 @@ scheduler = AsyncIOScheduler()
 # 自动检查间隔（分钟）。可用环境变量覆盖，便于测试时缩短。
 AUTO_CHECK_INTERVAL_MIN = float(os.getenv("AUTO_CHECK_INTERVAL_MIN", 10))
 
+# ---------- 后台任务 worker（Phase 1）----------
+# worker.py 是独立进程：大模型调用动辄几十秒，放在外面不拖慢聊天路径，worker 出问题也不影响记忆服务。
+# 记忆服务启动时把它拉起来并看护：意外退出会自动重启；记忆服务停止 / 重启时一起停止。
+# 设 WORKER_AUTOSTART=0 可以不自动拉起（然后手动运行 venv/bin/python worker.py）。
+WORKER_AUTOSTART = os.getenv("WORKER_AUTOSTART", "1") != "0"
+WORKER_LOG = LOG_DIR / "worker.log"
+_worker_proc = None
+
+async def _supervise_worker():
+    global _worker_proc
+    import subprocess
+    import sys
+    import time
+    script = Path(__file__).parent / "worker.py"
+    backoff = 5
+    while True:
+        started = time.monotonic()
+        with open(WORKER_LOG, "ab") as out:
+            _worker_proc = subprocess.Popen(
+                [sys.executable, str(script)], cwd=str(Path(__file__).parent),
+                stdout=out, stderr=subprocess.STDOUT, env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        logger.info(f"[WORKER] 已拉起 worker（pid {_worker_proc.pid}，日志 data/logs/worker.log）")
+        while _worker_proc.poll() is None:
+            await asyncio.sleep(2)
+        code = _worker_proc.returncode
+        if code == 3:   # 已有另一个 worker 在运行（比如手动启动的那个）
+            logger.warning("[WORKER] 已有另一个 worker 在运行，60 秒后再看")
+            await asyncio.sleep(60)
+            continue
+        backoff = 5 if time.monotonic() - started > 60 else min(backoff * 2, 120)
+        logger.warning(f"[WORKER] worker 退出了（退出码 {code}），{backoff} 秒后重新拉起")
+        await asyncio.sleep(backoff)
+
+def _stop_worker(timeout=20):
+    """让 worker 收尾退出（它最多再等正在执行的任务 15 秒，没做完的放回队列）"""
+    p = _worker_proc
+    if p is None or p.poll() is not None:
+        return
+    p.terminate()
+    try:
+        p.wait(timeout=timeout)
+    except Exception:
+        p.kill()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """启动时挂载自动检查任务，关闭时停止调度器。
+    """启动时挂载定时任务、拉起 worker；关闭时一起停止。
 
     FastAPI 0.138 已废弃 @app.on_event，改用 lifespan。
     """
+    # Phase 1：定时检查只负责往任务队列里投递（提取 / 近期摘要 / 共同经历），真正执行在 worker 里
     scheduler.add_job(
-        check_and_update_summary,
+        enqueue_auto_jobs,
         IntervalTrigger(minutes=AUTO_CHECK_INTERVAL_MIN),
-        id="check_summary",
+        id="auto_enqueue",
         max_instances=1,
         coalesce=True,
-    )
-    scheduler.add_job(
-        check_and_update_narrative,
-        IntervalTrigger(minutes=AUTO_CHECK_INTERVAL_MIN),
-        id="check_narrative",
-        max_instances=1,
-        coalesce=True,
+        next_run_time=datetime.now() + timedelta(seconds=30),
     )
     # Phase 1：索引对账（FTS 增量更新 + 向量补齐/清理孤儿），启动 20 秒后先跑一次
     scheduler.add_job(
@@ -77,12 +118,16 @@ async def lifespan(app: FastAPI):
         next_run_time=datetime.now() + timedelta(seconds=20),
     )
     scheduler.start()
-    print(f"[SCHEDULER] 自动检查任务已启动（间隔 {AUTO_CHECK_INTERVAL_MIN} 分钟）")
+    print(f"[SCHEDULER] 定时检查已启动（间隔 {AUTO_CHECK_INTERVAL_MIN} 分钟）")
+    supervisor = asyncio.create_task(_supervise_worker()) if WORKER_AUTOSTART else None
     try:
         yield
     finally:
         scheduler.shutdown(wait=False)
-        print("[SCHEDULER] 自动检查任务已停止")
+        if supervisor:
+            supervisor.cancel()
+        _stop_worker()
+        print("[SCHEDULER] 定时检查已停止")
 
 app = FastAPI(title="Memory Service", lifespan=lifespan)
 
@@ -1392,40 +1437,17 @@ async def save_profile(req: ProfileData):
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
-_profile_job = {'running': False, 'result': None, 'error': None, 'started_at': None}
-
 @app.post("/profile/rebuild")
 async def profile_rebuild():
-    """基于 L0 全部原文分批提炼 → 汇总 → 重建三节画像（异步，防超时）"""
-    global _profile_job
-    if _profile_job['running']:
-        return {"status": "running", "message": "已有重建任务进行中"}
-    _profile_job['running'] = True
-    _profile_job['result'] = None
-    _profile_job['error'] = None
-    _profile_job['started_at'] = timeutil.utc_now_str()
-    import asyncio
-    asyncio.create_task(_run_profile_job())
-    return {"status": "started", "message": "画像重建已启动，请轮询 /profile/rebuild/status"}
-
-async def _run_profile_job():
-    try:
-        result = await _do_profile_rebuild()
-        _profile_job['result'] = result
-    except Exception as e:
-        _profile_job['error'] = str(e)
-        logger.error(f"profile rebuild error: {e}")
-    finally:
-        _profile_job['running'] = False
+    """基于 L0 全部原文分批提炼 → 汇总 → 重建三节画像。投递到后台任务队列，由 worker 执行（前端轮询状态）"""
+    job, created = _enqueue("profile_rebuild", {}, source="dashboard")
+    if not created and job["status"] == "running":
+        return {"status": "running", "message": "已有重建任务进行中", "job_id": job["id"]}
+    return {"status": "started", "message": "画像重建已加入队列，请轮询 /profile/rebuild/status", "job_id": job["id"]}
 
 @app.get("/profile/rebuild/status")
 async def profile_rebuild_status():
-    return {
-        "running": _profile_job['running'],
-        "result": _profile_job['result'],
-        "error": _profile_job['error'],
-        "started_at": _profile_job['started_at'],
-    }
+    return _job_status("profile_rebuild")
 
 async def _do_profile_rebuild():
     # 1. 读全部 L0 原文
@@ -1454,7 +1476,7 @@ async def _do_profile_rebuild():
             "性格、称呼、偏好、习惯、重要事件（尽量带日期）、互动模式、她说过的话中的关键片段。"
             "每条一行要点，保留独特细节，不要泛泛而谈：\n\n" + text
         )
-        out = await call_llm(config, prompt, 2500)
+        out = await call_llm(config, prompt, 6000)   # 推理模型的思考也算在 max_tokens 里
         if out:
             points.append(out)
     all_points = "\n\n".join(points)
@@ -1467,7 +1489,7 @@ async def _do_profile_rebuild():
     )
     final = None
     for _try in range(3):
-        final = await call_llm(config, final_prompt, 4000)
+        final = await call_llm(config, final_prompt, 8000)
         if final:
             break
         import asyncio as _aio
@@ -2246,40 +2268,19 @@ class NarrativeGenerateRequest(BaseModel):
 # 本次实际消费的最大 id），避免一次生成 prompt 过长。
 NARRATIVE_BATCH_LIMIT = 60
 
-_narr_job = {'running': False, 'result': None, 'error': None, 'started_at': None}
-
 @app.post("/narrative/generate")
 async def generate_narrative(req: NarrativeGenerateRequest):
-    """异步生成/增量演化 Shared Narrative（避免长 LLM 调用被网关/CF 超时掐断）"""
-    if _narr_job['running']:
-        return {"status": "running", "message": "已有生成任务进行中"}
-    _narr_job['running'] = True
-    _narr_job['result'] = None
-    _narr_job['error'] = None
-    _narr_job['started_at'] = timeutil.utc_now_str()
-    import asyncio
-    asyncio.create_task(_run_narrative_job(req))
-    return {"status": "started", "message": "生成任务已启动，请轮询 /narrative/status"}
-
-async def _run_narrative_job(req):
-    try:
-        result = await _do_narrative(req)
-        _narr_job['result'] = result
-    except Exception as e:
-        _narr_job['error'] = str(e)
-        logger.error(f"narrative job error: {e}")
-    finally:
-        _narr_job['running'] = False
+    """生成/增量演化 Shared Narrative。投递到后台任务队列，由 worker 执行（前端轮询 /narrative/status）。
+    自动检查投递的任务还在排队时，用这次的参数覆盖它（比如勾了强制重写）。"""
+    job, created = _enqueue("narrative", _model_dict(req), source="dashboard", update_if_queued=True)
+    if not created and job["status"] == "running":
+        return {"status": "running", "message": "已有生成任务进行中", "job_id": job["id"]}
+    return {"status": "started", "message": "生成任务已加入队列，请轮询 /narrative/status", "job_id": job["id"]}
 
 @app.get("/narrative/status")
 async def narrative_status():
     """生成任务状态（前端轮询用）"""
-    return {
-        "running": _narr_job['running'],
-        "result": _narr_job['result'],
-        "error": _narr_job['error'],
-        "started_at": _narr_job['started_at'],
-    }
+    return _job_status("narrative")
 
 async def _do_narrative(req: NarrativeGenerateRequest):
     """生成/增量演化 Shared Narrative。
@@ -2771,9 +2772,6 @@ async def generate_summary():
 # 要求「情感浓度高的对话标注 arousal >= 0.6」，两者取并集。
 IMPORTANT_L1_WHERE = "status='active' AND (is_core=1 OR arousal >= 0.6)"
 
-# 生成期间串行化，避免上一轮 LLM 还没返回就被下一轮检查重复触发
-_auto_lock = asyncio.Lock()
-
 def read_auto_config():
     """读取自动更新配置。每轮现读，改配置无需重启服务。"""
     conn = get_conn()
@@ -2814,44 +2812,43 @@ def get_narrative_pending():
     conn.close()
     return watermark, new_count
 
-async def check_and_update_summary():
-    """达到轮数阈值时自动滚动 Recent Summary。"""
+async def enqueue_auto_jobs():
+    """定时检查（每 AUTO_CHECK_INTERVAL_MIN 分钟）：只往任务队列里投递，真正执行在 worker 里。
+    - L1 提取：每次都投递（以前是 cron 每 10 分钟跑一次 extract_l1.py）；
+    - 近期摘要 / 共同经历：达到阈值才投递。
+    同一种任务已经在排队或执行时不会重复投递。返回这次新投递的任务类型。"""
+    queued = []
     try:
+        job, created = _enqueue("extract", {"force": False})
+        if created:
+            queued.append("extract")
         config = read_auto_config()
         if not config or config["enabled"] != 1:
-            return
-        watermark, new_count = get_summary_pending()
-        threshold = config["threshold_turns"]
-        if new_count < threshold:
-            logger.info(f"Summary 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）")
-            return
-        async with _auto_lock:
-            logger.info(f"触发 Summary 更新：新增 {new_count} 条消息（阈值 {threshold}）")
-            result = await generate_summary()
-            logger.info(f"Summary 结果：{result.get('status')} {result.get('message', '')}")
+            return queued
+        s_watermark, s_new = get_summary_pending()
+        s_threshold = config["threshold_turns"]
+        if s_new >= s_threshold:
+            job, created = _enqueue("summary")
+            if created:
+                queued.append("summary")
+                logger.info(f"Summary 达到阈值：新增 {s_new} 条消息（阈值 {s_threshold}）→ 已投递任务 #{job['id']}")
+        else:
+            logger.info(f"Summary 未达阈值：新增 {s_new}/{s_threshold}（水位线 {s_watermark}）")
+        n_watermark, n_new = get_narrative_pending()
+        n_threshold = config["threshold_l1"]
+        if n_new >= n_threshold:
+            job, created = _enqueue("narrative", {
+                "trigger_type": "auto",
+                "reason": f"自动检查：新增 {n_new} 条重要记忆，达到阈值 {n_threshold}",
+            })
+            if created:
+                queued.append("narrative")
+                logger.info(f"Narrative 达到阈值：新增 {n_new} 条重要记忆（阈值 {n_threshold}）→ 已投递任务 #{job['id']}")
+        else:
+            logger.info(f"Narrative 未达阈值：新增 {n_new}/{n_threshold}（水位线 {n_watermark}）")
     except Exception as e:
-        logger.error(f"Summary 检查异常：{e}", exc_info=True)
-
-async def check_and_update_narrative():
-    """达到重要 L1 阈值时自动演化 Shared Narrative。"""
-    try:
-        config = read_auto_config()
-        if not config or config["enabled"] != 1:
-            return
-        watermark, new_count = get_narrative_pending()
-        threshold = config["threshold_l1"]
-        if new_count < threshold:
-            logger.info(f"Narrative 未达阈值：新增 {new_count}/{threshold}（水位线 {watermark}）")
-            return
-        async with _auto_lock:
-            logger.info(f"触发 Narrative 更新：新增 {new_count} 条重要记忆（阈值 {threshold}）")
-            result = await generate_narrative(NarrativeGenerateRequest(
-                trigger_type="auto",
-                reason=f"自动检查：新增 {new_count} 条重要记忆，达到阈值 {threshold}"
-            ))
-            logger.info(f"Narrative 结果：{result.get('status')} {result.get('message', '')}")
-    except Exception as e:
-        logger.error(f"Narrative 检查异常：{e}", exc_info=True)
+        logger.error(f"定时检查异常：{e}", exc_info=True)
+    return queued
 
 @app.get("/auto/status")
 async def get_auto_status():
@@ -2859,7 +2856,7 @@ async def get_auto_status():
     config = read_auto_config() or {"enabled": 0, "threshold_turns": 0, "threshold_l1": 0}
     s_watermark, s_new = get_summary_pending()
     n_watermark, n_new = get_narrative_pending()
-    job = scheduler.get_job("check_summary")
+    job = scheduler.get_job("auto_enqueue")
     next_run = job.next_run_time.isoformat() if job and job.next_run_time else None
     return {
         "enabled": config["enabled"],
@@ -2881,10 +2878,11 @@ async def get_auto_status():
 
 @app.post("/auto/check_now")
 async def trigger_auto_check():
-    """立即跑一次检查，测试用（不绕过阈值判断）。"""
-    await check_and_update_summary()
-    await check_and_update_narrative()
-    return {"status": "ok", "message": "检查已执行，详见服务日志"}
+    """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
+    queued = await enqueue_auto_jobs()
+    names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
+    msg = "检查已执行，" + ("已投递：" + "、".join(names.get(k, k) for k in queued) if queued else "没有需要新投递的任务")
+    return {"status": "ok", "message": msg, "queued": queued}
 
 @app.get("/auto/logs")
 async def get_auto_logs(lines: int = 100):
@@ -3048,19 +3046,77 @@ async def get_extraction_status():
 
 @app.post("/l1/extract_now")
 async def extract_now():
-    """手动触发 L1 提取（调用 extract_l1.py）"""
+    """手动触发 L1 提取：投递到后台任务队列（不等会话安静，立即提取所有未提取的消息）"""
     try:
-        import subprocess
-        script_path = Path(__file__).parent / "extract_l1.py"
-        venv_python = Path(__file__).parent / "venv" / "bin" / "python"
-
-        # 在后台运行提取脚本
-        # 手动触发时不等待会话安静（--force），立即提取所有未提取的消息
-        subprocess.Popen([str(venv_python), str(script_path), "--force"], cwd=str(Path(__file__).parent))
-
-        return {"status": "ok", "message": "提取任务已启动"}
+        job, created = _enqueue("extract", {"force": True}, source="dashboard", update_if_queued=True)
+        if job["status"] == "running":
+            return {"status": "ok", "job_id": job["id"],
+                    "message": f"已有提取任务在执行（#{job['id']}），完成后可以再点一次接着提取"}
+        return {"status": "ok", "job_id": job["id"], "message": f"提取任务已加入队列（#{job['id']}），几秒后开始"}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+# ============ 后台任务队列 API（Phase 1；Dashboard「记忆管线」页用）============
+
+def _enqueue(kind, payload=None, source="auto", update_if_queued=False):
+    """投递任务。同一种任务同时只有一个在排队或执行（dedupe_key = 任务类型）。"""
+    return jobs.enqueue(SQLITE_PATH, kind, payload=payload, dedupe_key=kind, source=source,
+                        update_if_queued=update_if_queued)
+
+def _model_dict(m):
+    return m.model_dump() if hasattr(m, "model_dump") else m.dict()
+
+def _job_status(kind):
+    """把最近一个任务的状态换成前端原来轮询用的格式：{running, result, error, started_at}"""
+    job = jobs.latest(SQLITE_PATH, kind)
+    if not job:
+        return {"running": False, "result": None, "error": None, "started_at": None}
+    st = job["status"]
+    waiting_retry = st == "queued" and job["attempts"] > 0
+    return {
+        "running": st == "running" or (st == "queued" and not waiting_retry),
+        "result": job.get("result") if st == "done" else None,
+        "error": jobs.describe(job) if (st == "dead" or waiting_retry) else None,
+        "started_at": job.get("started_at") or job.get("created_at"),
+        "job_id": job["id"],
+        "job_status": st,
+    }
+
+def _brief(v, n=200):
+    """列表里不返回大段正文（叙事、摘要全文），只留开头"""
+    if isinstance(v, dict):
+        return {k: _brief(x, n) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_brief(x, n) for x in v[:20]]
+    if isinstance(v, str) and len(v) > n:
+        return v[:n] + "…"
+    return v
+
+@app.get("/jobs/stats")
+async def jobs_stats():
+    """各状态的任务数 + worker 是否在线"""
+    return jobs.stats(SQLITE_PATH)
+
+@app.get("/jobs")
+async def jobs_list(status: Optional[str] = None, kind: Optional[str] = None, limit: int = 30):
+    """最近的任务。status 可以是 queued / running / done / dead / dismissed / retrying（等待重试）"""
+    items = jobs.list_jobs(SQLITE_PATH, status=status, kind=kind, limit=limit)
+    for j in items:
+        j["description"] = jobs.describe(j)
+        j["result"] = _brief(j.get("result"))
+    return {"jobs": items}
+
+@app.post("/jobs/{job_id}/retry")
+async def jobs_retry(job_id: int):
+    """失败（死信）的任务重新排队"""
+    ok, msg = jobs.retry(SQLITE_PATH, job_id)
+    return {"status": "ok" if ok else "error", "message": msg}
+
+@app.post("/jobs/{job_id}/dismiss")
+async def jobs_dismiss(job_id: int):
+    """忽略失败的任务（不再显示在「失败」里）"""
+    ok = jobs.dismiss(SQLITE_PATH, job_id)
+    return {"status": "ok" if ok else "error", "message": "已忽略" if ok else "只有失败的任务可以忽略"}
 
 # ============ Pipeline Status API ============
 
@@ -3499,7 +3555,11 @@ async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
                 }
             )
             response.raise_for_status()
-            return response.json()["choices"][0]["message"]["content"]
+            choice = response.json()["choices"][0]
+            content = choice["message"].get("content")
+            if not content and choice.get("finish_reason") == "length":
+                print(f"LLM call error: 输出被 max_tokens={max_tokens} 截断，正文为空（推理模型的思考也算在里面）")
+            return content
     except httpx.HTTPStatusError as e:
         print(f"LLM call error: {e} body={e.response.text[:300]}")
         return None
@@ -3541,7 +3601,8 @@ def build_summary_prompt(messages: list) -> str:
 
 async def call_llm_for_summary(config: dict, prompt: str) -> str:
     """调用 LLM 生成 Summary"""
-    return await call_llm(config, prompt, max_tokens=1000)
+    # 推理模型（如 deepseek-v4-pro）的思考也算在 max_tokens 里：给 1000 时思考就用完了，正文是空的
+    return await call_llm(config, prompt, max_tokens=6000)
 
 # Dashboard 静态文件路由
 DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"

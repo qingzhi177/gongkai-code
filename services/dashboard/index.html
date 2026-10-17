@@ -76,6 +76,8 @@
         .status-extracted { background: #d4edda; color: #155724; }
         .status-pending { background: #fff3cd; color: #856404; }
         .status-partial { background: #cce5ff; color: #004085; }
+        .status-dead { background: #f8d7da; color: #721c24; }
+        .status-dismissed { background: #eee; color: #888; }
         /* Narrative 样式 */
         .narrative-content { background: #fafafa; padding: 20px; border-radius: 8px; line-height: 1.8; font-size: 14px; white-space: pre-wrap; max-height: 500px; overflow-y: auto; }
         .narrative-meta { background: #f0f0f0; padding: 12px; border-radius: 6px; margin-bottom: 15px; font-size: 12px; color: #666; }
@@ -303,7 +305,29 @@
                 </div>
             </div>
             <div style="text-align:center;margin-top:30px;">
-                <button class="btn" onclick="loadPipeline()">刷新状态</button>
+                <button class="btn" onclick="loadPipeline(true); loadJobs();">刷新状态</button>
+            </div>
+
+            <h3 style="margin-top:40px;">后台任务</h3>
+            <div id="jobs-worker" style="font-size:13px;color:#666;margin:8px 0 12px;">-</div>
+            <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));">
+                <div class="stat-card"><div class="number" id="jobs-queued">-</div><div class="label">排队中</div></div>
+                <div class="stat-card"><div class="number" id="jobs-running">-</div><div class="label">执行中</div></div>
+                <div class="stat-card"><div class="number" id="jobs-retrying">-</div><div class="label">等待重试</div></div>
+                <div class="stat-card" id="jobs-dead-card"><div class="number" id="jobs-dead">-</div><div class="label">失败（需要处理）</div></div>
+                <div class="stat-card"><div class="number" id="jobs-done">-</div><div class="label">24 小时内完成</div></div>
+            </div>
+            <div style="margin:10px 0 5px;">
+                <button class="btn btn-small" onclick="loadJobs('')">全部</button>
+                <button class="btn btn-small" onclick="loadJobs('dead')">只看失败</button>
+                <button class="btn btn-small" onclick="loadJobs('retrying')">等待重试</button>
+                <span id="jobs-msg" style="margin-left:10px;font-size:12px;"></span>
+            </div>
+            <div style="overflow-x:auto;">
+            <table class="extraction-table">
+                <thead><tr><th>#</th><th>任务</th><th>来源</th><th>状态</th><th>次数</th><th>投递时间</th><th>说明</th><th></th></tr></thead>
+                <tbody id="jobs-table"></tbody>
+            </table>
             </div>
         </div>
 
@@ -624,7 +648,7 @@
             if (name === 'bak') {}
             if (name === 'anchors') loadAnchors();
             if (name === 'logs') loadLogs();
-            if (name === 'pipeline') loadPipeline();
+            if (name === 'pipeline') { loadPipeline(); loadJobs(); }
             if (name === 'extraction') loadExtraction();
             if (name === 'narrative') loadNarrative();
             if (name === 'summary') loadSummary();
@@ -1229,6 +1253,70 @@ function rebuildProfile() {
             percentText.textContent = Math.round(percent) + '%';
         }
 
+        // ============ 后台任务（Phase 1）============
+        var jobsFilter = '';
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建' };
+        var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
+                           dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
+        var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
+
+        function jobSummary(j) {
+            var r = j.result;
+            if (j.status !== 'done') return j.description || '';
+            if (!r) return '完成';
+            if (j.kind === 'extract') {
+                if (r.status === 'skipped') return r.message || '跳过';
+                var s = (r.segments || 0) + ' 段 · ' + (r.memories || 0) + ' 条记忆';
+                if (r.failed_segments) s += ' · ' + r.failed_segments + ' 段失败，下次自动重试' + (r.errors && r.errors.length ? '（' + r.errors[0] + '）' : '');
+                return s;
+            }
+            if (j.kind === 'profile_rebuild' && r.status === 'ok') return '完成（' + (r.batches || 0) + ' 批 · ' + (r.chars || 0) + ' 字）';
+            return r.message || (r.status === 'ok' ? '完成' : (r.status || '完成'));
+        }
+
+        function loadJobs(filter) {
+            if (filter !== undefined) jobsFilter = filter;
+            fetch(API + '/jobs/stats').then(function(r) { return r.json(); }).then(function(s) {
+                ['queued', 'running', 'retrying', 'dead'].forEach(function(k) { document.getElementById('jobs-' + k).textContent = s[k]; });
+                document.getElementById('jobs-done').textContent = s.done_24h;
+                document.getElementById('jobs-dead-card').style.background = s.dead ? '#fdecea' : '';
+                var w = s.worker, el = document.getElementById('jobs-worker');
+                if (w && w.online) {
+                    var run = (w.running || []).map(function(x) { return '#' + x.id + ' ' + (JOB_KIND[x.kind] || x.kind); }).join('、');
+                    el.textContent = '🟢 worker 在线（' + w.heartbeat_age_sec + ' 秒前心跳）' + (run ? ' · 正在执行：' + run : ' · 空闲');
+                } else {
+                    el.textContent = '🔴 worker 离线' + (w && w.heartbeat_at ? '（最后心跳 ' + formatTime(w.heartbeat_at) + '）' : '') + ' · 任务会在 worker 恢复后继续执行';
+                }
+            });
+            fetch(API + '/jobs?limit=30' + (jobsFilter ? '&status=' + jobsFilter : '')).then(function(r) { return r.json(); }).then(function(d) {
+                var html = '';
+                (d.jobs || []).forEach(function(j) {
+                    var st = JOB_STATUS[j.status] || [j.status, ''];
+                    var label = (j.status === 'queued' && j.attempts > 0) ? '等待重试' : st[0];
+                    var ops = j.status === 'dead'
+                        ? '<button class="btn btn-small" onclick="jobAction(' + j.id + ', \'retry\')">重试</button><button class="btn btn-small" style="background:#999;" onclick="jobAction(' + j.id + ', \'dismiss\')">忽略</button>'
+                        : '';
+                    html += '<tr><td>' + j.id + '</td><td>' + escapeHtml(JOB_KIND[j.kind] || j.kind) + '</td>'
+                        + '<td>' + escapeHtml(JOB_SOURCE[j.source] || j.source || '') + '</td>'
+                        + '<td><span class="status-badge ' + st[1] + '">' + label + '</span></td>'
+                        + '<td>' + j.attempts + '/' + j.max_attempts + '</td>'
+                        + '<td style="white-space:nowrap;">' + formatTime(j.created_at) + '</td>'
+                        + '<td style="max-width:420px;word-break:break-all;">' + escapeHtml(jobSummary(j)) + '</td>'
+                        + '<td style="white-space:nowrap;">' + ops + '</td></tr>';
+                });
+                document.getElementById('jobs-table').innerHTML = html || '<tr><td colspan="8" style="text-align:center;color:#888;">暂无任务</td></tr>';
+            });
+        }
+
+        function jobAction(id, action) {
+            var msg = document.getElementById('jobs-msg');
+            fetch(API + '/jobs/' + id + '/' + action, { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                msg.textContent = d.message || '';
+                msg.style.color = d.status === 'ok' ? '#28a745' : '#dc3545';
+                loadJobs();
+            });
+        }
+
         // ============ Extraction 相关函数 ============
         function loadExtraction() {
             fetch(API + '/l1/extraction_status').then(function(r) { return r.json(); }).then(function(d) {
@@ -1260,7 +1348,7 @@ function rebuildProfile() {
                 .then(function(r) { return r.json(); })
                 .then(function(d) {
                     if (d.status === 'ok') {
-                        status.textContent = '提取任务已启动，请稍后刷新查看进度';
+                        status.textContent = d.message || '提取任务已启动，请稍后刷新查看进度';
                         status.style.color = '#28a745';
                         setTimeout(loadExtraction, 3000);
                     } else {

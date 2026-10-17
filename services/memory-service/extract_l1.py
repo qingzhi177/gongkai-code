@@ -446,13 +446,42 @@ def verify_quote(quote, ref_texts, all_texts):
     return "", "unverified", None
 
 
+EXTRACT_LOCK = DATA_DIR / "run" / "extract.lock"
+
+
+def _acquire_extract_lock():
+    """同一时间只允许一个提取（worker、手动运行脚本都走这里），防止同一段对话被提取两次"""
+    import fcntl
+    EXTRACT_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    f = open(EXTRACT_LOCK, "a+")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        f.close()
+        return None
+    return f
+
+
 def main(force=False):
+    """提取一轮，返回结果摘要（由 worker 记进任务表）。平时由 worker 执行，也可以手动运行：python extract_l1.py [--force]"""
+    lock = _acquire_extract_lock()
+    if lock is None:
+        print(f"[{datetime.now()}] 已有提取在进行，这次跳过")
+        return {"status": "skipped", "message": "已有提取在进行"}
+    try:
+        return _extract_round(force)
+    finally:
+        lock.close()
+
+
+def _extract_round(force):
     print(f"[{datetime.now()}] L1 extraction starting (v2{', force' if force else ''})...")
     ensure_columns()
     segments = get_pending_segments(force=force)
     if not segments:
         print("No segments ready.")
-        return
+        return {"status": "ok", "segments": 0, "memories": 0, "failed_segments": 0}
+    summary = {"status": "ok", "segments": len(segments), "memories": 0, "failed_segments": 0, "errors": []}
     for conv_id, client, ctx, seg in segments:
         ids = [r[0] for r in seg]
         text, line_map = build_segment_text(ctx, seg)
@@ -460,7 +489,11 @@ def main(force=False):
         memories = call_deepseek(text, resolve_purpose('l1_extract'))
         if memories is None:
             # B7：调用失败时不标记已提取，下个周期重试；连续失败转死信
-            dead = mark_failed(ids, LAST_EXTRACT_ERROR or "unknown error")
+            err = LAST_EXTRACT_ERROR or "unknown error"
+            dead = mark_failed(ids, err)
+            summary["failed_segments"] += 1
+            if str(err)[:300] not in summary["errors"]:
+                summary["errors"].append(str(err)[:300])
             print(f"  !! 提取失败，{len(ids)} 条消息保留为未提取，下次重试"
                   + (f"；其中 {dead} 条已连续失败 {MAX_EXTRACT_ATTEMPTS} 次，转为死信(extracted=-1)" if dead else ""))
             continue
@@ -492,10 +525,13 @@ def main(force=False):
                     event_msg_id=(max(ref_ids) if ref_ids else ids[-1]),
                     evidence_ids=sorted(ref_ids) or None, evidence_status=status, ts=first_ts)
         print(f"  Extracted {len(memories)} memories {stats if stats else ''}")
+        summary["memories"] += len(memories)
         mark_extracted(ids)
     print(f"[{datetime.now()}] Complete.")
-    # B13：叙事自动更新只由记忆服务的 APScheduler 负责（check_and_update_narrative），这里不再重复触发。
-
+    # B13：叙事自动更新只由记忆服务的定时检查负责（投递到任务队列），这里不再重复触发。
+    if not summary["errors"]:
+        summary.pop("errors")
+    return summary
 
 def resolve_purpose(purpose):
     """按模块配置（model_configs→providers）解析：返回 {base_url, api_key, model} 或 None（回退 .env）"""
