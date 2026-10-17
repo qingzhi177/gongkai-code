@@ -1,4 +1,6 @@
 data/sqlite/*.db
+# 迁移前的自动备份（含个人数据，不入库）
+data/sqlite/backups/
 data/chroma/
 data/profile/*.md
 data/extract.log

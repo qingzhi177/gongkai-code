@@ -169,8 +169,32 @@
 ### 测试
 - `tests/manual/test_timeutil.py` 13 项；网关假上游 65 项（新增：recall 里的时间换算成北京时间）；`phase0_smoke.py` 全部通过。
 
+## 2026-10-18（凌晨）· Phase 1：数据库连接统一 + 迁移框架
+
+### 问题
+- 建表、加列的代码散在两处（记忆服务的 `init_db()`、提取脚本的 `ensure_columns()`）。每次启动都把几十条 `ALTER TABLE` 试一遍，靠报错判断列是不是已经有了；没有版本记录，看不出库现在是什么结构。
+- 80 多处各自 `sqlite3.connect`，等锁时间是默认的 5 秒。记忆服务、cron 提取、导入同时写库时，更容易碰到 `database is locked`。
+- 整个库一个索引都没有，按会话取对话、找未提取的消息都是全表扫描。
+- 顺带发现：全新的空库第一次启动时，`thinking_records.full_reply` 列加不上（加列写在了建表前面），要第二次启动才补上。
+
+### 改法
+- 新增 `services/memory-service/db.py`：
+  - `connect()`：统一的连接入口，等锁最多 10 秒。记忆服务里是 `get_conn()`；提取脚本、导入导出也都改用它（共 86 处）。
+  - `migrate()`：按编号执行 `migrations/` 里还没执行过的迁移，记录在 `schema_migrations` 表里。记忆服务启动、提取脚本每次运行都会调用，平时什么都不做。
+  - 每个迁移在一个事务里执行：失败就整体回滚、服务启动报错，不会留下半截结构；`up()` 里误提交事务也会被发现。
+  - 有数据的库执行新迁移前，先自动备份到 `data/sqlite/backups/`（只保留最近 10 份，不入库）。
+  - 两个进程同时启动，也不会重复执行同一个迁移。
+- `migrations/001_baseline.py`：原来 `init_db()` 和 `ensure_columns()` 的全部内容。对现有的库是空操作，只记下版本 1。
+- `migrations/002_indexes.py`：6 个常用查询的索引（L0 按会话、按未提取；L1 按状态、按会话；思考链按会话）。只加索引，不动数据。
+- 以后改表结构：新建 `migrations/003_名字.py`，写一个 `up(conn)`。规则是只加不删，旧代码在新库上也能跑。
+
+### 测试
+- `tests/manual/test_migrations.py` 41 项全部通过：全新空库、旧库补列、失败回滚、提前提交检测、两个进程同时执行、真实库的副本（每张表行数不变、建表语句不变）。
+- 旧 `init_db()` 和 001 分别在空库上建表，结构对比完全一致（除了上面说的 `full_reply`，现在第一次就能建上）。
+- 线上：记忆服务重启后执行了 001、002，迁移前的备份已生成；`phase0_smoke.py` 全部通过。
+
 ### 待办（下一步）
-- **Phase 1 剩余**：数据库连接统一（`get_conn`：WAL、busy_timeout）+ 迁移框架；任务表 + worker（替代 cron 和 APScheduler 里的生成任务），Dashboard 显示队列和死信。
+- **Phase 1 剩余**：任务表 + worker（替代 cron 和 APScheduler 里的生成任务），Dashboard 显示队列和死信。
 - **Pluvia**：前端按约定第 9 节联调；有对不上的地方再看前端代码。
 - **中转站**：如果经常出现提示词被替换，联系中转站或换一个分组 / 渠道（先用 `check_relay_system.py` 确认）。
 - **自动切换**：要不要调备用顺序（openrouter 一般按官方价计费，可能比中转贵；fuse 和 fusev1 在同一个站，一个挂了另一个大概也会挂）。

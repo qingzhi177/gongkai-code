@@ -14,6 +14,7 @@
 """
 import json
 import sqlite3
+import db
 import tempfile
 import zipfile
 from datetime import datetime
@@ -171,7 +172,7 @@ def import_kelivo_backup(zip_path: str, mode: str = 'skip', memory_db_path: str 
     if not memory_db_path:
         raise ValueError('memory_db_path required')
     db_conn, tmp_path = _open_backup_db(zip_path)
-    mem_conn = sqlite3.connect(memory_db_path)
+    mem_conn = db.connect(memory_db_path)
     try:
         convs = set(convs or [])
         conv_rows = db_conn.execute(

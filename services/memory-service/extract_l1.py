@@ -22,6 +22,7 @@ ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 # Phase 1：向量改存 SQLite（与记忆服务共用 vector_store.VectorCollection，不再依赖 ChromaDB 容器）
 from vector_store import VectorCollection  # noqa: E402
 import timeutil  # noqa: E402  存储一律 UTC，给模型看时换算成用户时区
+import db  # noqa: E402  统一的数据库连接 + 迁移
 l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的记忆提取，像给未来的自己写便签。
@@ -128,28 +129,14 @@ MAX_EXTRACT_ATTEMPTS = 3  # 连续失败达到这个次数 → extracted=-1（�
 
 
 def ensure_columns():
-    """B7：确保重试计数列存在（记忆服务启动时也会建，这里兜底，防止 cron 先跑）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
-    try:
-        for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
-            try:
-                conn.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
-            except sqlite3.OperationalError:
-                pass
-        # 提取流水线 v2：证据（引用的 L0 id 列表）、证据校验状态、作者（E 轴）
-        for col, coldef in (("evidence_json", "TEXT"), ("evidence_status", "TEXT"), ("author", "TEXT")):
-            try:
-                conn.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
-            except sqlite3.OperationalError:
-                pass
-        conn.commit()
-    finally:
-        conn.close()
+    """表结构由迁移统一管理（db.py + migrations/）。cron 可能比记忆服务先跑，所以这里也执行一次；
+    已经执行过的迁移不会重复执行，平时这一步什么都不做。"""
+    db.migrate(SQLITE_PATH)
 
 
 def mark_failed(ids, error):
     """B7：提取失败 → 不标记已提取，只累加失败次数；达到上限转为死信（extracted=-1）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     c = conn.cursor()
     for mid in ids:
         c.execute(
@@ -169,7 +156,7 @@ def mark_failed(ids, error):
 
 
 def get_unextracted():
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     c = conn.cursor()
     c.execute('SELECT id, conv_id, role, content, client, ts FROM l0_messages WHERE extracted=0 AND status=? ORDER BY ts LIMIT 50', ('active',))
     messages = c.fetchall()
@@ -264,7 +251,7 @@ def get_l0_ts(source_id):
     """
     if not source_id:
         return None
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     try:
         row = conn.execute('SELECT ts FROM l0_messages WHERE id=?', (source_id,)).fetchone()
         return row[0] if row and row[0] else None
@@ -292,7 +279,7 @@ def save_l1(memory, conv_id, client, source_id, event_msg_id=None, evidence_ids=
     author = memory.get("author")
     if author not in ("user_said", "ai_said", "co_created", "ai_felt"):
         author = None
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     c = conn.cursor()
     try:
         c.execute(
@@ -321,7 +308,7 @@ def save_l1(memory, conv_id, client, source_id, event_msg_id=None, evidence_ids=
 
 
 def mark_extracted(ids):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     c = conn.cursor()
     for mid in ids:
         c.execute('UPDATE l0_messages SET extracted=1 WHERE id=?', (mid,))
@@ -352,7 +339,7 @@ def get_pending_segments(force=False):
     - 只处理"已经安静了 QUIET_MINUTES 分钟"的会话；最早的未提取消息超过 BACKLOG_MINUTES 时不再等。force=True 忽略等待
     - 同一会话按 id 顺序（与版本切换级联的批次定位一致），相邻间隔 > GAP_MINUTES 或段长达到上限时切段
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = db.connect(SQLITE_PATH)
     try:
         convs = conn.execute(
             "SELECT conv_id, MIN(ts), MAX(ts) FROM l0_messages WHERE extracted=0 AND status='active' GROUP BY conv_id"
@@ -513,14 +500,13 @@ def main(force=False):
 def resolve_purpose(purpose):
     """按模块配置（model_configs→providers）解析：返回 {base_url, api_key, model} 或 None（回退 .env）"""
     try:
-        import sqlite3 as _sq
         import json as _js
         import os as _os
         # B11：与文件顶部统一使用 DATA_DIR（以前这里读 MEMORY_DATA_DIR，和其余代码不一致）
         _db = str(SQLITE_PATH)
         if not _os.path.exists(_db):
             return None
-        conn = _sq.connect(_db)
+        conn = db.connect(_db)
         c = conn.cursor()
         row = c.execute("SELECT provider_id, model_name FROM model_configs WHERE purpose=? AND enabled=1", (purpose,)).fetchone()
         if not row:

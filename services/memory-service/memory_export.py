@@ -3,6 +3,7 @@
 import io
 import json
 import sqlite3
+import db
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -18,7 +19,7 @@ def export_memory_zip(db_path, profile_dir) -> bytes:
         manifest = {'format': 'memory-export', 'version': 1,
                     'createdAtUtc': datetime.utcnow().isoformat(),
                     'tables': {}, 'profiles': []}
-        conn = sqlite3.connect(db_path)
+        conn = db.connect(db_path)
         conn.row_factory = sqlite3.Row
         for t in EXPORT_TABLES:
             try:
@@ -39,7 +40,7 @@ def export_memory_zip(db_path, profile_dir) -> bytes:
 
 def import_memory_zip(zip_bytes, db_path, profile_dir, mode='merge'):
     with zipfile.ZipFile(io.BytesIO(zip_bytes)) as z:
-        conn = sqlite3.connect(db_path)
+        conn = db.connect(db_path)
         stats = {}
         for t in EXPORT_TABLES:
             name = f'{t}.json'
@@ -73,7 +74,7 @@ def import_memory_zip(zip_bytes, db_path, profile_dir, mode='merge'):
 
 
 def export_feel(db_path) -> list:
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     conn.row_factory = sqlite3.Row
     rows = [dict(r) for r in conn.execute(
         "SELECT * FROM l1_memories WHERE event_type='feel' AND status='active'").fetchall()]
@@ -86,7 +87,7 @@ def import_feel(db_path, rows, chroma_add=None) -> int:
 
     完整保留所有字段：anchor_json（和弦锚点）, display_count, last_shown_at, visibility, supersedes
     """
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     saved = 0
     for r in rows:
         content = (r.get('content') or '').strip()
@@ -147,7 +148,7 @@ def export_l1_with_context(db_path, filters=None) -> dict:
         }
     }
     """
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     # 1. 导出 L1
@@ -218,7 +219,7 @@ def import_l1_with_context(db_path, data, chroma_add=None) -> dict:
         "skipped": 5      # 因重复跳过的数量
     }
     """
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     stats = {'imported': 0, 'remapped': 0, 'orphaned': 0, 'skipped': 0}
 
     old_to_new_id = {}  # {旧 L0 id: 新 L0 id}
@@ -327,7 +328,7 @@ def export_l1_simple(db_path, filters=None) -> list:
 
     返回完整的 L1 行数据（包括所有字段）
     """
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     conn.row_factory = sqlite3.Row
 
     query = "SELECT * FROM l1_memories WHERE status='active'"
@@ -349,7 +350,7 @@ def import_l1_simple(db_path, rows, chroma_add=None) -> int:
     - 只需要保留记忆内容，不需要回溯原文上下文
     - 跨会话/跨系统迁移记忆
     """
-    conn = sqlite3.connect(db_path)
+    conn = db.connect(db_path)
     saved = 0
 
     for r in rows:

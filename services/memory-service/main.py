@@ -23,6 +23,7 @@ import difflib
 from vector_store import VectorCollection
 import text_index
 import timeutil   # Phase 1：存储一律 UTC，给人 / 模型看时换算成用户时区
+import db         # Phase 1：统一的数据库连接 + 迁移（db.py、migrations/）
 
 load_dotenv()
 
@@ -120,224 +121,19 @@ GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:3000")
 SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
 SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+
+def get_conn():
+    """统一的数据库连接（等锁最多 10 秒，见 db.py）"""
+    return db.connect(SQLITE_PATH)
+
 # Phase 1：向量改存 SQLite（vector_store.py），不再依赖 ChromaDB 容器。
 # VectorCollection 与原 chromadb Collection 接口兼容，下面所有 l1_collection.xxx 调用保持不变。
 l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 def init_db():
-    conn = sqlite3.connect(str(SQLITE_PATH))
-    c = conn.cursor()
-    # H1：WAL 模式（持久化在库文件里，一次设置即可）。记忆服务和 cron 提取进程会同时写库，
-    # WAL 允许一写多读并发，配合 sqlite3 默认 5 秒 busy 等待，减少 "database is locked"。
-    try:
-        c.execute("PRAGMA journal_mode=WAL")
-    except sqlite3.OperationalError as e:
-        print(f"[MIGRATE] 设置 WAL 失败（不影响运行）: {e}")
-    c.execute('''CREATE TABLE IF NOT EXISTS l0_messages (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conv_id TEXT NOT NULL,
-        msg_idx INTEGER NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-        source TEXT DEFAULT 'live',
-        client TEXT DEFAULT 'unknown',
-        status TEXT DEFAULT 'active',
-        extracted INTEGER DEFAULT 0
-    )''')
-    c.execute('''CREATE TABLE IF NOT EXISTS l1_memories (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT NOT NULL,
-        quote TEXT,
-        source_msg_id INTEGER,
-        conv_id TEXT,
-        client TEXT,
-        event_type TEXT,
-        tags TEXT,
-        valence REAL,
-        arousal REAL,
-        is_core INTEGER DEFAULT 0,
-        access_count INTEGER DEFAULT 0,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'active'
-    )''')
-    # 功能6：供应商配置表。api_key 加密存储；models 存 JSON 数组。
-    c.execute('''CREATE TABLE IF NOT EXISTS providers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        name TEXT NOT NULL,
-        base_url TEXT NOT NULL,
-        api_key_enc TEXT DEFAULT '',
-        models TEXT DEFAULT '[]',
-        role TEXT DEFAULT 'chat',
-        api_format TEXT DEFAULT 'openai',
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # 已有表迁移：providers.role
-    try:
-        c.execute("ALTER TABLE providers ADD COLUMN role TEXT DEFAULT 'chat'")
-        conn.commit()
-    except Exception:
-        pass
-    try:
-        c.execute("ALTER TABLE providers ADD COLUMN api_format TEXT DEFAULT 'openai'")
-        conn.commit()
-    except Exception:
-        pass
-    # 当前选中的供应商 + 模型（单行，key 固定为 1）
-    c.execute('''CREATE TABLE IF NOT EXISTS active_config (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        provider_id INTEGER,
-        model TEXT
-    )''')
-    # Shared Narrative 表
-    c.execute('''CREATE TABLE IF NOT EXISTS shared_narrative (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT NOT NULL,
-        version INTEGER DEFAULT 1,
-        trigger_type TEXT,
-        trigger_details TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'active'
-    )''')
-    # Recent Summary 表
-    c.execute('''CREATE TABLE IF NOT EXISTS recent_summary (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        content TEXT NOT NULL,
-        period_start DATETIME,
-        period_end DATETIME,
-        msg_count INTEGER,
-        token_count INTEGER,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-        status TEXT DEFAULT 'active'
-    )''')
-    # Narrative 配置表（更新检查策略）
-    c.execute('''CREATE TABLE IF NOT EXISTS narrative_config (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        auto_update_enabled INTEGER DEFAULT 1,
-        check_threshold_turns INTEGER DEFAULT 50,
-        check_threshold_l1 INTEGER DEFAULT 10,
-        summary_max_turns INTEGER DEFAULT 100,
-        summary_max_tokens INTEGER DEFAULT 50000
-    )''')
-    # 模型配置表（不同模块独立配置模型）
-    c.execute('''CREATE TABLE IF NOT EXISTS model_configs (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        purpose TEXT UNIQUE NOT NULL,
-        provider_id INTEGER,
-        model_name TEXT,
-        enabled INTEGER DEFAULT 1,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # 配置行必须存在，否则自动检查读不到配置会静默跳过
-    c.execute("INSERT OR IGNORE INTO narrative_config (id) VALUES (1)")
-    # narrative_state 增量状态表：记录上次已处理到哪条消息
-    c.execute('''CREATE TABLE IF NOT EXISTS narrative_state (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        last_processed_l1_id INTEGER DEFAULT 0,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # custom_prompts 表：用户自定义交互偏好
-    c.execute('''CREATE TABLE IF NOT EXISTS custom_prompts (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        content TEXT DEFAULT '',
-        enabled INTEGER DEFAULT 1,
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # conv_settings 表：per-conv 会话配置（TG ↔ Kelivo 会话同步）
-    # id='__default__' 为全局默认；其他为具体 conv_id（如 tg_<chat_id>）
-    c.execute('''CREATE TABLE IF NOT EXISTS conv_settings (
-        id TEXT PRIMARY KEY,          -- conv_id；'__default__' 为全局默认
-        window_mode TEXT DEFAULT 'all',   -- all | n | tokens
-        window_n INTEGER DEFAULT 50,      -- window_mode=n 时的条数
-        window_tokens INTEGER DEFAULT 8000, -- window_mode=tokens 时的 token 预算（粗略 char/4）
-        effort TEXT DEFAULT 'medium',     -- low | medium | high（output_config.effort）
-        model TEXT DEFAULT '',
-        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    c.execute("INSERT OR IGNORE INTO conv_settings (id) VALUES ('__default__')")
-    # ③ 和弦情绪锚点：l1_memories 加 anchor_json（可空；AI 自述 feel 的可选结构化锚）
-    for _col, _coldef in (("anchor_json", "TEXT"),):
-        try:
-            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {_col} {_coldef}")
-        except sqlite3.OperationalError:
-            pass
-    # 方案C：group 语义列（幂等 migration；列已存在则跳过）
-    for col, coldef in (("group_id", "TEXT"), ("version", "INTEGER DEFAULT 0"), ("group_anchor", "INTEGER")):
-        try:
-            c.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
-        except sqlite3.OperationalError:
-            pass
-    # 思考链独立存储：不进入 L0 正文，按会话关联
-    try:
-        c.execute("ALTER TABLE thinking_records ADD COLUMN full_reply TEXT")
-        conn.commit()
-    except Exception:
-        pass
-    c.execute('''CREATE TABLE IF NOT EXISTS thinking_records (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        conv_id TEXT NOT NULL,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP,
-        thinking TEXT NOT NULL,
-        answer_ref TEXT
-    )''')
-    # 复活 bug 修复：用户显式删除的 L0 消息黑名单。
-    # 单条删除已改真删（DELETE），但真删只清掉本地行，不留痕迹——Kelivo 客户端本地
-    # 仍保留这条消息，下次全量上报时 save_conversation 按 group_id 查不到任何记录，
-    # 会当成"全新消息"重新插入（新 id、新时间戳），也就是用户看到的"删了又出现，
-    # 时间戳还一直变"。这张表记录被删过的 group_id（或无 group 时的 conv+role+内容），
-    # 写入前先查这张黑名单，命中就跳过，防止复活。
-    c.execute('''CREATE TABLE IF NOT EXISTS l0_deleted_marks (
-        mark_key TEXT PRIMARY KEY,
-        conv_id TEXT,
-        ts DATETIME DEFAULT CURRENT_TIMESTAMP
-    )''')
-    # 增量水位线：记录生成时已消费到的最大 id。
-    # 用自增 id 而非 ts —— L1 的 ts 是「对话发生时间」（见 extract_l1.py 的
-    # get_l0_ts），导入旧对话后提取的 L1 时间戳更早，按 ts 比较会漏算增量。
-    for table, col in (("shared_narrative", "last_l1_id"), ("recent_summary", "last_l0_id")):
-        cols = [r[1] for r in c.execute(f"PRAGMA table_info({table})").fetchall()]
-        if col not in cols:
-            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} INTEGER DEFAULT 0")
-            print(f"[MIGRATE] {table}.{col} 已添加")
-
-    # 记忆理念工程化 + 随机触发：新增字段（display_count, last_shown_at, visibility, supersedes）
-    for col, coldef in (
-        ("display_count", "INTEGER DEFAULT 0"),
-        ("last_shown_at", "INTEGER"),  # Unix 时间戳（毫秒）
-        ("visibility", "REAL DEFAULT 1.0"),  # 0.0-1.0，软隐藏机制
-        ("supersedes", "INTEGER")  # 指向被修正的旧 feel 的 id
-    ):
-        try:
-            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
-            print(f"[MIGRATE] l1_memories.{col} 已添加")
-        except sqlite3.OperationalError:
-            pass  # 列已存在，跳过
-
-    # 叙事虚构修复：新增 event_msg_id 字段（指向真正触发提取的 L0 消息）
-    try:
-        c.execute("ALTER TABLE l1_memories ADD COLUMN event_msg_id INTEGER")
-        print("[MIGRATE] l1_memories.event_msg_id 已添加")
-    except sqlite3.OperationalError:
-        pass  # 列已存在，跳过
-
-    # 提取流水线 v2：证据（引用的 L0 id 列表 JSON）、证据校验状态、作者（E 轴：user_said/ai_said/co_created/ai_felt）
-    for col, coldef in (("evidence_json", "TEXT"), ("evidence_status", "TEXT"), ("author", "TEXT")):
-        try:
-            c.execute(f"ALTER TABLE l1_memories ADD COLUMN {col} {coldef}")
-            print(f"[MIGRATE] l1_memories.{col} 已添加")
-        except sqlite3.OperationalError:
-            pass
-
-    # B7：提取失败重试计数与错误信息（连续失败 3 次 → extracted=-1 死信，不再自动重试）
-    for col, coldef in (("extract_attempts", "INTEGER DEFAULT 0"), ("extract_error", "TEXT")):
-        try:
-            c.execute(f"ALTER TABLE l0_messages ADD COLUMN {col} {coldef}")
-            print(f"[MIGRATE] l0_messages.{col} 已添加")
-        except sqlite3.OperationalError:
-            pass  # 列已存在，跳过
-
-    conn.commit()
-    conn.close()
+    """建表、加列已经移到 migrations/（001_baseline 就是原来这里的全部内容），
+    这里只负责执行还没执行过的迁移。规则见 db.py 开头。"""
+    db.migrate(SQLITE_PATH)
 
 init_db()
 # Phase 1：L1 关键词检索索引（FTS5 + jieba，见 text_index.py），触发器保证跨进程的变更都能被对账发现
@@ -380,7 +176,7 @@ def get_l0_context(sqlite_path, l1_id_str):
     先用 source_id 查出对应行的 msg_idx，再用 msg_idx 做区间查询。
     """
     try:
-        conn = sqlite3.connect(str(sqlite_path))
+        conn = db.connect(sqlite_path)
         c = conn.cursor()
         # 先找这条 L1 对应的 conv_id 和 source_msg_id（l0_messages.id）
         c.execute('SELECT source_msg_id, conv_id, evidence_json FROM l1_memories WHERE id=?', (l1_id_str,))
@@ -421,7 +217,7 @@ def get_l0_context(sqlite_path, l1_id_str):
                         prefix = "你" if role == "user" else "我"
                         parts.append(prefix + ": " + content[:200])
                     return "\n".join(parts)
-                conn = sqlite3.connect(str(sqlite_path))
+                conn = db.connect(sqlite_path)
                 c = conn.cursor()
 
         # Bug4 修复：用 source_id（l0_messages.id）查出对应的 msg_idx，再做区间查询
@@ -512,7 +308,7 @@ async def reconcile_indexes():
     except Exception as e:
         logger.error(f"[RECONCILE] FTS 对账失败: {e}")
     try:
-        conn = sqlite3.connect(str(SQLITE_PATH), timeout=10)
+        conn = get_conn()
         active = dict(conn.execute("SELECT id, content FROM l1_memories WHERE status='active'").fetchall())
         conn.close()
         existing = l1_collection.existing_ids()
@@ -553,7 +349,7 @@ async def search_memories(req: SearchRequest):
     try:
         if req.mode == "exact":
             # 精确检索：搜索 L1 + L0（未提炼的原文）
-            conn = sqlite3.connect(str(SQLITE_PATH), timeout=30)
+            conn = db.connect(SQLITE_PATH, timeout=30)
             c = conn.cursor()
 
             # 1. 搜索 L1 记忆
@@ -669,7 +465,7 @@ async def search_memories(req: SearchRequest):
         sorted_ids = sorted(rrf_scores.items(), key=lambda x: -x[1])
 
         memories = []
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         q_vec = np.asarray(query_embedding, dtype=np.float32)
         q_norm = float(np.linalg.norm(q_vec)) or 1.0
@@ -822,7 +618,7 @@ class UpdateVisibilityRequest(BaseModel):
 @app.post("/memories/increment_access_count")
 async def increment_access_count(req: IncrementCountRequest):
     """recall 工具显式调用时增加 access_count"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     for mid in req.memory_ids:
         l1_id = mid.replace("l1_", "")
@@ -834,7 +630,7 @@ async def increment_access_count(req: IncrementCountRequest):
 @app.post("/memories/increment_display_count")
 async def increment_display_count(req: IncrementCountRequest):
     """memoryMenu 展示时增加 display_count"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     for mid in req.memory_ids:
         l1_id = mid.replace("l1_", "")
@@ -846,7 +642,7 @@ async def increment_display_count(req: IncrementCountRequest):
 @app.post("/memories/update_last_shown")
 async def update_last_shown(req: UpdateLastShownRequest):
     """更新 last_shown_at 时间戳（毫秒）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     for mid in req.memory_ids:
         l1_id = mid.replace("l1_", "")
@@ -862,7 +658,7 @@ async def update_visibility(l1_id: int, req: UpdateVisibilityRequest):
     if not 0.0 <= req.visibility <= 1.0:
         raise HTTPException(400, "visibility must be between 0.0 and 1.0")
 
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE l1_memories SET visibility = ? WHERE id = ?", (req.visibility, l1_id))
     conn.commit()
@@ -876,7 +672,7 @@ async def search_serendipity(
     n: int = 10
 ):
     """无由来浮现：返回高情感强度或核心记忆，且满足冷却期"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     import time
@@ -1091,7 +887,7 @@ def _merge_l0_sequence(c, conv_id, client, messages):
 
 @app.post("/save_conversation")
 async def save_conversation(req: SaveRequest):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     saved = 0
     superseded_old_ids = []   # 修复7：本轮因版本切换被 superseded 的旧 L0 id（含其 extracted 标志）
@@ -1206,7 +1002,7 @@ async def save_conversation(req: SaveRequest):
 
 @app.get("/stats")
 async def stats():
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute('SELECT COUNT(*) FROM l0_messages WHERE status=?', ('active',))
     l0 = c.fetchone()[0]
@@ -1218,7 +1014,7 @@ async def stats():
 @app.get("/stats/detail")
 async def stats_detail():
     """详细统计"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     # 按类型统计
     c.execute('SELECT event_type, COUNT(*) FROM l1_memories WHERE status=? GROUP BY event_type', ('active',))
@@ -1277,7 +1073,7 @@ def parse_anchor(content: str):
 @app.post("/save_feel")
 async def save_feel(req: FeelRequest):
     """保存 AI 的感受到 L1"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     try:
         # 存入 SQLite
@@ -1345,7 +1141,7 @@ async def import_memory_upload(file: UploadFile, mode: str = "merge"):
         fpath.write_bytes(await file.read())
         from memory_export import import_memory_zip, EXPORT_TABLES
         if mode == "replace":
-            conn = sqlite3.connect(str(SQLITE_PATH))
+            conn = get_conn()
             for t in EXPORT_TABLES:
                 conn.execute(f"DELETE FROM {t}")
             conn.commit(); conn.close()
@@ -1374,7 +1170,7 @@ async def import_memory_api(req: MemoryImportReq):
         data = open(req.path, "rb").read()
         if req.mode == "replace":
             for t in EXPORT_TABLES:
-                conn = sqlite3.connect(str(SQLITE_PATH))
+                conn = get_conn()
                 conn.execute(f"DELETE FROM {t}")
                 conn.commit(); conn.close()
         stats = import_memory_zip(data, str(SQLITE_PATH),
@@ -1542,7 +1338,7 @@ async def import_conversation(req: ImportRequest):
     """导入历史对话到 L0"""
     import uuid
     conv_id = f"{req.client}_{uuid.uuid4().hex[:8]}"
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     saved = 0
     try:
@@ -1633,7 +1429,7 @@ async def profile_rebuild_status():
 
 async def _do_profile_rebuild():
     # 1. 读全部 L0 原文
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, role, content FROM l0_messages WHERE status='active' ORDER BY id ASC"
@@ -1713,7 +1509,7 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     Bug4 修复：conv_id 指定时按 msg_idx 排序（反映真实对话顺序），
     而不是按 id 排序（只反映写入数据库的先后）。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     if conv_id:
         c.execute(
@@ -1742,7 +1538,7 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
 @app.get("/l0/conversations")
 async def get_conversations(limit: int = 500, offset: int = 0):
     """获取对话列表"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute('''
         SELECT conv_id, client, MIN(ts) as first_ts, MAX(ts) as last_ts, COUNT(*) as msg_count
@@ -1762,7 +1558,7 @@ async def get_conversations(limit: int = 500, offset: int = 0):
 @app.get("/l1/list")
 async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offset: int = 0):
     """获取 L1 记忆列表"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     if event_type:
         c.execute(
@@ -1793,7 +1589,7 @@ async def get_l1_list(event_type: Optional[str] = None, limit: int = 1000, offse
 @app.get("/l1/anchors")
 async def get_l1_anchors(limit: int = 100, offset: int = 0):
     """返回带和弦锚点(anchor_json)的 feel 记忆列表"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, content, anchor_json, ts FROM l1_memories WHERE event_type='feel' AND status='active' AND anchor_json IS NOT NULL ORDER BY ts DESC LIMIT ? OFFSET ?",
@@ -1808,7 +1604,7 @@ async def get_viz_l0l1():
     """L0-L1 关联可视化：active L1（含批次 source_msg_id）+ 批次窗口内 L0 消息。
     批次 = source_msg_id（该次提取首条消息 id），按 id 区间不重叠切分。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, content, quote, event_type, tags, valence, arousal, is_core, access_count, ts, client, source_msg_id "
@@ -1879,7 +1675,7 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
     重构：L1 改硬删后，编辑前先校验该 id 存在且 status='active'，
     否则返回 404（防止对已删 id 编辑还返回 ok）。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     exists = c.execute("SELECT status FROM l1_memories WHERE id=?", (memory_id,)).fetchone()
     if not exists or exists[0] != 'active':
@@ -1927,7 +1723,7 @@ async def update_l1(memory_id: int, req: UpdateL1Request):
 @app.get("/viz/thinkings")
 async def viz_thinkings(limit: int = 500, offset: int = 0):
     """思维潜流可视化：思考链 + 完整回复（full_reply 回填自 L0）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, conv_id, ts, thinking, answer_ref, full_reply FROM thinking_records ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -1947,7 +1743,7 @@ async def delete_l1(memory_id: int):
     现改硬删。SQLite 先提交，再删向量；ChromaDB 失败返回 warning 不回滚
     （与 /search 的 active 兜底校验配合，残留向量也搜不出来）。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute('DELETE FROM l1_memories WHERE id=?', (memory_id,))
     conn.commit()
@@ -1973,7 +1769,7 @@ async def reextract_l1(memory_id: int):
     # 复用 cron 提取管线的 prompt 和 DeepSeek 调用（懒加载，避免 import 时的连接副作用）
     from extract_l1 import EXTRACT_PROMPT, call_deepseek
 
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     try:
         row = c.execute(
@@ -2095,7 +1891,7 @@ class UpdateTimestampRequest(BaseModel):
 @app.put("/l0/{msg_id}/timestamp")
 async def update_l0_timestamp(msg_id: int, req: UpdateTimestampRequest):
     """修改 L0 消息的时间戳"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute('UPDATE l0_messages SET ts=? WHERE id=?', (req.ts, msg_id))
     conn.commit()
@@ -2111,7 +1907,7 @@ async def delete_l0_message(msg_id: int):
     删掉的消息落在某批次内 → 作废整批 L1、该批其它 active 消息重提取(extracted=0)、
     从 ChromaDB 删对应向量。只对已提取过(extracted=1)的消息联动。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     l1_ids_to_purge = []
     try:
@@ -2152,7 +1948,7 @@ async def delete_l0_conversation(conv_id: str):
     重构：L1 从软删（superseded）改为硬删（DELETE）。L0 仍保持软删。
     先收集该对话下 active L1 的 id，DELETE 后再删对应向量。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     # 1. 查出该 conv_id 下所有 active L1 的 id（删向量要用）
     c.execute("SELECT id FROM l1_memories WHERE conv_id=? AND status='active'", (conv_id,))
@@ -2177,7 +1973,7 @@ async def delete_l0_conversation(conv_id: str):
 def get_extract_provider():
     """从 providers 表找 role='extract' 的供应商（供 L1 提取），无则 None（回退 .env）"""
     try:
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         row = c.execute(
             "SELECT id, name, base_url, api_key_enc, models FROM providers WHERE role='extract' ORDER BY id LIMIT 1"
@@ -2218,7 +2014,7 @@ def _mask_key(enc: str) -> str:
 @app.get("/config/providers")
 async def list_providers():
     """列出所有供应商。api_key 脱敏为 ***，不返回明文。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute("SELECT id, name, base_url, api_key_enc, models, role, api_format FROM providers ORDER BY id").fetchall()
     active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
@@ -2240,7 +2036,7 @@ async def list_providers():
 
 @app.post("/config/providers")
 async def create_provider(req: ProviderData):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     enc = encrypt_secret(req.api_key) if req.api_key else ""
     c.execute(
@@ -2254,7 +2050,7 @@ async def create_provider(req: ProviderData):
 
 @app.put("/config/providers/{pid}")
 async def update_provider(pid: int, req: ProviderData):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute("SELECT api_key_enc FROM providers WHERE id = ?", (pid,)).fetchone()
     if not row:
@@ -2275,7 +2071,7 @@ async def update_provider(pid: int, req: ProviderData):
 
 @app.delete("/config/providers/{pid}")
 async def delete_provider(pid: int):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("DELETE FROM providers WHERE id = ?", (pid,))
     # 如果删的是当前选中的供应商，清空 active
@@ -2298,7 +2094,7 @@ async def notify_gateway_reload():
 
 @app.post("/config/active")
 async def set_active(req: ActiveConfig):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     exists = c.execute("SELECT id FROM providers WHERE id = ?", (req.provider_id,)).fetchone()
     if not exists:
@@ -2317,7 +2113,7 @@ async def set_active(req: ActiveConfig):
 @app.get("/config/current")
 async def get_current_config():
     """给网关拉取用：返回当前选中供应商的 base_url + 解密后的真实 api_key + model。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
     if not active:
@@ -2341,7 +2137,7 @@ async def get_chat_targets():
 
     含解密后的 api_key，只给本机网关调用；网关的 /api 代理会拦掉这个路径，不对外。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
     rows = c.execute(
@@ -2375,7 +2171,7 @@ async def get_last_session(conv_id: Optional[str] = None):
     不传 conv_id 直接查全局最近一条。
     ts 是 SQLite 存的 UTC（CURRENT_TIMESTAMP，"YYYY-MM-DD HH:MM:SS"）。
     """
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     try:
         row = None
@@ -2406,7 +2202,7 @@ async def test_embedding():
 @app.get("/narrative/current")
 async def get_current_narrative():
     """获取当前活跃的 Shared Narrative"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT id, content, version, trigger_type, trigger_details, ts FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
@@ -2427,7 +2223,7 @@ async def get_current_narrative():
 @app.get("/narrative/history")
 async def get_narrative_history(limit: int = 10):
     """获取历史版本"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, version, trigger_type, ts, status FROM shared_narrative ORDER BY version DESC LIMIT ?",
@@ -2494,7 +2290,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
     """
     try:
         # 1. 获取现有 narrative
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         existing = c.execute(
             "SELECT content FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
@@ -2557,7 +2353,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
         # B14：校验结果为 fail 时不发布——草稿存为 rejected（不替换线上版本、不推进水位线），下次自动检查重试。
         # 同一批素材最多拦截 2 次，第 3 次照常发布并带上校验报告，避免无限重试消耗额度。强制重写不拦截。
         if verification.get("status") == "fail" and not req.force:
-            conn = sqlite3.connect(str(SQLITE_PATH))
+            conn = get_conn()
             c = conn.cursor()
             prev_rejects = c.execute(
                 "SELECT COUNT(*) FROM shared_narrative WHERE status='rejected' AND last_l1_id=?",
@@ -2582,7 +2378,7 @@ async def _do_narrative(req: NarrativeGenerateRequest):
             verification["published_after_rejects"] = prev_rejects
 
         # 7. 保存新版本 + 更新增量状态
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         c.execute("UPDATE shared_narrative SET status='superseded' WHERE status='active'")
         last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
@@ -2638,7 +2434,7 @@ class NarrativeUpdateRequest(BaseModel):
 @app.put("/narrative/{narrative_id}")
 async def update_narrative(narrative_id: int, req: NarrativeUpdateRequest):
     """编辑 Narrative 内容"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE shared_narrative SET content=? WHERE id=?", (req.content, narrative_id))
     conn.commit()
@@ -2650,7 +2446,7 @@ async def update_narrative(narrative_id: int, req: NarrativeUpdateRequest):
 @app.get("/summary/current")
 async def get_current_summary():
     """获取当前 Recent Summary"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT id, content, period_start, period_end, msg_count, ts FROM recent_summary WHERE status='active' ORDER BY id DESC LIMIT 1"
@@ -2671,7 +2467,7 @@ async def get_current_summary():
 @app.get("/summary/config")
 async def get_summary_config():
     """获取摘要配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1, summary_max_turns, summary_max_tokens FROM narrative_config WHERE id=1"
@@ -2703,7 +2499,7 @@ class SummaryConfigUpdate(BaseModel):
 @app.put("/summary/config")
 async def update_summary_config(req: SummaryConfigUpdate):
     """更新摘要配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     # 确保配置行存在
@@ -2740,7 +2536,7 @@ async def update_summary_config(req: SummaryConfigUpdate):
 @app.get("/custom_prompt")
 async def get_custom_prompt():
     """获取用户自定义交互偏好"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     row = conn.execute("SELECT content, enabled FROM custom_prompts WHERE id=1").fetchone()
     conn.close()
     if not row:
@@ -2754,7 +2550,7 @@ class CustomPromptUpdate(BaseModel):
 @app.put("/custom_prompt")
 async def update_custom_prompt(req: CustomPromptUpdate):
     """更新用户自定义交互偏好"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     conn.execute(
         "INSERT OR REPLACE INTO custom_prompts (id, content, enabled, updated_at) VALUES (1, ?, ?, ?)",
         (req.content, req.enabled, timeutil.utc_now_str())
@@ -2782,7 +2578,7 @@ def _get_conv_settings(c, cid: str) -> dict:
 
 @app.get("/conv/{cid}/settings")
 async def get_conv_settings(cid: str):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     s = _get_conv_settings(c, cid)
     conn.close()
@@ -2790,7 +2586,7 @@ async def get_conv_settings(cid: str):
 
 @app.put("/conv/{cid}/settings")
 async def put_conv_settings(cid: str, req: ConvSettingsUpdate):
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     cur = _get_conv_settings(c, cid)
     for k in ("window_mode", "window_n", "window_tokens", "effort", "model"):
@@ -2810,7 +2606,7 @@ async def put_conv_settings(cid: str, req: ConvSettingsUpdate):
 
 @app.get("/conv/defaults")
 async def get_conv_defaults():
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     s = _get_conv_settings(c, "__default__")
     conn.close()
@@ -2823,7 +2619,7 @@ async def put_conv_defaults(req: ConvSettingsUpdate):
 @app.get("/conversations")
 async def list_conversations():
     """列出所有有 L0 的会话（按最近活跃排序）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT conv_id, COUNT(*), MAX(ts) FROM l0_messages "
@@ -2843,7 +2639,7 @@ class ThinkingRecord(BaseModel):
 @app.post("/thinking")
 async def save_thinking(req: ThinkingRecord):
     """思考链独立存储（不进 L0 正文）：供 Kelivo 端拉取后挂载显示"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("INSERT INTO thinking_records (conv_id, thinking, answer_ref, full_reply) VALUES (?,?,?,?)",
               (req.conv_id, req.thinking, req.answer_ref, req.full_reply))
@@ -2855,7 +2651,7 @@ async def save_thinking(req: ThinkingRecord):
 @app.get("/conversations/{cid}/thinkings")
 async def conversation_thinkings(cid: str, after_id: int = 0, limit: int = 100):
     """增量拉取思考链（按 id 升序）"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     rows = c.execute(
         "SELECT id, ts, thinking, answer_ref, full_reply FROM thinking_records WHERE conv_id=? AND id>? ORDER BY id ASC LIMIT ?",
@@ -2868,7 +2664,7 @@ async def conversation_thinkings(cid: str, after_id: int = 0, limit: int = 100):
 @app.get("/conversations/{cid}/messages")
 async def conversation_messages(cid: str, after_id: int = 0, limit: int = 200, last: int = 0, order: str = "id"):
     """增量拉取：返回 id > after_id 的消息（升序）。origin 推导：assistant→ai，user→client。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     order_expr = "COALESCE(group_anchor, id) ASC" if order == "anchor" else "id ASC"
     if last and last > 0:
@@ -2896,7 +2692,7 @@ class SummaryUpdateRequest(BaseModel):
 @app.put("/summary/{summary_id}")
 async def update_summary(summary_id: int, req: SummaryUpdateRequest):
     """编辑 Summary 内容"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     c.execute("UPDATE recent_summary SET content=? WHERE id=?", (req.content, summary_id))
     conn.commit()
@@ -2908,7 +2704,7 @@ async def generate_summary():
     """生成 Recent Summary"""
     try:
         # 获取配置
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         config_row = c.execute("SELECT summary_max_turns, summary_max_tokens FROM narrative_config WHERE id=1").fetchone()
         max_turns = config_row[0] if config_row else 100
@@ -2945,7 +2741,7 @@ async def generate_summary():
             return {"status": "error", "message": "生成失败"}
 
         # 保存摘要
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
 
         # 标记旧摘要为 superseded
@@ -2980,7 +2776,7 @@ _auto_lock = asyncio.Lock()
 
 def read_auto_config():
     """读取自动更新配置。每轮现读，改配置无需重启服务。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT auto_update_enabled, check_threshold_turns, check_threshold_l1 FROM narrative_config WHERE id=1"
@@ -2992,7 +2788,7 @@ def read_auto_config():
 
 def get_summary_pending():
     """返回（上次摘要水位线, 距上次摘要新增的消息数）。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT last_l0_id FROM recent_summary WHERE status='active' ORDER BY id DESC LIMIT 1"
@@ -3006,7 +2802,7 @@ def get_summary_pending():
 
 def get_narrative_pending():
     """返回（上次叙事水位线, 距上次叙事新增的重要 L1 数）。"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
     row = c.execute(
         "SELECT last_l1_id FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
@@ -3121,7 +2917,7 @@ async def purge_all_data(confirmation: dict):
         logger.warning("开始硬清除所有数据...")
 
         # 1. 清空 SQLite
-        conn = sqlite3.connect(str(SQLITE_PATH))
+        conn = get_conn()
         c = conn.cursor()
         c.execute("DELETE FROM l0_messages")
         try:
@@ -3203,7 +2999,7 @@ async def purge_all_data(confirmation: dict):
 @app.get("/l1/extraction_status")
 async def get_extraction_status():
     """获取 L1 提取状态"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     # 统计总消息数
@@ -3271,7 +3067,7 @@ async def extract_now():
 @app.get("/pipeline/status")
 async def get_pipeline_status():
     """获取整个记忆管线状态"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     # L0 统计
@@ -3309,7 +3105,7 @@ async def get_pipeline_status():
 
 async def get_model_config(purpose: str):
     """获取指定模块的模型配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     # 先查 model_configs 表
@@ -3345,7 +3141,7 @@ async def get_all_model_configs():
     purposes = ["chat", "l1_extract", "embedding", "narrative", "summary"]
     configs = {}
 
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     for purpose in purposes:
@@ -3376,7 +3172,7 @@ class ModelConfigUpdate(BaseModel):
 @app.put("/config/models/{purpose}")
 async def update_model_config(purpose: str, req: ModelConfigUpdate):
     """更新指定模块的模型配置"""
-    conn = sqlite3.connect(str(SQLITE_PATH))
+    conn = get_conn()
     c = conn.cursor()
 
     # 检查供应商是否存在
@@ -3410,7 +3206,7 @@ def get_l0_context_by_msg_id(sqlite_path, msg_id):
     返回：前后各2条消息的文本（共5条）
     """
     try:
-        conn = sqlite3.connect(str(sqlite_path))
+        conn = db.connect(sqlite_path)
         c = conn.cursor()
 
         # 先查出这条消息的 msg_idx 和 conv_id
