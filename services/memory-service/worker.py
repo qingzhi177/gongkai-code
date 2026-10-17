@@ -5,6 +5,7 @@
 
 怎么运行：
 - 平时由记忆服务自动拉起并看护（main.py 的 lifespan），意外退出会自动重启，记忆服务重启时一起重启。
+- 各类任务的逻辑在 app/pipeline/（摘要、叙事、画像）和 extract_l1.py（提取）。
   不想让记忆服务拉起时，在 .env 里设 WORKER_AUTOSTART=0，然后手动运行：venv/bin/python worker.py
 - 同一时间只会有一个 worker（data/run/worker.lock 文件锁），再启动一个会直接退出（退出码 3）。
 
@@ -33,10 +34,10 @@ if str(HERE) not in sys.path:
 
 import jobs  # noqa: E402
 import timeutil  # noqa: E402
+from app import config as app_config  # noqa: E402
 
-DATA_DIR = Path(os.getenv("DATA_DIR", os.path.expanduser("~/memory-system/data")))
-SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
-LOCK_PATH = DATA_DIR / "run" / "worker.lock"
+SQLITE_PATH = app_config.SQLITE_PATH
+LOCK_PATH = app_config.DATA_DIR / "run" / "worker.lock"
 
 POLL_SEC = float(os.getenv("WORKER_POLL_SEC", 5))
 MAX_CONCURRENCY = int(os.getenv("WORKER_CONCURRENCY", 2))
@@ -204,23 +205,24 @@ def _check(result):
 
 
 def build_handlers():
-    # 摘要 / 叙事 / 画像的生成逻辑目前还在 main.py 里，这里直接复用（导入 main 不会启动服务）。
-    # 以后按方案 4.3 节拆出模块后，改成直接引用对应模块。
-    import main as core
+    # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
+    from app.pipeline import narrative as narrative_pipeline
+    from app.pipeline import profile as profile_pipeline
+    from app.pipeline import summary as summary_pipeline
 
     def extract(payload, job):
         return extract_l1.main(force=bool(payload.get("force")))
 
     async def summary(payload, job):
-        return _check(await core.generate_summary())
+        return _check(await summary_pipeline.generate_summary())
 
     async def narrative(payload, job):
         fields = {k: payload[k] for k in ("trigger_type", "force", "reason") if k in payload}
-        return _check(await core._do_narrative(core.NarrativeGenerateRequest(**fields)))
+        return _check(await narrative_pipeline.run_narrative(narrative_pipeline.NarrativeGenerateRequest(**fields)))
 
     async def profile_rebuild(payload, job):
-        return _check(await core._do_profile_rebuild())
+        return _check(await profile_pipeline.rebuild_profile())
 
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild}
 
@@ -230,9 +232,8 @@ def main():
     if lock is None:
         print("[WORKER] 已有另一个 worker 在运行，退出", flush=True)
         sys.exit(EXIT_LOCKED)
-    handlers = build_handlers()          # 导入 main 时会配置日志（写 data/logs/auto_trigger.log）
-    if not logging.getLogger().handlers:
-        logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    app_config.setup_logging()           # 和记忆服务一样写 data/logs/auto_trigger.log
+    handlers = build_handlers()
     worker = Worker(SQLITE_PATH, handlers)
     try:
         asyncio.run(worker.run())

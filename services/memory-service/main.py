@@ -25,22 +25,19 @@ import text_index
 import timeutil   # Phase 1：存储一律 UTC，给人 / 模型看时换算成用户时区
 import db         # Phase 1：统一的数据库连接 + 迁移（db.py、migrations/）
 import jobs       # Phase 1：后台任务队列（jobs.py；执行在 worker.py）
+# 模块骨架（方案 4.3 节，绞杀者模式）：下面这些原来写在本文件里，已原样搬到 app/，这里导入后接口不变
+from app import config as app_config
+from app.config import DATA_DIR, SQLITE_PATH, LOG_DIR, AUTO_TRIGGER_LOG, GATEWAY_URL, get_conn
+from app.crypto import decrypt_secret, encrypt_secret
+from app.llm import get_model_config
+from app.pipeline.summary import get_summary_pending
+from app.pipeline.narrative import NarrativeGenerateRequest, get_narrative_pending
+from app.pipeline import summary as summary_pipeline
 
 load_dotenv()
 
-# 配置日志
-LOG_DIR = Path(__file__).parent.parent.parent / "data" / "logs"
-LOG_DIR.mkdir(parents=True, exist_ok=True)
-AUTO_TRIGGER_LOG = LOG_DIR / "auto_trigger.log"
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.FileHandler(AUTO_TRIGGER_LOG, encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
+# 配置日志（写 data/logs/auto_trigger.log + 终端；和 worker 共用，见 app/config.py）
+app_config.setup_logging()
 logger = logging.getLogger(__name__)
 
 scheduler = AsyncIOScheduler()
@@ -131,45 +128,12 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Memory Service", lifespan=lifespan)
 
-# 功能6：配置加密。CONFIG_SECRET_KEY 用于加密存储 API Key（Fernet 对称加密）。
-_config_secret = os.getenv("CONFIG_SECRET_KEY")
-_fernet = Fernet(_config_secret.encode()) if _config_secret else None
-
-def encrypt_secret(plain: str) -> str:
-    """加密明文 API Key；未配置密钥时降级为明文存储（并告警）。"""
-    if not plain:
-        return ""
-    if not _fernet:
-        print("[CONFIG] 警告：未配置 CONFIG_SECRET_KEY，API Key 将明文存储")
-        return plain
-    return _fernet.encrypt(plain.encode()).decode()
-
-def decrypt_secret(token: str) -> str:
-    """解密 API Key；解密失败（如密钥变更）时返回空串。"""
-    if not token:
-        return ""
-    if not _fernet:
-        return token
-    try:
-        return _fernet.decrypt(token.encode()).decode()
-    except Exception:
-        print("[CONFIG] 警告：API Key 解密失败（密钥可能已变更）")
-        return ""
 
 CHROMA_HOST = os.getenv("CHROMA_HOST", "localhost")
 CHROMA_PORT = int(os.getenv("CHROMA_PORT", 8000))
 ALIBABA_API_KEY = os.getenv("ALIBABA_API_KEY")
 ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
-DATA_DIR = Path(os.getenv("DATA_DIR", os.path.expanduser("~/memory-system/data")))
-# 功能6：网关地址，用于配置变更后通知网关热重载
-GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:3000")
-SQLITE_PATH = DATA_DIR / "sqlite" / "memory.db"
-SQLITE_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-
-def get_conn():
-    """统一的数据库连接（等锁最多 10 秒，见 db.py）"""
-    return db.connect(SQLITE_PATH)
+# DATA_DIR、SQLITE_PATH、GATEWAY_URL（配置变更后通知网关热重载）、get_conn() 都在 app/config.py
 
 # Phase 1：向量改存 SQLite（vector_store.py），不再依赖 ChromaDB 容器。
 # VectorCollection 与原 chromadb Collection 接口兼容，下面所有 l1_collection.xxx 调用保持不变。
@@ -1449,80 +1413,6 @@ async def profile_rebuild():
 async def profile_rebuild_status():
     return _job_status("profile_rebuild")
 
-async def _do_profile_rebuild():
-    # 1. 读全部 L0 原文
-    conn = get_conn()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, role, content FROM l0_messages WHERE status='active' ORDER BY id ASC"
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return {"status": "error", "message": "L0 无原文，无法重建画像"}
-    # 2. 模型配置（复用 narrative 配置的 LLM）
-    config = await get_model_config("narrative")
-    if not config.get("configured"):
-        return {"status": "error", "message": "Narrative 模型未配置（请先在模块模型配置中设置）"}
-    # 3. 分批提炼要点
-    batch_size = 250
-    points = []
-    for i in range(0, len(rows), batch_size):
-        chunk = rows[i:i + batch_size]
-        text = "\n".join(
-            f"[{'她' if r[1] == 'user' else '我'}] {str(r[2] or '')[:400]}" for r in chunk
-        )
-        prompt = (
-            "以下是一段我们之间的对话记录（节选）。请提炼关于「她」以及她与我关系的重要信息点："
-            "性格、称呼、偏好、习惯、重要事件（尽量带日期）、互动模式、她说过的话中的关键片段。"
-            "每条一行要点，保留独特细节，不要泛泛而谈：\n\n" + text
-        )
-        out = await call_llm(config, prompt, 6000)   # 推理模型的思考也算在 max_tokens 里
-        if out:
-            points.append(out)
-    all_points = "\n\n".join(points)
-    # 5. 汇总生成画像（三节）
-    final_prompt = (
-        "根据以下从我们完整对话中提炼的全部要点，写一份「画像」文档（Markdown），包含三节：\n"
-        "## 关于她      ## 关于我们      ## 关于我\n"
-        "要求：具体（保留称呼、日期、独特细节），温暖自然，只依据要点，不要编造没有提及的信息。\n\n"
-        + all_points
-    )
-    final = None
-    for _try in range(3):
-        final = await call_llm(config, final_prompt, 8000)
-        if final:
-            break
-        import asyncio as _aio
-        await _aio.sleep(12)
-    if not final or len(final.strip()) < 50:
-        return {"status": "error", "message": "画像生成失败（LLM 返回为空，请稍后重试或检查 OpenRouter 额度）"}
-    # 5. 按节拆分写文件（未匹配的兜底整段）
-    import re as _re
-    def _sec(content, title):
-        m = _re.search(rf"##\s*{title}[\s\S]*?(?=\n##\s|\Z)", content)
-        return m.group(0).strip() if m else ""
-    u = _sec(final, "关于她")
-    us = _sec(final, "关于我们")
-    ai = _sec(final, "关于我")
-    if not u and not us and not ai:
-        u, us, ai = final, "", ""
-    profile_dir = DATA_DIR / "profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%Y%m%d%H%M%S")
-    for name in ("about_user.md", "about_us.md", "about_ai.md"):
-        f = profile_dir / name
-        if f.exists():
-            f.rename(profile_dir / f"{name}.bak_{ts}")
-    (profile_dir / "about_user.md").write_text(u, encoding="utf-8")
-    (profile_dir / "about_us.md").write_text(us, encoding="utf-8")
-    (profile_dir / "about_ai.md").write_text(ai, encoding="utf-8")
-    return {
-        "status": "ok",
-        "batches": len(points),
-        "l0_total": len(rows),
-        "chars": len(final),
-        "sections": {"user": len(u), "us": len(us), "ai": len(ai)},
-    }
 
 @app.get("/l0/messages")
 async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offset: int = 0):
@@ -2259,14 +2149,6 @@ async def get_narrative_history(limit: int = 10):
         ]
     }
 
-class NarrativeGenerateRequest(BaseModel):
-    trigger_type: str = "manual"
-    force: bool = False
-    reason: Optional[str] = None
-
-# 单次演化最多消费的重要记忆条数。超出的留给下一轮（水位线只推进到
-# 本次实际消费的最大 id），避免一次生成 prompt 过长。
-NARRATIVE_BATCH_LIMIT = 60
 
 @app.post("/narrative/generate")
 async def generate_narrative(req: NarrativeGenerateRequest):
@@ -2282,152 +2164,6 @@ async def narrative_status():
     """生成任务状态（前端轮询用）"""
     return _job_status("narrative")
 
-async def _do_narrative(req: NarrativeGenerateRequest):
-    """生成/增量演化 Shared Narrative。
-
-    更新检查周期.md：existing narrative + new important memories = updated
-    narrative。已有叙事时只消费水位线之后的新增重要记忆，往后续写；
-    没有新增则跳过（force=true 强制用全部重要记忆重写）。
-    """
-    try:
-        # 1. 获取现有 narrative
-        conn = get_conn()
-        c = conn.cursor()
-        existing = c.execute(
-            "SELECT content FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
-        ).fetchone()
-        existing_narrative = existing[0] if existing else ""
-
-        # 2. 获取增量状态（上次处理到哪条 L1）
-        state = c.execute("SELECT last_processed_l1_id FROM narrative_state WHERE id=1").fetchone()
-        last_id = state[0] if state else 0
-
-        # 3. 如果是强制重生成，忽略增量，读取全部
-        if req.force or not existing_narrative:
-            # 全量：读取所有重要记忆（包含 event_msg_id 用于获取 L0 原文）
-            new_memories = c.execute(
-                f"SELECT id, content, quote, ts, event_msg_id FROM l1_memories WHERE {IMPORTANT_L1_WHERE} ORDER BY id ASC LIMIT ?",
-                (NARRATIVE_BATCH_LIMIT,)
-            ).fetchall()
-        else:
-            # 增量：只读上次之后新增的重要记忆（包含 event_msg_id）
-            new_memories = c.execute(
-                f"SELECT id, content, quote, ts, event_msg_id FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ? ORDER BY id ASC LIMIT ?",
-                (last_id, NARRATIVE_BATCH_LIMIT)
-            ).fetchall()
-
-        if not new_memories:
-            conn.close()
-            return {"status": "skipped", "message": f"新增记忆不足，跳过更新（上次已处理到 L1 id={last_id}）"}
-
-        # 如果新增不足 5 条且非强制，跳过（内容太少不值得更新）
-        if len(new_memories) < 5 and not req.force and existing_narrative:
-            conn.close()
-            return {"status": "skipped", "message": f"新增记忆不足（{len(new_memories)}条），跳过更新"}
-
-        # 4. 获取最新 L1 id，用于更新 state
-        latest_l1 = c.execute(
-            "SELECT MAX(id) FROM l1_memories WHERE status='active'"
-        ).fetchone()
-        latest_l1_id = latest_l1[0] if latest_l1 and latest_l1[0] else 0
-
-        consumed_ids = [m[0] for m in new_memories]
-        conn.close()
-
-        # 5. 获取模型配置
-        config = await get_model_config("narrative")
-        if not config["configured"]:
-            return {"status": "error", "message": "Narrative 模型未配置"}
-
-        # 6. 构建提示词并调用 LLM
-        prompt_parts = await build_narrative_prompt(existing_narrative, new_memories)
-        new_narrative = await call_llm_for_narrative(config, prompt_parts)
-
-        if not new_narrative:
-            return {"status": "error", "message": "生成失败"}
-
-        # 6.5. 忠实度校验（检查是否编造）。增量模式只校验新增句子（B14）
-        is_full = bool(req.force or not existing)
-        verification = await verify_narrative_faithfulness(
-            new_narrative, new_memories, "" if is_full else existing_narrative)
-
-        # B14：校验结果为 fail 时不发布——草稿存为 rejected（不替换线上版本、不推进水位线），下次自动检查重试。
-        # 同一批素材最多拦截 2 次，第 3 次照常发布并带上校验报告，避免无限重试消耗额度。强制重写不拦截。
-        if verification.get("status") == "fail" and not req.force:
-            conn = get_conn()
-            c = conn.cursor()
-            prev_rejects = c.execute(
-                "SELECT COUNT(*) FROM shared_narrative WHERE status='rejected' AND last_l1_id=?",
-                (consumed_ids[-1],)
-            ).fetchone()[0]
-            if prev_rejects < 2:
-                last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
-                c.execute(
-                    "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) "
-                    "VALUES (?, ?, ?, ?, 'rejected', ?)",
-                    (new_narrative, last_version + 1, req.trigger_type,
-                     json.dumps({"timestamp": timeutil.utc_now_str(), "reason": "忠实度校验未通过，未发布",
-                                 "l1_ids": consumed_ids, "verification": verification}, ensure_ascii=False),
-                     consumed_ids[-1])
-                )
-                conn.commit()
-                conn.close()
-                logger.warning(f"[NARRATIVE] 校验未通过（第 {prev_rejects + 1} 次），草稿已存为 rejected：{verification.get('issues')}")
-                return {"status": "rejected", "message": "叙事忠实度校验未通过，线上版本保持不变",
-                        "verification": verification}
-            conn.close()
-            verification["published_after_rejects"] = prev_rejects
-
-        # 7. 保存新版本 + 更新增量状态
-        conn = get_conn()
-        c = conn.cursor()
-        c.execute("UPDATE shared_narrative SET status='superseded' WHERE status='active'")
-        last_version = c.execute("SELECT MAX(version) FROM shared_narrative").fetchone()[0] or 0
-        new_version = last_version + 1
-
-        # 溯源信息：为何更新、基于哪些记忆（Dashboard Observatory 数据源）+ 忠实度校验结果
-        trigger_details = json.dumps({
-            "timestamp": timeutil.utc_now_str(),
-            "reason": req.reason or ("强制全量重写" if req.force else
-                                     "首次生成" if not existing else
-                                     f"新增 {len(consumed_ids)} 条重要记忆"),
-            "mode": "full" if (req.force or not existing) else "incremental",
-            "l1_ids": consumed_ids,
-            "l1_count": len(consumed_ids),
-            "verification": verification  # 忠实度校验结果
-        }, ensure_ascii=False)
-
-        c.execute(
-            "INSERT INTO shared_narrative (content, version, trigger_type, trigger_details, status, last_l1_id) VALUES (?, ?, ?, ?, 'active', ?)",
-            (new_narrative, new_version, req.trigger_type, trigger_details, consumed_ids[-1])
-        )
-
-        # 更新增量状态
-        # B12 修复：水位线必须是「本批最后一条已消费的 L1 id」，而不是全表 MAX(id)。
-        # 否则一次新增超过 NARRATIVE_BATCH_LIMIT 条重要记忆时，多出来的会被永久跳过；
-        # 同时与 shared_narrative.last_l1_id（自动检查用的水位线）保持一致。
-        # 剩余未消费的记忆会在下一次自动检查时继续处理。
-        c.execute(
-            "INSERT OR REPLACE INTO narrative_state (id, last_processed_l1_id, updated_at) VALUES (1, ?, ?)",
-            (consumed_ids[-1], timeutil.utc_now_str())
-        )
-        conn.commit()
-        new_id = c.lastrowid
-        conn.close()
-
-        return {
-            "status": "ok",
-            "id": new_id,
-            "version": new_version,
-            "mode": "full" if (req.force or not existing) else "incremental",
-            "consumed_l1": len(consumed_ids),
-            "content": new_narrative
-        }
-
-    except Exception as e:
-        logger.error(f"Narrative generation error: {e}")
-        import traceback; traceback.print_exc()
-        return {"status": "error", "message": str(e)}
 
 class NarrativeUpdateRequest(BaseModel):
     content: str
@@ -2701,76 +2437,12 @@ async def update_summary(summary_id: int, req: SummaryUpdateRequest):
     return {"status": "ok"}
 
 @app.post("/summary/generate")
-async def generate_summary():
-    """生成 Recent Summary"""
-    try:
-        # 获取配置
-        conn = get_conn()
-        c = conn.cursor()
-        config_row = c.execute("SELECT summary_max_turns, summary_max_tokens FROM narrative_config WHERE id=1").fetchone()
-        max_turns = config_row[0] if config_row else 100
-
-        # 获取最近的对话消息
-        messages = c.execute(
-            "SELECT role, content, ts FROM l0_messages WHERE status='active' ORDER BY ts DESC LIMIT ?",
-            (max_turns,)
-        ).fetchall()
-
-        # 水位线取「当前最大 l0 id」而非入选消息的最大 id：入选是按 ts 截断的，
-        # 若只记入选范围，那些 id 更大但 ts 更早的消息会永远算作增量，导致反复触发。
-        new_watermark = c.execute(
-            "SELECT COALESCE(MAX(id), 0) FROM l0_messages WHERE status='active'"
-        ).fetchone()[0]
-
-        conn.close()
-
-        if not messages:
-            return {"status": "error", "message": "没有足够的对话内容"}
-
-        # 获取 summary 模型配置
-        model_config = await get_model_config("summary")
-        if not model_config["configured"]:
-            return {"status": "error", "message": "Summary 模型未配置"}
-
-        # 构建摘要提示词
-        prompt = build_summary_prompt(messages)
-
-        # 调用 LLM 生成摘要
-        summary_content = await call_llm_for_summary(model_config, prompt)
-
-        if not summary_content:
-            return {"status": "error", "message": "生成失败"}
-
-        # 保存摘要
-        conn = get_conn()
-        c = conn.cursor()
-
-        # 标记旧摘要为 superseded
-        c.execute("UPDATE recent_summary SET status='superseded' WHERE status='active'")
-
-        period_start = messages[-1][2] if messages else None
-        period_end = messages[0][2] if messages else None
-
-        c.execute(
-            "INSERT INTO recent_summary (content, period_start, period_end, msg_count, status, last_l0_id) VALUES (?, ?, ?, ?, 'active', ?)",
-            (summary_content, period_start, period_end, len(messages), new_watermark)
-        )
-
-        conn.commit()
-        new_id = c.lastrowid
-        conn.close()
-
-        return {"status": "ok", "id": new_id, "content": summary_content}
-
-    except Exception as e:
-        print(f"Summary generation error: {e}")
-        return {"status": "error", "message": str(e)}
+async def generate_summary_api():
+    """生成 Recent Summary（手动生成，当场返回结果；逻辑在 app/pipeline/summary.py）"""
+    return await summary_pipeline.generate_summary()
 
 # ============ 自动检查与触发 ============
 
-# 「重要记忆」判定：is_core 由人工/后续流程标记，arousal 由提取时的提示词
-# 要求「情感浓度高的对话标注 arousal >= 0.6」，两者取并集。
-IMPORTANT_L1_WHERE = "status='active' AND (is_core=1 OR arousal >= 0.6)"
 
 def read_auto_config():
     """读取自动更新配置。每轮现读，改配置无需重启服务。"""
@@ -2784,33 +2456,6 @@ def read_auto_config():
         return None
     return {"enabled": row[0], "threshold_turns": row[1], "threshold_l1": row[2]}
 
-def get_summary_pending():
-    """返回（上次摘要水位线, 距上次摘要新增的消息数）。"""
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT last_l0_id FROM recent_summary WHERE status='active' ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    watermark = (row[0] or 0) if row else 0
-    new_count = c.execute(
-        "SELECT COUNT(*) FROM l0_messages WHERE status='active' AND id > ?", (watermark,)
-    ).fetchone()[0]
-    conn.close()
-    return watermark, new_count
-
-def get_narrative_pending():
-    """返回（上次叙事水位线, 距上次叙事新增的重要 L1 数）。"""
-    conn = get_conn()
-    c = conn.cursor()
-    row = c.execute(
-        "SELECT last_l1_id FROM shared_narrative WHERE status='active' ORDER BY version DESC LIMIT 1"
-    ).fetchone()
-    watermark = (row[0] or 0) if row else 0
-    new_count = c.execute(
-        f"SELECT COUNT(*) FROM l1_memories WHERE {IMPORTANT_L1_WHERE} AND id > ?", (watermark,)
-    ).fetchone()[0]
-    conn.close()
-    return watermark, new_count
 
 async def enqueue_auto_jobs():
     """定时检查（每 AUTO_CHECK_INTERVAL_MIN 分钟）：只往任务队列里投递，真正执行在 worker 里。
@@ -3159,37 +2804,6 @@ async def get_pipeline_status():
 
 # ============ Model Config API (扩展) ============
 
-async def get_model_config(purpose: str):
-    """获取指定模块的模型配置"""
-    conn = get_conn()
-    c = conn.cursor()
-
-    # 先查 model_configs 表
-    config = c.execute(
-        "SELECT provider_id, model_name FROM model_configs WHERE purpose=? AND enabled=1",
-        (purpose,)
-    ).fetchone()
-
-    if not config:
-        conn.close()
-        return {"configured": False}
-
-    # 查供应商信息
-    provider = c.execute(
-        "SELECT name, base_url, api_key_enc, api_format FROM providers WHERE id=?",
-        (config[0],)
-    ).fetchone()
-    conn.close()
-    if not provider:
-        return {"configured": False}
-    return {
-        "configured": True,
-        "provider_name": provider[0],
-        "base_url": provider[1],
-        "api_key": decrypt_secret(provider[2]),
-        "model": config[1],
-        "api_format": provider[3] or 'openai'
-    }
 
 @app.get("/config/models")
 async def get_all_model_configs():
@@ -3253,356 +2867,9 @@ async def update_model_config(purpose: str, req: ModelConfigUpdate):
 
     return {"status": "ok"}
 
-# ============ Helper Functions ============
+# ============ 生成逻辑 ============
+# 叙事 / 摘要 / 画像的生成和大模型调用已经搬到 app/（app/pipeline/、app/llm.py），上面的接口从那里导入。
 
-def get_l0_context_by_msg_id(sqlite_path, msg_id):
-    """根据 L0 消息 id 获取前后上下文（用于叙事生成）
-
-    msg_id: l0_messages.id（事件触发消息）
-    返回：前后各2条消息的文本（共5条）
-    """
-    try:
-        conn = db.connect(sqlite_path)
-        c = conn.cursor()
-
-        # 先查出这条消息的 msg_idx 和 conv_id
-        row = c.execute(
-            'SELECT msg_idx, conv_id FROM l0_messages WHERE id=? AND status=?',
-            (msg_id, 'active')
-        ).fetchone()
-
-        if not row:
-            conn.close()
-            return ""
-
-        msg_idx, conv_id = row
-
-        # 前后各2条（共5条上下文）
-        rows = c.execute(
-            'SELECT role, content FROM l0_messages WHERE conv_id=? AND status=? AND msg_idx BETWEEN ? AND ? ORDER BY msg_idx ASC',
-            (conv_id, 'active', max(0, msg_idx - 2), msg_idx + 2)
-        ).fetchall()
-
-        conn.close()
-
-        if not rows:
-            return ""
-
-        # 格式化为对话片段
-        parts = []
-        for role, content in rows:
-            prefix = "你" if role == "user" else "我"
-            parts.append(f"{prefix}: {content[:300]}")  # 限制长度避免过长
-
-        return "\n".join(parts)
-    except Exception as e:
-        print(f"获取 L0 上下文失败 (msg_id={msg_id}): {e}")
-        return ""
-
-
-async def build_narrative_prompt(existing_narrative: str, new_memories: list) -> dict:
-    """构建 Narrative 生成提示词，返回 {system, user} 两段。
-
-    new_memories: [(id, content, quote, ts), ...] 按提取顺序（≈时间顺序）。
-    已有叙事 → 增量演化（现有全文保留，只续写新增）；否则从头生成。
-    """
-    # 读取系统角色指令（Narrative生成提示词.md）
-    prompt_file = Path(__file__).parent.parent.parent / "Narrative生成提示词.md"
-    try:
-        with open(prompt_file, 'r', encoding='utf-8') as f:
-            system_prompt = f.read()
-    except:
-        system_prompt = """你是一段亲密关系的记忆守护者。维护一份连续的共同经历叙事。
-按时间顺序分章节书写，保留时间锚点、情感转折点、共同经历、关系演化，
-重要的原话用引号保留。温暖但不矫饰、连贯流动。"""
-
-    # 构建记忆列表（带时间戳和 L0 原文，构成时间线骨架）
-    memory_text = "### 核心记忆\n"
-    for m in new_memories:
-        ts_date = timeutil.local_date(m[3]) or "未知时间"   # 用户时区的日期（以前直接截 UTC，凌晨的事会算成前一天）
-        event_msg_id = m[4] if len(m) > 4 else None  # event_msg_id
-
-        memory_text += f"- [{ts_date}] {m[1]}\n"
-        if m[2]:
-            memory_text += f"  > 原话：{m[2]}\n"
-
-        # 附上 L0 原文片段（防止编造）
-        if event_msg_id:
-            l0_context = get_l0_context_by_msg_id(SQLITE_PATH, event_msg_id)
-            if l0_context:
-                memory_text += f"  > 原文片段：\n    {l0_context.replace(chr(10), chr(10) + '    ')}\n"
-            else:
-                memory_text += f"  > 原文片段：(不可考，请浅写)\n"
-        else:
-            memory_text += f"  > 原文片段：(不可考，请浅写)\n"
-
-    # 构建 user message（待处理内容）
-    user_message = f"""请基于以下材料，更新我们的共同经历叙事。
-
-## 现有叙事
-{existing_narrative or "（这是第一次生成，请基于记忆从头写起）"}
-
-## 新增记忆材料
-{memory_text}
-
-请生成更新后的完整叙事（按时间顺序，markdown 章节格式）："""
-
-    return {"system": system_prompt, "user": user_message}
-
-async def call_llm_for_narrative(config: dict, prompt_parts: dict) -> str:
-    """调用 LLM 生成 Narrative（system+user 两段式），支持多轮续写（输出上限截断时自动继续）"""
-    try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
-            is_claude = (config['model'].startswith("claude")
-                         or "anthropic/" in config['model']
-                         or "claude-" in config['model']
-                         or "claude." in config['model'])
-            if is_claude:
-                system_text = prompt_parts["system"]
-                user_text = prompt_parts["user"]
-                full = ""
-                for _round in range(6):
-                    response = await client.post(
-                        f"{config['base_url']}/messages",
-                        headers={
-                            "x-api-key": config['api_key'],
-                            "Authorization": f"Bearer {config['api_key']}",
-                            "anthropic-version": "2023-06-01",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": config['model'],
-                            "system": system_text,
-                            "messages": [{"role": "user", "content": user_text}],
-                            "max_tokens": 8000
-                        }
-                    )
-                    response.raise_for_status()
-                    data = response.json()
-                    content = data.get("content", [])
-                    part_text = "".join(b.get("text", "") for b in content if b.get("type") == "text")
-                    full += part_text
-                    if data.get("stop_reason") not in ("max_tokens", "long_context", "length"):
-                        break
-                    # 到输出上限 → 续写
-                    user_text = "请接着上一段继续写完整的叙事（不要重复，直接续写，保持语气与结构一致）："
-                return full
-            else:
-                # 其他模型走 /chat/completions（含多轮续写）
-                full2 = ""
-                user_text2 = prompt_parts["user"]
-                for _round in range(6):
-                    response = await client.post(
-                        f"{config['base_url']}/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {config['api_key']}",
-                            "Content-Type": "application/json"
-                        },
-                        json={
-                            "model": config['model'],
-                            "messages": [
-                                {"role": "system", "content": prompt_parts["system"]},
-                                {"role": "user", "content": user_text2}
-                            ],
-                            "max_tokens": 8000
-                        }
-                    )
-                    response.raise_for_status()
-                    data2 = response.json()
-                    msg = data2["choices"][0]["message"]
-                    full2 += msg.get("content") or ""
-                    fr = data2["choices"][0].get("finish_reason")
-                    if fr != "length" and str(fr) != "max_tokens":
-                        break
-                    user_text2 = "请接着上一段继续写完整的叙事（不要重复，直接续写，保持语气与结构一致）："
-                return full2
-    except Exception as e:
-        logger.error(f"LLM call error in narrative generation: {e}")
-        return None
-
-async def verify_narrative_faithfulness(narrative: str, memories: list, existing_narrative: str = "") -> dict:
-    """忠实度校验：检查叙事是否编造内容
-
-    Args:
-        narrative: 生成的叙事文本
-        memories: [(id, content, quote, ts, event_msg_id), ...]
-        existing_narrative: 增量模式下的旧叙事。B14 修复：传入后只校验"新增的句子"——
-            以前拿整篇叙事去对照本批新素材，旧叙事里的引号、篇幅都会被误判为编造，导致校验结果没法用来拦截
-
-    Returns:
-        {
-            "status": "pass" | "warning" | "fail",
-            "issues": [...],  # 发现的问题列表
-            "score": 0.0-1.0  # 忠实度分数
-        }
-    """
-    try:
-        # 收集所有记忆的原文和提炼
-        all_l0_texts = []
-        all_l1_summaries = []
-
-        for mem in memories:
-            mem_id, content, quote, ts, event_msg_id = mem
-            all_l1_summaries.append(content)
-            if quote:
-                all_l1_summaries.append(quote)
-
-            # 获取 L0 原文
-            if event_msg_id:
-                l0_context = get_l0_context_by_msg_id(SQLITE_PATH, event_msg_id)
-                if l0_context:
-                    all_l0_texts.append(l0_context)
-
-        # B14：增量模式只校验新增句子（旧叙事里已有的句子不再重复判定）
-        full_narrative = narrative
-        if existing_narrative:
-            def _sents(t):
-                return [x.strip() for x in re.split(r'[。！？!?\n]+', t or '') if x.strip()]
-            def _nk(t):
-                return re.sub(r'[\s，。！？、,.!?「」『』“”"]', '', t)
-            old_keys = {_nk(x) for x in _sents(existing_narrative)}
-            added = [x for x in _sents(narrative) if _nk(x) not in old_keys]
-            narrative = '。'.join(added)
-
-        # 简单启发式检查（避免调用 LLM，节省成本）
-        issues = []
-
-        # 1. 检查引号内的话是否在原文中（re 已在文件顶部导入；这里不能再局部 import，否则上面的嵌套函数取不到 re）
-        quoted_parts = re.findall(r'[「『""]([^」』""]+)[」』""]', narrative)
-
-        for quoted in quoted_parts:
-            # 去除标点和空格后检查
-            quoted_clean = re.sub(r'[，。！？、\s]', '', quoted)
-            found = False
-
-            for l0_text in all_l0_texts:
-                l0_clean = re.sub(r'[，。！？、\s]', '', l0_text)
-                if quoted_clean in l0_clean or len(quoted_clean) < 5:
-                    found = True
-                    break
-
-            if not found and len(quoted_clean) > 5:
-                issues.append(f"引号内容可能编造: {quoted[:50]}...")
-
-        # 2. 检查叙事长度 vs 素材量（过长可能有编造）
-        narrative_len = len(narrative)
-        material_len = sum(len(s) for s in all_l1_summaries) + sum(len(t) for t in all_l0_texts)
-
-        if material_len > 0 and narrative_len > material_len * 3:
-            issues.append(f"叙事长度 ({narrative_len}) 远超素材量 ({material_len})，可能有过度展开")
-
-        # 计算忠实度分数
-        score = 1.0
-        if len(issues) > 0:
-            score = max(0.0, 1.0 - len(issues) * 0.15)
-
-        status = "pass" if score >= 0.8 else ("warning" if score >= 0.6 else "fail")
-
-        return {
-            "status": status,
-            "issues": issues,
-            "score": round(score, 2),
-            "quoted_count": len(quoted_parts),
-            "material_length": material_len,
-            "narrative_length": narrative_len,          # 增量模式下是"新增部分"的长度
-            "full_length": len(full_narrative),
-            "checked": "added_only" if existing_narrative else "full"
-        }
-
-    except Exception as e:
-        logger.error(f"忠实度校验失败: {e}")
-        return {
-            "status": "error",
-            "issues": [f"校验失败: {str(e)}"],
-            "score": 0.0
-        }
-
-async def call_llm(config: dict, prompt: str, max_tokens: int) -> str:
-    """通用 LLM 调用。claude 系列走 Anthropic 原生 /messages（与网关约定一致，
-    部分中转的令牌不开放 OpenAI 兼容端点），其余走 /chat/completions。"""
-    try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
-            if config['model'].startswith("claude"):
-                response = await client.post(
-                    f"{config['base_url']}/messages",
-                    headers={
-                        "x-api-key": config['api_key'],
-                        "Authorization": f"Bearer {config['api_key']}",
-                        "anthropic-version": "2023-06-01",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": config['model'],
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": max_tokens
-                    }
-                )
-                response.raise_for_status()
-                return "".join(
-                    block.get("text", "") for block in response.json()["content"]
-                    if block.get("type") == "text"
-                )
-            response = await client.post(
-                f"{config['base_url']}/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {config['api_key']}",
-                    "Content-Type": "application/json"
-                },
-                json={
-                    "model": config['model'],
-                    "messages": [{"role": "user", "content": prompt}],
-                    "max_tokens": max_tokens
-                }
-            )
-            response.raise_for_status()
-            choice = response.json()["choices"][0]
-            content = choice["message"].get("content")
-            if not content and choice.get("finish_reason") == "length":
-                print(f"LLM call error: 输出被 max_tokens={max_tokens} 截断，正文为空（推理模型的思考也算在里面）")
-            return content
-    except httpx.HTTPStatusError as e:
-        print(f"LLM call error: {e} body={e.response.text[:300]}")
-        return None
-    except Exception as e:
-        print(f"LLM call error: {e}")
-        return None
-
-def build_summary_prompt(messages: list) -> str:
-    """构建 Summary 提示词"""
-    msg_text = ""
-    last_day = None
-    for msg in reversed(messages[-100:]):  # 最近100条，倒序
-        # 换天的地方插一行日期（用户时区）：下面要求「每天发生的事各自成句」，没有日期模型分不出哪天是哪天
-        day = timeutil.local_day_label(msg[2]) if len(msg) > 2 else ""
-        if day and day != last_day:
-            msg_text += f"—— {day} ——\n\n"
-            last_day = day
-        role = "用户" if msg[0] == "user" else "AI"
-        msg_text += f"{role}: {msg[1][:500]}\n\n"
-
-    prompt = f"""请为以下对话生成一份简洁的近期摘要（300字以内）：
-
-{msg_text}
-
-摘要要求：
-- 提取关键事件和话题
-- 保留时间顺序
-- 突出重要信息
-- 简洁明了
-- 【AI 第一人称】以 AI（[我]）的第一人称视角记录；对话中 [我] 是 AI，[你] 是对话的用户；提及用户不要用 "用户"，用 ta / 她 / 宝宝 / 小猫，保持事件与信息主语清晰
-- 【保留关系质感】保留对话的温度，但以事实为主，不要捏造没有的关系性或事实性内容
-- 【每天成句】每天发生的事各自成句；绝不许把两天的事并成一句话——那等于把其中一天弄丢了
-- 【只说一半就写一半】用户只说了 "那个前端"，就写 "那个前端"；绝不许自己编名字、编职位
-- 【亲密含蓄】亲密内容用含蓄的说法概括（如 "度过了亲密的一晚"）；事实和约定照记；注意内容语义去重；细节可适度提及，但不要逐字复述
-
-摘要："""
-
-    return prompt
-
-async def call_llm_for_summary(config: dict, prompt: str) -> str:
-    """调用 LLM 生成 Summary"""
-    # 推理模型（如 deepseek-v4-pro）的思考也算在 max_tokens 里：给 1000 时思考就用完了，正文是空的
-    return await call_llm(config, prompt, max_tokens=6000)
 
 # Dashboard 静态文件路由
 DASHBOARD_DIR = Path(__file__).parent.parent / "dashboard"
