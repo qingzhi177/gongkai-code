@@ -7,6 +7,11 @@ const app = express();
 app.use(express.json({ limit: '50mb' }));
 app.get('/config/current', (q, r) => r.json({ configured: true, name: 'fake', base_url: 'http://127.0.0.1:3997/v1', api_key: 'k', model: 'fake-model' }));
 app.get('/config/providers', (q, r) => r.json([]));
+app.get('/config/chat_targets', (q, r) => r.json({ targets: [
+  { id: 1, name: 'fake', base_url: 'http://127.0.0.1:3997/v1', api_key: 'k', models: ['fake-model'], active: true },
+  { id: 2, name: 'backup', base_url: 'http://127.0.0.1:3997/backup/v1', api_key: 'k2', models: ['vendor/fake.model:batch', 'vendor/fake.model'], active: false },
+  { id: 3, name: 'other', base_url: 'http://127.0.0.1:3997/other/v1', api_key: 'k3', models: ['some-other-model'], active: false }
+] }));
 app.get('/last_session', (q, r) => r.json({ last_ts: '2026-10-14 01:00:00' }));
 app.post('/search', (q, r) => {
   log('search', q.body);

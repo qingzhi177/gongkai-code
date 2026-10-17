@@ -322,20 +322,21 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
       upReqs(d)[0].messages[0].content.includes('[当前时间'), 'T14', { s, up: upReqs(d)[0].messages });
   }
 
-  console.log('T15 上游 4xx：把真实原因告诉前端、不重试、不存');
+  console.log('T15 上游 4xx：不重试同一个中转、换备用，都失败时列出各自原因、不存');
   {
     const m = mark();
     const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-e',
       pluvia: { v: '0.2', turn: { id: 'te1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [E]' }] })));
     await sleep(300);
     const d = since(m);
-    ok(s.text.includes('账户余额不足（测试）') && upReqs(d).length === 1 && saves(d).length === 0, 'T15 Pluvia', { s, n: upReqs(d).length });
+    ok(s.text.includes('所有中转都失败了') && s.text.includes('账户余额不足（测试）') && upReqs(d).length === 2 &&
+      upReqs(d)[1]._target === 'backup' && saves(d).length === 0, 'T15 Pluvia', { s, n: upReqs(d).length });
     const m2 = mark();
     const s2 = oaSummary(await sseCollect(await fetch(GW + '/v1/chat/completions', { method: 'POST',
       headers: { 'content-type': 'application/json', 'x-conversation-id': 'kel-e' },
       body: JSON.stringify({ model: 'fake-model', stream: true, messages: [{ role: 'user', content: '在吗 [E]' }] }) })));
     await sleep(300);
-    ok(s2.text.includes('账户余额不足（测试）') && upReqs(since(m2)).length === 1, 'T15 Kelivo 路径同样显示真实原因', s2);
+    ok(s2.text.includes('账户余额不足（测试）') && upReqs(since(m2)).length === 2, 'T15 Kelivo 路径同样显示真实原因', s2);
   }
 
   console.log('T16 pluvia.system = append / ignore（约定 8.1）');
@@ -407,6 +408,49 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     const d = since(m); const sv = saves(d);
     ok(sv.length === 1 && sv[0].b.messages[1].content === '放好了\n\n好听吗' && sv[0].b.messages[3].content === '你好呀', 'T19 L0 只存正文', sv.map(x => x.b));
     ok(JSON.stringify(upReqs(d)[0].messages[1]).includes('[工具记录 · 听歌 · 晴天]'), 'T19 发给模型的原文不变');
+  }
+
+  console.log('T20 自动切换中转：主中转 503 → 改用备用（模型名自动对应）');
+  {
+    const m = mark();
+    const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-fo',
+      pluvia: { v: '0.2', turn: { id: 'tfo1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [F]' }] })));
+    await sleep(300);
+    const d = since(m); const ups = upReqs(d);
+    const bk = ups.filter(x => x._target === 'backup');
+    ok(s.text === '备用中转回答' && s.finish === 'stop', 'T20 由备用中转回答', s);
+    ok(ups.filter(x => !x._target).length === 3 && bk.length === 1 && bk[0].model === 'vendor/fake.model' && !ups.some(x => x._target === 'other'),
+      'T20 主中转试 3 次后切到备用，模型名对应成 vendor/fake.model，没有同款模型的中转被跳过', ups.map(x => (x._target || 'primary') + ':' + x.model));
+    ok(saves(d).length === 1, 'T20 照常存 L0');
+  }
+
+  console.log('T21 参数错误（400）不切换中转');
+  {
+    const m = mark();
+    const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-fo2',
+      pluvia: { v: '0.2', turn: { id: 'tfo2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [G]' }] })));
+    await sleep(300);
+    const ups = upReqs(since(m));
+    ok(s.text.includes('参数错误（测试）') && ups.length === 1, 'T21 只请求一次主中转', { s, n: ups.length });
+  }
+
+  console.log('T22 Kelivo 非流式同样会切换');
+  {
+    const m = mark();
+    const j = await (await fetch(GW + '/v1/chat/completions', { method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-conversation-id': 'kel-fo' },
+      body: JSON.stringify({ model: 'fake-model', stream: false, messages: [{ role: 'user', content: '在吗 [F]' }] }) })).json();
+    await sleep(300);
+    const ups = upReqs(since(m));
+    ok(j.choices && j.choices[0].message.content === '备用中转回答' && ups.some(x => x._target === 'backup'), 'T22', { j, n: ups.length });
+  }
+
+  console.log('T23 /api 代理不放行会返回明文密钥的内部接口');
+  {
+    const r1 = await fetch(GW + '/api/config/current');
+    const r2 = await fetch(GW + '/api/config/chat_targets?x=1');
+    const r3 = await fetch(GW + '/api/config/providers');
+    ok(r1.status === 403 && r2.status === 403 && r3.status === 200, 'T23', [r1.status, r2.status, r3.status]);
   }
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);

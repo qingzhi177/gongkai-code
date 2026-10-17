@@ -2339,6 +2339,36 @@ async def get_current_config():
         "model": active[1],
     }
 
+@app.get("/config/chat_targets")
+async def get_chat_targets():
+    """给网关自动切换中转用：所有 Anthropic 格式的「聊天」供应商，当前启用的排第一（其余按 id）。
+
+    含解密后的 api_key，只给本机网关调用；网关的 /api 代理会拦掉这个路径，不对外。
+    """
+    conn = sqlite3.connect(str(SQLITE_PATH))
+    c = conn.cursor()
+    active = c.execute("SELECT provider_id, model FROM active_config WHERE id = 1").fetchone()
+    rows = c.execute(
+        "SELECT id, name, base_url, api_key_enc, models, api_format FROM providers "
+        "WHERE COALESCE(role, 'chat') = 'chat' ORDER BY id"
+    ).fetchall()
+    conn.close()
+    targets = []
+    for pid, name, base_url, key_enc, models, api_format in rows:
+        if (api_format or 'openai') != 'anthropic' or not base_url:
+            continue
+        key = decrypt_secret(key_enc) if key_enc else ""
+        if not key:
+            continue
+        try:
+            model_list = json.loads(models or '[]')
+        except Exception:
+            model_list = []
+        targets.append({"id": pid, "name": name, "base_url": base_url, "api_key": key,
+                        "models": model_list, "active": bool(active and active[0] == pid)})
+    targets.sort(key=lambda t: not t["active"])
+    return {"targets": targets}
+
 @app.get("/last_session")
 async def get_last_session(conv_id: Optional[str] = None):
     """时间感知：返回最近一条 active L0 消息的时间戳（UTC）。

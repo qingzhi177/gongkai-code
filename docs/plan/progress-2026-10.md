@@ -132,9 +132,23 @@
   - 这是中转站把请求转到了会替换提示词的通道，不是网关的问题。陪伴时 ta 如果突然「不认识你」、口吻变成编程助手，多半是这个原因。
   - 新增 `scripts/check_relay_system.py`，直接测中转站有没有把 system 送到，随时可以跑。
 
+### 多中转自动切换（failover）
+- Dashboard 里配了 4 个聊天中转：cam（当前启用）、openrouter、fuse、fusev1。以前网关只用当前启用的一个，cam 余额用完那次所有对话都直接失败了。
+- 现在当前中转出错时，网关按顺序改用下一个：
+  - 会切换的错误：网络错误、超时、5xx、429，以及 401/402/403/404（余额不足、密钥失效、地址不对）。
+  - 不切换的情况：参数错误（400），换了也没用；已经开始往前端输出之后才出错的，也不切。
+  - 模型名自动对应，比如 `claude-opus-4-6` ↔ `anthropic/claude-opus-4.6`；没有同款模型的中转直接跳过，不会悄悄换成别的模型。
+  - 全部失败时，正文里列出每个中转各自的失败原因。
+- 记忆服务新增 `GET /config/chat_targets`（只给本机网关用）。
+- `.env` 设置：`GATEWAY_FAILOVER=on|off`（默认 on）；`GATEWAY_FAILOVER_ORDER=fuse,openrouter`（只用列出的几个、按这个顺序；不设就按 Dashboard 里的顺序）。
+- 实测：临时网关里故意把 cam 的密钥改错，cam 返回 401，网关马上改用 openrouter 回答。
+- **顺带修了一个暴露**：以前有 Dashboard 密码的人，能通过 `/api/config/current` 拿到当前中转的明文密钥。现在 `/api` 代理拦掉了 `/config/current` 和 `/config/chat_targets`，网关自己在本机直接调用，不受影响。
+- `check_relay_system.py` 改成逐个测所有聊天中转（要用记忆服务的 Python 运行）。这次 4 个全部正常；fuse 在 Cloudflare 后面，会拦 Python 默认的 User-Agent（403 error code: 1010），脚本已经自带 UA，网关用的 axios 不受影响。
+
 ### 待办（下一步）
 - **Pluvia**：前端按约定第 9 节联调；有对不上的地方再看前端代码。
 - **中转站**：如果经常出现提示词被替换，联系中转站或换一个分组 / 渠道（先用 `check_relay_system.py` 确认）。
+- **自动切换**：要不要调备用顺序（openrouter 一般按官方价计费，可能比中转贵；fuse 和 fusev1 在同一个站，一个挂了另一个大概也会挂）。
 - **浮现门槛校准**：等真实数据多一些后，看 `gateway.log` 里的 `[SURFACE]` 行，重新校准 `SURFACE_MIN_SIM`（当前 0.55）。
 - **Phase 1 剩余**：统一 UTC 时间、任务表 + worker（替代 cron）、迁移框架。
 - **Phase 2**：召回编排（`/compose/*`、投递账本、Reranker、分层注入）。

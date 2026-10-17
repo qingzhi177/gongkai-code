@@ -5,7 +5,7 @@ const LOG = (process.env.GWTEST_DIR || '/tmp/gwtest') + '/upstream.jsonl';
 
 function sse(res, ev, data) { res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); }
 function scenario(body) {
-  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E)\]/g);
+  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G)\]/g);
   return m ? m[m.length - 1][1] : 'A';
 }
 function resultIds(msgs) {
@@ -20,8 +20,20 @@ http.createServer((req, res) => {
   req.on('end', async () => {
     if (req.method === 'GET') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ data: [{ id: 'fake-model' }] })); }
     const body = JSON.parse(buf || '{}');
-    fs.appendFileSync(LOG, JSON.stringify(body) + '\n');
+    // /backup、/other 开头的地址模拟备用中转（自动切换测试用）
+    const target = req.url.startsWith('/backup') ? 'backup' : req.url.startsWith('/other') ? 'other' : 'primary';
+    fs.appendFileSync(LOG, JSON.stringify(target === 'primary' ? body : { ...body, _target: target }) + '\n');
     const scen = scenario(body);
+    if (scen === 'F' && target === 'primary') {   // 模拟主中转暂时不可用
+      res.statusCode = 503;
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ error: { message: '上游暂时不可用（测试）' } }));
+    }
+    if (scen === 'G') {   // 模拟参数错误（换中转也没用）
+      res.statusCode = 400;
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ error: { message: '参数错误（测试）' } }));
+    }
     if (scen === 'E') {   // 模拟中转站余额不足
       res.statusCode = 403;
       res.setHeader('content-type', 'application/json');
@@ -45,7 +57,7 @@ http.createServer((req, res) => {
     } else if (scen === 'S') {
       blocks = [{ type: 'text', text: '慢慢说', slow: true }];
     } else {
-      blocks = [{ type: 'text', text: ids.size ? '好啦，弄好了' : '你好呀' }];
+      blocks = [{ type: 'text', text: scen === 'F' ? '备用中转回答' : (ids.size ? '好啦，弄好了' : '你好呀') }];
     }
     const usage = { input_tokens: 100, output_tokens: 0, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 };
     if (!body.stream) {

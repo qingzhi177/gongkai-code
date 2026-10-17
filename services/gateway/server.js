@@ -662,11 +662,13 @@ async function loadActiveConfig() {
       };
       console.log(`[CONFIG] 已加载配置：${activeConfig.name} / ${activeConfig.model}`);
       await refreshModelsCache(true);
+      await loadChatTargets();
       return 'active';
     } else {
       activeConfig = null;
       console.log('[CONFIG] 记忆服务未配置供应商，回退到 .env');
       await refreshModelsCache(true);
+      await loadChatTargets();
       return 'unconfigured';
     }
   } catch (e) {
@@ -1608,43 +1610,9 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   // 功能2补丁：透传 output_config（effort），让前端的思考预算调节真正生效。
   if (outputConfig) body.output_config = outputConfig;
   logUpstreamBody(body);
-  // 建连重试：此时还未向前端发任何数据，重试安全。抵御中转站冷启动/偶发失败（空回主因）。
-  let upstream = null;
-  let lastErr = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      upstream = await axios.post(apiUrl, body, {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'anthropic-version': '2023-06-01'
-        },
-        timeout: 120000,
-        responseType: 'stream',
-        signal
-      });
-      break;
-    } catch (e) {
-      lastErr = e;
-      if (signal && signal.aborted) throw e;   // 前端已断开，不再重试
-      console.error(`[STREAM] 建连失败(第${attempt}次):`, e.response?.status || e.message);
-      // 只重试可能是偶发的错误（网络、5xx、429、408）；余额不足 / 鉴权 / 参数错误这类 4xx 重试也没用
-      const st = e.response?.status;
-      if (st && st < 500 && st !== 429 && st !== 408) break;
-      if (attempt < 3) await new Promise(r => setTimeout(r, 500 * attempt));
-    }
-  }
-  if (!upstream) {
-    // 流式请求出错时，上游的错误说明（如「账户余额不足」）在响应流里，读出来放进错误信息，前端才能看到真实原因
-    const raw = await readErrorBody(lastErr);
-    if (raw) {
-      const msg = upstreamErrorMessage(raw).slice(0, 300);
-      console.error('[STREAM] 上游错误说明:', msg);
-      lastErr.message = msg;
-      if (lastErr.response) lastErr.response.data = { error: { message: msg } };
-    }
-    throw lastErr;
-  }
+  // 建连：此时还没往前端发任何数据，重试、换中转都安全（见 postWithFailover）。
+  // 抵御中转站冷启动 / 偶发失败（空回主因），以及余额不足、密钥失效这类整个中转不可用的情况。
+  const upstream = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: true, signal })).resp;
 
   return await new Promise((resolve, reject) => {
     const blocks = {};       // 上游 index -> block
@@ -1784,6 +1752,110 @@ function upstreamErrorMessage(raw) {
   }
 }
 
+// ============ 多中转自动切换（failover） ============
+// 当前启用的中转出错时（网络错误、超时、5xx、429、401/402/403/404 —— 比如余额不足、密钥失效），
+// 自动改用 Dashboard 里配置的其它「聊天」中转（Anthropic 格式）。
+//  - 400 之类的请求错误换中转也没用，不切换；
+//  - 只在还没往前端输出任何内容时切换（建连阶段），输出到一半出错不切换；
+//  - 模型名按「去掉厂商前缀、点换成横线」对应（claude-opus-4-6 ↔ anthropic/claude-opus-4.6），
+//    没有同款模型的中转直接跳过，不会悄悄换成别的模型。
+// .env：GATEWAY_FAILOVER=on|off（默认 on）；GATEWAY_FAILOVER_ORDER=fuse,openrouter（只用这几个、按这个顺序；不设则按 Dashboard 里的顺序）。
+const FAILOVER_MODE = String(process.env.GATEWAY_FAILOVER || 'on').trim().toLowerCase();
+const FAILOVER_ORDER = String(process.env.GATEWAY_FAILOVER_ORDER || '').split(',').map(s => s.trim()).filter(Boolean);
+let chatTargets = [];   // [{ name, apiUrl, apiKey, models, active }]，来自记忆服务 /config/chat_targets
+
+async function loadChatTargets() {
+  try {
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/config/chat_targets`, { timeout: 5000 });
+    const list = (r.data && r.data.targets) || [];
+    chatTargets = list.map(t => {
+      const base = String(t.base_url || '').replace(/\/$/, '');
+      return { name: t.name, apiUrl: base.endsWith('/messages') ? base : base + '/messages', apiKey: t.api_key,
+        models: Array.isArray(t.models) ? t.models : [], active: !!t.active };
+    }).filter(t => t.apiKey && t.apiUrl);
+    console.log('[FAILOVER] 可用中转：' + (chatTargets.map(t => t.name + (t.active ? '（当前）' : '')).join('、') || '无') +
+      ' | 自动切换：' + FAILOVER_MODE + (FAILOVER_ORDER.length ? ' | 备用顺序：' + FAILOVER_ORDER.join('、') : ''));
+  } catch (e) {
+    console.error('[FAILOVER] 读取中转列表失败（不影响主中转）：', e.message);
+  }
+}
+
+function normalizeModelName(s) {
+  return String(s || '').toLowerCase().replace(/^[^/]+\//, '').replace(/:.*$/, '').replace(/\./g, '-');
+}
+// 这次请求依次尝试的上游：先主中转，再其它中转（各自换成对应的模型名）
+function upstreamCandidates(apiUrl, apiKey, requestModel) {
+  const primaryName = (activeConfig && apiKey === activeConfig.api_key) ? activeConfig.name : '主上游';
+  const list = [{ name: primaryName, apiUrl, apiKey, model: requestModel }];
+  if (FAILOVER_MODE === 'off') return list;
+  let others = chatTargets.filter(t => !(t.apiUrl === apiUrl && t.apiKey === apiKey));
+  if (FAILOVER_ORDER.length) {
+    others = others.filter(t => FAILOVER_ORDER.includes(t.name))
+      .sort((a, b) => FAILOVER_ORDER.indexOf(a.name) - FAILOVER_ORDER.indexOf(b.name));
+  }
+  const want = normalizeModelName(requestModel);
+  for (const t of others) {
+    let model = t.models.includes(requestModel) ? requestModel : null;
+    if (!model) {
+      const same = t.models.filter(m => normalizeModelName(m) === want);
+      model = same.find(m => !m.includes(':')) || same[0] || null;
+    }
+    if (model) list.push({ name: t.name, apiUrl: t.apiUrl, apiKey: t.apiKey, model });
+  }
+  return list;
+}
+function isFailoverError(e) {
+  if (!e || e.code === 'ERR_CANCELED' || e.name === 'CanceledError') return false;
+  const st = e.response && e.response.status;
+  if (!st) return true;   // 网络错误、超时
+  return st >= 500 || [401, 402, 403, 404, 408, 429].includes(st);
+}
+// 发一次上游请求：主中转对偶发错误最多试 3 次；不行就按顺序换中转（每个试 1 次）。
+// 成功返回 { resp, target }；全部失败时抛出最后一个错误，message 里列出每个中转的失败原因。
+async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, signal }) {
+  const cands = upstreamCandidates(apiUrl, apiKey, requestModel);
+  const failures = [];
+  let lastErr = null;
+  for (let ci = 0; ci < cands.length; ci++) {
+    const c = cands[ci];
+    const attempts = ci === 0 ? 3 : 1;
+    for (let attempt = 1; attempt <= attempts; attempt++) {
+      try {
+        const resp = await axios.post(c.apiUrl, { ...body, model: c.model }, {
+          headers: { 'Authorization': `Bearer ${c.apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+          timeout: 120000,
+          signal,
+          ...(stream ? { responseType: 'stream' } : {})
+        });
+        if (ci > 0) console.log(`[FAILOVER] 这次由 ${c.name} 回答（${c.model}）`);
+        return { resp, target: c };
+      } catch (e) {
+        lastErr = e;
+        if (signal && signal.aborted) throw e;   // 前端已断开
+        const st = e.response && e.response.status;
+        console.error(`[UPSTREAM] ${c.name} 请求失败（第${attempt}次）：`, st || e.message);
+        if (st && st < 500 && st !== 429 && st !== 408) break;   // 4xx 不重试同一个中转
+        if (attempt < attempts) await new Promise(r => setTimeout(r, 500 * attempt));
+      }
+    }
+    // 流式请求的错误说明在响应流里，读出来换成可读的文字
+    const raw = await readErrorBody(lastErr);
+    const msg = (raw ? upstreamErrorMessage(raw) : (lastErr.response ? `HTTP ${lastErr.response.status}` : lastErr.message)).slice(0, 200);
+    console.error(`[UPSTREAM] ${c.name} 错误说明：`, msg);
+    failures.push(`${c.name}：${msg}`);
+    lastErr.message = msg;
+    if (lastErr.response) lastErr.response.data = { error: { message: msg } };
+    if (!isFailoverError(lastErr)) break;
+    if (ci + 1 < cands.length) console.warn(`[FAILOVER] ${c.name} 不可用，改用 ${cands[ci + 1].name}`);
+  }
+  if (failures.length > 1) {
+    const msg = '所有中转都失败了 —— ' + failures.join('；');
+    lastErr.message = msg;
+    if (lastErr.response) lastErr.response.data = { error: { message: msg } };
+  }
+  throw lastErr;
+}
+
 // 非流式跑一次上游（Pluvia 非流式用），返回结构与 streamRound 一致
 async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal }) {
   const body = { model: requestModel, system, messages, max_tokens: maxTokens || 4096 };
@@ -1796,11 +1868,7 @@ async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, to
   }
   if (outputConfig) body.output_config = outputConfig;
   logUpstreamBody(body);
-  const r = await axios.post(apiUrl, body, {
-    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
-    timeout: 120000,
-    signal
-  });
+  const r = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: false, signal })).resp;
   const d = r.data || {};
   return { id: d.id, content: Array.isArray(d.content) ? d.content : [], stop_reason: d.stop_reason, usage: d.usage };
 }
@@ -2451,14 +2519,7 @@ if (thinkAcc.length && result) {
       return b;
     };
 
-    const apiResponse = await axios.post(apiUrl, buildBody(), {
-      headers: {
-        'Authorization': `Bearer ${apiKey}`,
-        'Content-Type': 'application/json',
-        'anthropic-version': '2023-06-01'
-      },
-      timeout: 120000
-    });
+    const apiResponse = (await postWithFailover({ apiUrl, apiKey, requestModel, body: buildBody() })).resp;
 
     let result = apiResponse.data;
     console.log('[DEBUG] API返回:', JSON.stringify(result).substring(0, 500));
@@ -2498,14 +2559,7 @@ if (thinkAcc.length && result) {
       nonSystemMessages.push({ role: 'assistant', content: result.content });
       nonSystemMessages.push({ role: 'user', content: toolResults });
 
-      const followUp = await axios.post(apiUrl, buildBody(), {
-        headers: {
-          'Authorization': `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-          'anthropic-version': '2023-06-01'
-        },
-        timeout: 120000
-      });
+      const followUp = (await postWithFailover({ apiUrl, apiKey, requestModel, body: buildBody() })).resp;
 
       result = followUp.data;
       addUsage(result.usage);
@@ -2780,6 +2834,10 @@ app.post('/reload-config', async (req, res) => {
 app.all('/api/*splat', async (req, res) => {
   // originalUrl 已含 query，用 pathname 拼接避免与 params:req.query 双重附加 query
   const path = req.originalUrl.replace(/^\/api/, '');
+  // 会返回明文 API Key 的内部接口只给网关在本机直接调用，不经过 /api 对外（Dashboard 也用不到它们）
+  if (/^\/config\/(current|chat_targets)(\/|\?|$)/.test(path)) {
+    return res.status(403).json({ error: { message: '内部接口，不对外开放', type: 'forbidden' } });
+  }
   const target = MEMORY_SERVICE_URL + path;
   try {
     const upstream = await axios({
