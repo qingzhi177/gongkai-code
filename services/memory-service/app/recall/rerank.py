@@ -4,6 +4,7 @@
 - 模型：.env 里的 RERANK_MODEL，默认 qwen3.7-text-rerank（也可以用 qwen3-rerank、gte-rerank-v2）；
 - 超过 RERANK_TIMEOUT 秒（默认 1.5）或者出错时返回 None，由调用方退回到向量相似度门槛；
 - RERANK_ENABLED=0 可以关掉。
+以上是默认值；Dashboard「召回对比」页的参数里可以改（模型、超时、开关），召回编排每一轮传进来。
 分数只在同一次请求里互相比较才有意义；门槛（0.75 / 0.5）是起点，要用黄金集校准。
 """
 import os
@@ -19,10 +20,13 @@ RERANK_TIMEOUT = float(os.getenv("RERANK_TIMEOUT", 1.5))
 RERANK_ENABLED = os.getenv("RERANK_ENABLED", "1") != "0"
 
 
-async def rerank(query, docs, timeout=None):
-    """返回 (scores, info)。scores 和 docs 一一对应（0~1）；失败时 scores 为 None。"""
-    info = {"model": RERANK_MODEL, "ok": False, "ms": 0}
-    if not RERANK_ENABLED or not ALIBABA_API_KEY:
+async def rerank(query, docs, timeout=None, model=None, enabled=None):
+    """返回 (scores, info)。scores 和 docs 一一对应（0~1）；失败时 scores 为 None。
+    model / timeout / enabled 不传就用 .env 里的默认值。"""
+    model = model or RERANK_MODEL
+    enabled = RERANK_ENABLED if enabled is None else bool(enabled)
+    info = {"model": model, "ok": False, "ms": 0}
+    if not enabled or not ALIBABA_API_KEY:
         info["error"] = "未启用"
         return None, info
     if not docs:
@@ -31,7 +35,7 @@ async def rerank(query, docs, timeout=None):
     t0 = time.monotonic()
     try:
         r = await _client().post(RERANK_URL, headers={"Authorization": f"Bearer {ALIBABA_API_KEY}"},
-                                 json={"model": RERANK_MODEL, "input": {"query": query, "documents": docs},
+                                 json={"model": model, "input": {"query": query, "documents": docs},
                                        "parameters": {"return_documents": False}},
                                  timeout=timeout or RERANK_TIMEOUT)
         info["ms"] = int((time.monotonic() - t0) * 1000)

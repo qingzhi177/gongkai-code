@@ -1,11 +1,12 @@
 // 假的 Anthropic Messages 上游：按消息里的场景标记 [A]/[B]/[C]/[D]/[S] 返回固定内容，并把收到的请求体记到 upstream.jsonl
+// /oa 开头的地址模拟 OpenAI 格式（/chat/completions）的供应商，/aux 开头的模拟辅助请求专用的 Anthropic 供应商
 const http = require('http');
 const fs = require('fs');
 const LOG = (process.env.GWTEST_DIR || '/tmp/gwtest') + '/upstream.jsonl';
 
 function sse(res, ev, data) { res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); }
 function scenario(body) {
-  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G)\]/g);
+  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N)\]/g);
   return m ? m[m.length - 1][1] : 'A';
 }
 function resultIds(msgs) {
@@ -21,9 +22,39 @@ http.createServer((req, res) => {
     if (req.method === 'GET') { res.setHeader('content-type', 'application/json'); return res.end(JSON.stringify({ data: [{ id: 'fake-model' }] })); }
     const body = JSON.parse(buf || '{}');
     // /backup、/other 开头的地址模拟备用中转（自动切换测试用）
-    const target = req.url.startsWith('/backup') ? 'backup' : req.url.startsWith('/other') ? 'other' : 'primary';
-    fs.appendFileSync(LOG, JSON.stringify(target === 'primary' ? body : { ...body, _target: target }) + '\n');
+    const target = req.url.startsWith('/backup') ? 'backup' : req.url.startsWith('/other') ? 'other'
+      : req.url.startsWith('/oa') ? 'oa' : req.url.startsWith('/aux') ? 'aux' : 'primary';
+    fs.appendFileSync(LOG, JSON.stringify(target === 'primary' ? body : { ...body, _target: target, _auth: req.headers.authorization }) + '\n');
     const scen = scenario(body);
+    if (scen === 'H' && (target === 'oa' || target === 'aux')) {   // 模拟辅助请求指定的供应商出错（模型名填错了之类）
+      res.statusCode = 400;
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ error: { message: '模型不存在（测试）' } }));
+    }
+    if (scen === 'N' && target === 'primary') {   // 模拟中转「没有可用账号」
+      res.statusCode = 503;
+      res.setHeader('content-type', 'application/json');
+      return res.end(JSON.stringify({ error: { message: 'No available accounts: no available accounts' } }));
+    }
+    if (target === 'oa') {   // OpenAI 格式：先来一段推理（不该转发），再分两段给正文
+      const usage = { prompt_tokens: 30, completion_tokens: 7, total_tokens: 37 };
+      if (!body.stream) {
+        res.setHeader('content-type', 'application/json');
+        return res.end(JSON.stringify({ id: 'chatcmpl-oa', object: 'chat.completion', model: body.model,
+          choices: [{ index: 0, message: { role: 'assistant', content: '译文：你好', reasoning_content: '想一想' }, finish_reason: 'stop' }], usage }));
+      }
+      res.setHeader('content-type', 'text/event-stream');
+      const chunk = (delta, finish) => res.write('data: ' + JSON.stringify({ id: 'chatcmpl-oa', object: 'chat.completion.chunk', model: body.model,
+        choices: [{ index: 0, delta, finish_reason: finish || null }] }) + '\n\n');
+      chunk({ role: 'assistant', content: '' });
+      chunk({ reasoning_content: '想一想' });
+      chunk({ content: '译文：' });
+      chunk({ content: '你好' });
+      chunk({}, 'stop');
+      res.write('data: ' + JSON.stringify({ id: 'chatcmpl-oa', object: 'chat.completion.chunk', model: body.model, choices: [], usage }) + '\n\n');
+      res.write('data: [DONE]\n\n');
+      return res.end();
+    }
     if (scen === 'F' && target === 'primary') {   // 模拟主中转暂时不可用
       res.statusCode = 503;
       res.setHeader('content-type', 'application/json');
@@ -57,7 +88,7 @@ http.createServer((req, res) => {
     } else if (scen === 'S') {
       blocks = [{ type: 'text', text: '慢慢说', slow: true }];
     } else {
-      blocks = [{ type: 'text', text: scen === 'F' ? '备用中转回答' : (ids.size ? '好啦，弄好了' : '你好呀') }];
+      blocks = [{ type: 'text', text: (scen === 'F' || scen === 'N') ? '备用中转回答' : target === 'aux' ? '辅助模型回答' : (ids.size ? '好啦，弄好了' : '你好呀') }];
     }
     const usage = { input_tokens: 100, output_tokens: 0, cache_read_input_tokens: 10, cache_creation_input_tokens: 5 };
     if (!body.stream) {

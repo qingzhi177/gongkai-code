@@ -343,7 +343,16 @@
                 <div class="stat-card"><div class="number" id="rc-rerank">-</div><div class="label">精排成功</div></div>
                 <div class="stat-card"><div class="number" id="rc-p50">-</div><div class="label">耗时 p50 / p90（毫秒）</div></div>
             </div>
-            <div style="margin:10px 0;"><button class="btn btn-small" onclick="loadRecall()">刷新</button><span id="rc-intents" style="font-size:12px;color:#666;margin-left:10px;"></span></div>
+            <div style="margin:10px 0;"><button class="btn btn-small" onclick="loadRecall()">刷新</button>
+                <button class="btn btn-small" style="margin-left:6px;" onclick="toggleRecallSettings()">调参数</button><span id="rc-intents" style="font-size:12px;color:#666;margin-left:10px;"></span></div>
+            <div id="rc-settings" style="display:none;margin:10px 0 16px;padding:14px;background:#f8f8f8;border-radius:8px;font-size:13px;">
+                <div style="display:flex;justify-content:space-between;"><b>召回参数</b><a href="javascript:void(0)" onclick="toggleRecallSettings()">收起</a></div>
+                <p style="color:#666;line-height:1.7;margin:6px 0 10px;">这些参数只影响新的召回逻辑，保存后立即生效，不用重启。现在还是影子模式（只记录、不注入），改完之后聊几句，在下面的对比记录里看效果；以后切到正式模式，才会真的影响聊天时想起什么。</p>
+                <div id="rc-settings-form">加载中…</div>
+                <div style="margin-top:12px;"><button class="btn btn-small" onclick="saveRecallSettings()">保存</button>
+                    <button class="btn btn-small" style="background:#999;margin-left:6px;" onclick="resetRecallSettings()">全部恢复默认</button>
+                    <span id="rc-settings-status" style="margin-left:8px;font-size:12px;"></span></div>
+            </div>
             <div style="overflow-x:auto;">
             <table class="extraction-table">
                 <thead><tr><th>时间</th><th>这一轮的话</th><th>意图</th><th>旧逻辑</th><th>新逻辑</th><th>耗时</th></tr></thead>
@@ -1397,6 +1406,85 @@ function rebuildProfile() {
             });
         }
 
+        // ---- 召回参数（门槛、概率、冷却、精排），存在记忆服务的 app_settings 里 ----
+        var rcSettings = [];
+        function toggleRecallSettings() {
+            var el = document.getElementById('rc-settings');
+            if (el.style.display === 'none') { el.style.display = 'block'; loadRecallSettings(); }
+            else el.style.display = 'none';
+        }
+        function rcFmt(v) { return typeof v === 'boolean' ? (v ? '开' : '关') : String(v); }
+        function loadRecallSettings() {
+            fetch(API + '/recall/settings').then(function(r) { return r.json(); }).then(renderRecallSettings)
+                .catch(function(e) { document.getElementById('rc-settings-form').textContent = '加载失败：' + e; });
+        }
+        function renderRecallSettings(d) {
+            rcSettings = d.items || [];
+            var html = '', section = null;
+            rcSettings.forEach(function(it) {
+                if (it.section !== section) {
+                    section = it.section;
+                    html += '<div style="margin:12px 0 4px;font-weight:bold;color:#555;">' + escapeHtml(section) + '</div>';
+                }
+                var id = 'rcs-' + it.key, input;
+                if (it.type === 'bool') {
+                    input = '<input type="checkbox" id="' + id + '"' + (it.value ? ' checked' : '') + '>';
+                } else if (it.type === 'str') {
+                    input = '<input type="text" id="' + id + '" value="' + escapeHtml(it.value) + '" style="width:200px;">';
+                } else {
+                    input = '<input type="number" id="' + id + '" value="' + it.value + '" step="' + it.step + '" min="' + it.min + '" max="' + it.max + '" style="width:90px;">';
+                }
+                html += '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:6px 0;border-bottom:1px solid #eee;">'
+                    + '<label for="' + id + '" style="min-width:130px;' + (it.overridden ? 'color:#5b6abf;font-weight:bold;' : '') + '">' + escapeHtml(it.label) + '</label>'
+                    + input
+                    + '<span style="color:#999;font-size:12px;">默认 ' + escapeHtml(rcFmt(it.default)) + '</span>'
+                    + (it.overridden ? '<a href="javascript:void(0)" style="font-size:12px;" onclick="resetRecallSettings(\'' + it.key + '\')">恢复默认</a>' : '')
+                    + '<div style="flex-basis:100%;color:#888;font-size:12px;line-height:1.6;">' + escapeHtml(it.help) + '</div></div>';
+            });
+            document.getElementById('rc-settings-form').innerHTML = html;
+        }
+        function rcStatus(text, color) {
+            var st = document.getElementById('rc-settings-status');
+            st.textContent = text;
+            st.style.color = color || '#666';
+        }
+        function rcHandle(r) {
+            return r.json().then(function(d) {
+                if (!r.ok || d.status === 'error') throw new Error(d.message || ('HTTP ' + r.status));
+                return d;
+            });
+        }
+        function saveRecallSettings() {
+            var values = {}, n = 0;
+            rcSettings.forEach(function(it) {
+                var el = document.getElementById('rcs-' + it.key);
+                if (!el) return;
+                var v = it.type === 'bool' ? el.checked : el.value;
+                if (it.type === 'float' || it.type === 'int') {
+                    if (String(v).trim() === '') return;
+                    if (Number(v) === Number(it.value)) return;
+                } else if (it.type === 'str') {
+                    if (String(v).trim() === String(it.value)) return;
+                } else if (v === it.value) return;
+                values[it.key] = v;
+                n++;
+            });
+            if (!n) { rcStatus('没有改动'); return; }
+            rcStatus('保存中…');
+            fetch(API + '/recall/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(rcHandle)
+                .then(function(d) { renderRecallSettings(d); rcStatus('已保存 ' + n + ' 项，立即生效', '#28a745'); })
+                .catch(function(e) { rcStatus('没有保存：' + e.message, '#dc3545'); });
+        }
+        function resetRecallSettings(key) {
+            if (!key && !confirm('把召回参数全部恢复成默认值吗？')) return;
+            rcStatus('恢复中…');
+            fetch(API + '/recall/settings/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ keys: key ? [key] : [] }) })
+                .then(rcHandle)
+                .then(function(d) { renderRecallSettings(d); rcStatus(key ? '这一项已恢复默认' : '已全部恢复默认', '#28a745'); })
+                .catch(function(e) { rcStatus('没有恢复：' + e.message, '#dc3545'); });
+        }
+
         function showRecallTrace(id) {
             fetch(API + '/recall/traces/' + id).then(function(r) { return r.json(); }).then(function(t) {
                 var sn = t.snippets || {}, dec = t.decision || {}, rr = t.rerank || {}, ch = t.channels || {}, lg = t.legacy || {};
@@ -1406,6 +1494,8 @@ function rebuildProfile() {
                 html += '<div>检索用的文本：' + escapeHtml(t.query || '') + '</div>';
                 html += '<div>意图：' + (RC_INTENT[(t.intent || {}).type] || '') + ((t.intent || {}).matched ? '（命中「' + escapeHtml(t.intent.matched) + '」）' : '') + '</div>';
                 html += '<div>精排：' + (rr.skipped ? escapeHtml(rr.skipped) : (rr.ok ? (escapeHtml(rr.model || '') + '，' + rr.ms + 'ms') : ('失败：' + escapeHtml(rr.error || '') + '，改用向量相似度'))) + '</div>';
+                if (dec.params) html += '<div>这一轮用的参数：强门槛 ' + dec.params.t_high + '，中门槛 ' + dec.params.t_low + '，中层概率 ' + dec.params.medium_prob
+                    + '，向量兜底 ' + dec.params.min_sim + '，每轮最多 ' + dec.params.max_picks + ' 条</div>';
                 html += '<div style="margin-top:8px;"><b>候选（按精排分）</b></div><table class="extraction-table"><thead><tr><th>记忆</th><th>精排</th><th>向量</th></tr></thead><tbody>';
                 (dec.candidates || []).forEach(function(c) {
                     html += '<tr><td>' + name(c.id) + '</td><td>' + (c.rerank == null ? '-' : Number(c.rerank).toFixed(3)) + '</td><td>' + (c.vec_sim == null ? '-' : Number(c.vec_sim).toFixed(3)) + '</td></tr>';
@@ -1927,7 +2017,9 @@ function rebuildProfile() {
                     {key: 'l1_extract', label: 'L1 记忆提取'},
                     {key: 'embedding', label: '向量嵌入'},
                     {key: 'narrative', label: '共同经历叙事'},
-                    {key: 'summary', label: '近期摘要'}
+                    {key: 'summary', label: '近期摘要'},
+                    {key: 'aux', label: '辅助请求（翻译思考链等）',
+                     hint: '不设置时：用前端选的模型、走当前启用的中转。设置后，Pluvia 的翻译思考链这类小请求改走这里，可以选便宜、快的模型（OpenAI 格式和 Anthropic 格式的供应商都行）；它出错时会自动退回当前中转。保存后立即生效。'}
                 ];
 
                 var html = '';
@@ -1935,6 +2027,7 @@ function rebuildProfile() {
                     var cfg = configs[p.key];
                     html += '<div class="config-section">';
                     html += '<h4>' + p.label + '</h4>';
+                    if (p.hint) html += '<div style="font-size:12px;color:#888;line-height:1.6;margin:-4px 0 10px;">' + p.hint + '</div>';
                     html += '<div class="config-field">';
                     html += '<label>供应商：</label>';
                     html += '<select id="model-' + p.key + '-provider" onchange="onModelProviderChange(\'' + p.key + '\')">';
@@ -1950,6 +2043,7 @@ function rebuildProfile() {
                     html += '<select id="model-' + p.key + '-model" style="width:250px;"></select>';
                     html += '</div>';
                     html += '<button class="btn btn-small" onclick="saveModelConfig(\'' + p.key + '\')">保存</button>';
+                    if (cfg) html += '<button class="btn btn-small" style="background:#999;margin-left:6px;" onclick="clearModelConfig(\'' + p.key + '\', \'' + p.label + '\')">清除</button>';
                     html += '<span id="model-' + p.key + '-status" style="margin-left:8px;font-size:11px;"></span>';
                     html += '</div>';
                 });
@@ -1985,6 +2079,22 @@ function rebuildProfile() {
             if (cfg2 && cfg2.model) modelSelect.value = cfg2.model;
         }
 
+        function clearModelConfig(purpose, label) {
+            var tip = purpose === 'aux' ? '清除后翻译这类辅助请求会回到默认：用前端选的模型、走当前中转。确定吗？'
+                : '清除后「' + label + '」会回到默认设置（.env 里的配置）。确定吗？';
+            if (!confirm(tip)) return;
+            var status = document.getElementById('model-' + purpose + '-status');
+            status.textContent = '清除中...';
+            status.style.color = '#666';
+            fetch(API + '/config/models/' + purpose + '/clear', { method: 'POST' })
+                .then(function(r) { return r.json(); })
+                .then(function(d) {
+                    if (d.status === 'ok') loadModelConfigs();
+                    else { status.textContent = '失败：' + (d.message || '未知'); status.style.color = '#dc3545'; }
+                })
+                .catch(function(e) { status.textContent = '失败：' + e; status.style.color = '#dc3545'; });
+        }
+
         function saveModelConfig(purpose) {
             var providerId = parseInt(document.getElementById('model-' + purpose + '-provider').value);
             var model = document.getElementById('model-' + purpose + '-model').value;
@@ -2009,6 +2119,7 @@ function rebuildProfile() {
                 if (d.status === 'ok') {
                     status.textContent = '已保存';
                     status.style.color = '#28a745';
+                    setTimeout(loadModelConfigs, 1200);   // 刷新一下，显示「清除」按钮
                 } else {
                     status.textContent = '失败：' + (d.message || '未知');
                     status.style.color = '#dc3545';

@@ -1,6 +1,7 @@
 const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
+const { PassThrough } = require('stream');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -712,12 +713,14 @@ async function loadActiveConfig() {
       console.log(`[CONFIG] 已加载配置：${activeConfig.name} / ${activeConfig.model}`);
       await refreshModelsCache(true);
       await loadChatTargets();
+      await loadAuxTarget();
       return 'active';
     } else {
       activeConfig = null;
       console.log('[CONFIG] 记忆服务未配置供应商，回退到 .env');
       await refreshModelsCache(true);
       await loadChatTargets();
+      await loadAuxTarget();
       return 'unconfigured';
     }
   } catch (e) {
@@ -1672,7 +1675,7 @@ function makeEmitter(res, isAnthropic, requestModel) {
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
 // signal（可选）：前端断开时中止上游请求（Pluvia 路径用；Kelivo 路径不传，行为不变）。
-async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens, toolChoice, signal }) {
+async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens, toolChoice, signal, cands }) {
   // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
   // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
   const body = {
@@ -1698,7 +1701,7 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   logUpstreamBody(body);
   // 建连：此时还没往前端发任何数据，重试、换中转都安全（见 postWithFailover）。
   // 抵御中转站冷启动 / 偶发失败（空回主因），以及余额不足、密钥失效这类整个中转不可用的情况。
-  const upstream = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: true, signal })).resp;
+  const upstream = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: true, signal, cands })).resp;
 
   return await new Promise((resolve, reject) => {
     const blocks = {};       // 上游 index -> block
@@ -1752,6 +1755,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
           if (evt.delta && evt.delta.stop_reason) stopReason = evt.delta.stop_reason;
           // 功能4：output_tokens 在 message_delta.usage（累积值）
           if (evt.usage && evt.usage.output_tokens != null) usage.output_tokens = evt.usage.output_tokens;
+          // OpenAI 格式的上游（辅助请求）到最后才给输入 token 数，转换后放在 message_delta 里
+          if (evt.usage && evt.usage.input_tokens && !usage.input_tokens) usage.input_tokens = evt.usage.input_tokens;
           break;
       }
     }
@@ -1866,6 +1871,124 @@ async function loadChatTargets() {
   }
 }
 
+// ============ Pluvia 辅助请求（翻译思考链等）指定的模型：Dashboard「模块模型配置」→「辅助请求」 ============
+// 设置了就先用它（Anthropic / OpenAI 格式的供应商都行），它出错时退回「当前中转 + 前端选的模型」；没设置就和以前一样。
+let auxTarget = null;   // { name, apiUrl, apiKey, model, format: 'anthropic' | 'openai' } 或 null
+async function loadAuxTarget() {
+  try {
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/config/aux_target`, { timeout: 5000 });
+    const d = r.data || {};
+    if (d.configured && d.base_url && d.api_key && d.model) {
+      const format = d.api_format === 'anthropic' ? 'anthropic' : 'openai';
+      const base = String(d.base_url).replace(/\/$/, '');
+      const apiUrl = format === 'anthropic'
+        ? (base.endsWith('/messages') ? base : base + '/messages')
+        : (base.endsWith('/chat/completions') ? base : base + '/chat/completions');
+      auxTarget = { name: d.name || '辅助模型', apiUrl, apiKey: d.api_key, model: d.model, format };
+      console.log(`[CONFIG] 辅助请求（翻译等）用：${auxTarget.name} / ${auxTarget.model}（${format} 格式）`);
+    } else {
+      if (auxTarget) console.log('[CONFIG] 辅助请求改回默认：用前端选的模型、走当前中转');
+      auxTarget = null;
+    }
+  } catch (e) {
+    console.error('[CONFIG] 读取辅助请求的配置失败（沿用之前的设置）：', e.message);
+  }
+}
+
+// OpenAI 格式的上游（目前只给辅助请求用）：把 Anthropic 请求体换成 /chat/completions，再把回复换回 Anthropic 格式，
+// 后面的流程（streamRound / upstreamOnce）不用改。只处理文字；推理模型的 reasoning_content 不转发（翻译只要结果）。
+function blockText(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.map(b => {
+    if (!b) return '';
+    if (b.type === 'text') return b.text || '';
+    if (b.type === 'tool_result') return blockText(b.content);
+    return '';
+  }).filter(Boolean).join('\n');
+}
+function anthropicBodyToOpenAI(body, model, stream) {
+  const msgs = [];
+  const sys = blockText(body.system);
+  if (sys) msgs.push({ role: 'system', content: sys });
+  for (const m of body.messages || []) {
+    const text = blockText(m && m.content);
+    if (text) msgs.push({ role: m.role === 'assistant' ? 'assistant' : 'user', content: text });
+  }
+  const out = { model, messages: msgs, max_tokens: body.max_tokens || 4096 };
+  if (body.temperature != null) out.temperature = body.temperature;
+  if (body.top_p != null) out.top_p = body.top_p;
+  if (stream) { out.stream = true; out.stream_options = { include_usage: true }; }
+  return out;
+}
+function oaStopReason(r) { return r === 'length' ? 'max_tokens' : 'end_turn'; }
+async function postOpenAIAsAnthropic(c, body, stream, signal) {
+  const resp = await axios.post(c.apiUrl, anthropicBodyToOpenAI(body, c.model, stream), {
+    headers: { 'Authorization': `Bearer ${c.apiKey}`, 'Content-Type': 'application/json' },
+    timeout: 120000,
+    signal,
+    ...(stream ? { responseType: 'stream' } : {})
+  });
+  if (!stream) {
+    const d = resp.data || {};
+    const ch = (d.choices || [])[0] || {};
+    const text = (ch.message && ch.message.content) || '';
+    resp.data = { id: d.id || ('msg_oa_' + Date.now()), type: 'message', role: 'assistant', model: d.model || c.model,
+      content: text ? [{ type: 'text', text }] : [], stop_reason: oaStopReason(ch.finish_reason), stop_sequence: null,
+      usage: { input_tokens: (d.usage && d.usage.prompt_tokens) || 0, output_tokens: (d.usage && d.usage.completion_tokens) || 0 } };
+    return resp;
+  }
+  const out = new PassThrough();
+  const src = resp.data;
+  const send = (type, data) => out.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
+  let buf = '', started = false, textOpen = false, finish = null, usage = null, done = false, srcEnded = false;
+  const start = (id, model) => {
+    if (started) return;
+    started = true;
+    send('message_start', { message: { id: id || ('msg_oa_' + Date.now()), type: 'message', role: 'assistant', model: model || c.model,
+      content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: 0, output_tokens: 0 } } });
+  };
+  const finishAll = () => {
+    if (done) return;
+    done = true;
+    start();
+    if (textOpen) send('content_block_stop', { index: 0 });
+    send('message_delta', { delta: { stop_reason: oaStopReason(finish), stop_sequence: null },
+      usage: { input_tokens: (usage && usage.prompt_tokens) || 0, output_tokens: (usage && usage.completion_tokens) || 0 } });
+    send('message_stop', {});
+    out.end();
+  };
+  src.on('data', chunk => {
+    buf += chunk.toString('utf8');
+    let idx;
+    while ((idx = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, idx).trim();
+      buf = buf.slice(idx + 1);
+      if (!line.startsWith('data:')) continue;
+      const data = line.slice(5).trim();
+      if (data === '[DONE]') { finishAll(); continue; }
+      let j;
+      try { j = JSON.parse(data); } catch (_) { continue; }
+      if (done) continue;
+      start(j.id, j.model);
+      if (j.usage) usage = j.usage;
+      const ch = (j.choices || [])[0];
+      if (!ch) continue;
+      const t = ch.delta && ch.delta.content;
+      if (t) {
+        if (!textOpen) { textOpen = true; send('content_block_start', { index: 0, content_block: { type: 'text', text: '' } }); }
+        send('content_block_delta', { index: 0, delta: { type: 'text_delta', text: t } });
+      }
+      if (ch.finish_reason) finish = ch.finish_reason;
+    }
+  });
+  src.on('end', () => { srcEnded = true; finishAll(); });
+  src.on('error', e => { if (!done) out.destroy(e); });
+  src.on('close', () => { if (!srcEnded && !done) out.destroy(new Error('上游流在结束前被关闭')); });
+  resp.data = out;
+  return resp;
+}
+
 function normalizeModelName(s) {
   return String(s || '').toLowerCase().replace(/^[^/]+\//, '').replace(/:.*$/, '').replace(/\./g, '-');
 }
@@ -1898,8 +2021,8 @@ function isFailoverError(e) {
 }
 // 发一次上游请求：主中转对偶发错误最多试 3 次；不行就按顺序换中转（每个试 1 次）。
 // 成功返回 { resp, target }；全部失败时抛出最后一个错误，message 里列出每个中转的失败原因。
-async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, signal }) {
-  const cands = upstreamCandidates(apiUrl, apiKey, requestModel);
+async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, signal, cands: given }) {
+  const cands = (given && given.length) ? given : upstreamCandidates(apiUrl, apiKey, requestModel);
   const failures = [];
   let lastErr = null;
   for (let ci = 0; ci < cands.length; ci++) {
@@ -1907,12 +2030,13 @@ async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, si
     const attempts = ci === 0 ? 3 : 1;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
-        const resp = await axios.post(c.apiUrl, { ...body, model: c.model }, {
-          headers: { 'Authorization': `Bearer ${c.apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
-          timeout: 120000,
-          signal,
-          ...(stream ? { responseType: 'stream' } : {})
-        });
+        const resp = c.format === 'openai' ? await postOpenAIAsAnthropic(c, body, stream, signal)
+          : await axios.post(c.apiUrl, { ...body, model: c.model }, {
+            headers: { 'Authorization': `Bearer ${c.apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
+            timeout: 120000,
+            signal,
+            ...(stream ? { responseType: 'stream' } : {})
+          });
         if (ci > 0) console.log(`[FAILOVER] 这次由 ${c.name} 回答（${c.model}）`);
         return { resp, target: c };
       } catch (e) {
@@ -1921,17 +2045,22 @@ async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, si
         const st = e.response && e.response.status;
         console.error(`[UPSTREAM] ${c.name} 请求失败（第${attempt}次）：`, st || e.message);
         if (st && st < 500 && st !== 429 && st !== 408) break;   // 4xx 不重试同一个中转
+        if (st === 503) {   // 「没有可用账号」这类说明重试也没用，直接换下一个中转
+          e._rawBody = await readErrorBody(e);
+          if (/no available (account|channel)/i.test(e._rawBody || '')) break;
+        }
         if (attempt < attempts) await new Promise(r => setTimeout(r, 500 * attempt));
       }
     }
     // 流式请求的错误说明在响应流里，读出来换成可读的文字
-    const raw = await readErrorBody(lastErr);
+    const raw = lastErr._rawBody != null ? lastErr._rawBody : await readErrorBody(lastErr);
     const msg = (raw ? upstreamErrorMessage(raw) : (lastErr.response ? `HTTP ${lastErr.response.status}` : lastErr.message)).slice(0, 200);
     console.error(`[UPSTREAM] ${c.name} 错误说明：`, msg);
     failures.push(`${c.name}：${msg}`);
     lastErr.message = msg;
     if (lastErr.response) lastErr.response.data = { error: { message: msg } };
-    if (!isFailoverError(lastErr)) break;
+    // 辅助请求指定的模型出任何错（比如模型名填错了）都退回默认路线
+    if (!isFailoverError(lastErr) && !c.fallbackOnAnyError) break;
     if (ci + 1 < cands.length) console.warn(`[FAILOVER] ${c.name} 不可用，改用 ${cands[ci + 1].name}`);
   }
   if (failures.length > 1) {
@@ -1943,7 +2072,7 @@ async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, si
 }
 
 // 非流式跑一次上游（Pluvia 非流式用），返回结构与 streamRound 一致
-async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal }) {
+async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal, cands }) {
   const body = { model: requestModel, system, messages, max_tokens: maxTokens || 4096 };
   if (tools && tools.length) body.tools = tools;
   if (toolChoice && body.tools) body.tool_choice = toolChoice;
@@ -1954,7 +2083,7 @@ async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, to
   }
   if (outputConfig) body.output_config = outputConfig;
   logUpstreamBody(body);
-  const r = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: false, signal })).resp;
+  const r = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: false, signal, cands })).resp;
   const d = r.data || {};
   return { id: d.id, content: Array.isArray(d.content) ? d.content : [], stop_reason: d.stop_reason, usage: d.usage };
 }
@@ -1980,9 +2109,17 @@ async function runPluviaAux(req, res, pv) {
     : oaMessagesToAnthropic(messages);
   const tools = (req.body.tools || []).map(toAnthropicTool);
   capCacheControl(systemBlocks, upstreamMessages, tools);
-  console.log('[PLUVIA] 辅助请求 aux=' + pv.aux + '：不检索、不注入、不存');
+  // Dashboard 指定了辅助请求的模型：先用它，出错时退回当前中转 + 前端选的模型（再不行按顺序换中转）
+  let upstreamCands;
+  if (auxTarget) {
+    upstreamCands = [{ name: auxTarget.name + '（辅助）', apiUrl: auxTarget.apiUrl, apiKey: auxTarget.apiKey, model: auxTarget.model,
+      format: auxTarget.format, fallbackOnAnyError: true }, ...upstreamCandidates(apiUrl, apiKey, requestModel)];
+    console.log(`[PLUVIA] 辅助请求 aux=${pv.aux}：用 Dashboard 指定的 ${auxTarget.name} / ${auxTarget.model}；不检索、不注入、不存`);
+  } else {
+    console.log('[PLUVIA] 辅助请求 aux=' + pv.aux + '：不检索、不注入、不存');
+  }
   return await runPluvia({
-    req, res, pv, stream: !!req.body.stream, isAnthropic: !!req.body._anthropicFormat,
+    req, res, pv, stream: !!req.body.stream, isAnthropic: !!req.body._anthropicFormat, upstreamCands,
     apiUrl, apiKey, requestModel, systemBlocks: systemBlocks.length ? systemBlocks : undefined,
     messages: upstreamMessages, allTools: tools, toolChoice: toAnthropicToolChoice(req.body.tool_choice),
     menuCtx: { shownIds: [] }, convId: resolveConvId(req), continued: false
@@ -1995,7 +2132,7 @@ async function runPluviaAux(req, res, pv) {
 //  - 模型调了前端工具 → 把这些调用交回前端（OpenAI finish_reason=tool_calls / Anthropic stop_reason=tool_use），
 //    这一轮的上游状态按 (conversation_id, turn.id) 存 10 分钟，前端带着工具结果续问时接回去；
 //  - 只在一条回复的最后一轮存 L0（整条回复的文字合成一条 assistant）；前端中途断开（用户点停）就不存，并中止上游。
-async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, requestModel, systemBlocks, messages, allTools, toolChoice, menuCtx, convId, continued }) {
+async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, requestModel, systemBlocks, messages, allTools, toolChoice, menuCtx, convId, continued, upstreamCands }) {
   const key = pv.turn ? turnKey(convId, pv.turn.id) : null;
   const prev = (key && continued) ? turnStoreGet(key) : null;   // 本条回复前几轮的累计（文字、思考、浮现的记忆）
   const skipMemory = isTitleGenerationRequest(req) || !!pv.aux;   // 辅助请求（翻译思考链等）不进记忆
@@ -2036,7 +2173,8 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
     while (loops-- > 0) {
       const args = {
         apiUrl, apiKey, requestModel, system: systemBlocks, messages: convo, tools: allTools,
-        thinking, outputConfig: req.body.output_config, maxTokens: req.body.max_tokens, toolChoice, signal: ac.signal
+        thinking, outputConfig: req.body.output_config, maxTokens: req.body.max_tokens, toolChoice, signal: ac.signal,
+        cands: upstreamCands
       };
       result = stream ? await streamRound({ ...args, emitter }) : await upstreamOnce(args);
       addUsageTo(totalUsage, result.usage);
@@ -2923,7 +3061,7 @@ app.all('/api/*splat', async (req, res) => {
   // originalUrl 已含 query，用 pathname 拼接避免与 params:req.query 双重附加 query
   const path = req.originalUrl.replace(/^\/api/, '');
   // 会返回明文 API Key 的内部接口只给网关在本机直接调用，不经过 /api 对外（Dashboard 也用不到它们）
-  if (/^\/config\/(current|chat_targets)(\/|\?|$)/.test(path)) {
+  if (/^\/config\/(current|chat_targets|aux_target)(\/|\?|$)/.test(path)) {
     return res.status(403).json({ error: { message: '内部接口，不对外开放', type: 'forbidden' } });
   }
   const target = MEMORY_SERVICE_URL + path;

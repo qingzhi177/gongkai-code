@@ -1,4 +1,5 @@
-"""分层决策 + 冷却（方案 8.3、8.5 节）。下面的数值都是起点，要用黄金集校准。
+"""分层决策 + 冷却（方案 8.3、8.5 节）。下面的数值都是默认值（起点），要用黄金集校准。
+Dashboard「召回对比」页可以改（存在 app_settings 表，见 app/settings.py），每一轮通过 params 传进来。
 
 | 层级     | 条件                         | 动作                                      |
 |----------|------------------------------|-------------------------------------------|
@@ -36,6 +37,25 @@ MEDIUM_COOLDOWN_H = 24
 SERENDIPITY_COOLDOWN_D = 7
 EMOTION_BONUS = 0.05
 
+PARAM_KEYS = ("t_high", "t_low", "min_sim", "medium_prob", "task_medium_prob", "serendipity_prob", "max_picks",
+              "recall_top", "recent_turns", "medium_cooldown_h", "serendipity_cooldown_d", "emotion_bonus")
+
+
+def params_from(params=None):
+    """决策要用的参数：传进来的（Dashboard 上调过的）优先，没传的用上面的默认值"""
+    p = {"t_high": T_HIGH, "t_low": T_LOW, "min_sim": MIN_SIM, "medium_prob": MEDIUM_PROB,
+         "task_medium_prob": TASK_MEDIUM_PROB, "serendipity_prob": SERENDIPITY_PROB, "max_picks": MAX_PICKS,
+         "recall_top": RECALL_TOP, "recent_turns": RECENT_TURNS, "medium_cooldown_h": MEDIUM_COOLDOWN_H,
+         "serendipity_cooldown_d": SERENDIPITY_COOLDOWN_D, "emotion_bonus": EMOTION_BONUS}
+    for k, v in (params or {}).items():
+        if k in p and v is not None:
+            p[k] = v
+    return p
+
+
+def _num(x):
+    return int(x) if float(x).is_integer() else x
+
 
 def _weighted_choice(options, rng):
     total = sum(w for _, w in options)
@@ -63,11 +83,15 @@ def _weighted_sample(items, n, rng):
     return out
 
 
-def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=None):
+def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=None, params=None):
     """cands：[{id, score(精排分或向量相似度), vec_sim, arousal, is_core, ...}]，按分数从高到低。
     cooldown：{"recent": set(最近 5 轮出现过的 id), "medium": set(24 小时内出现过的), "serendipity": set(7 天内无由来出现过的)}
+    params：可调参数（见 params_from），不传就用默认值。
     返回 {"picks": [...], "eligible": {...}, "dropped": [...], "gate": ...}"""
     rng = rng or random.Random()
+    p = params_from(params)
+    recent_reason = f"最近 {_num(p['recent_turns'])} 轮出现过"
+    medium_reason = f"中层 {_num(p['medium_cooldown_h'])} 小时冷却"
     recent, medium_cd, seren_cd = cooldown.get("recent", set()), cooldown.get("medium", set()), cooldown.get("serendipity", set())
     out = {"picks": [], "eligible": {"recall": [], "strong": [], "medium": []}, "dropped": [], "gate": None,
            "basis": "rerank" if rerank_ok else "vec_sim"}
@@ -76,18 +100,18 @@ def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=Non
     for c in cands:
         s = c["score"]
         if intent_type == "emotion" and (c.get("arousal") or 0) >= 0.6:
-            s = round(s + EMOTION_BONUS, 4)
+            s = round(s + p["emotion_bonus"], 4)
         scored.append({**c, "score": s})
     scored.sort(key=lambda c: -c["score"])
 
     def tier_of(c):
         if rerank_ok:
-            if c["score"] >= T_HIGH:
+            if c["score"] >= p["t_high"]:
                 return "strong"
-            if c["score"] >= T_LOW:
+            if c["score"] >= p["t_low"]:
                 return "medium"
             return None
-        return "medium" if (c.get("vec_sim") or 0) >= MIN_SIM else None
+        return "medium" if (c.get("vec_sim") or 0) >= p["min_sim"] else None
 
     if intent_type == "greeting":
         out["gate"] = "greeting"
@@ -97,10 +121,10 @@ def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=Non
             if tier_of(c) is None:
                 continue
             if c["id"] in recent:
-                out["dropped"].append({"id": c["id"], "reason": "最近 5 轮出现过"})
+                out["dropped"].append({"id": c["id"], "reason": recent_reason})
                 continue
             out["eligible"]["recall"].append(c["id"])
-            if len(out["picks"]) < RECALL_TOP:
+            if len(out["picks"]) < p["recall_top"]:
                 out["picks"].append({**c, "tier": "recall"})
     else:
         strong, medium = [], []
@@ -109,18 +133,18 @@ def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=Non
             if t is None:
                 continue
             if c["id"] in recent:
-                out["dropped"].append({"id": c["id"], "reason": "最近 5 轮出现过"})
+                out["dropped"].append({"id": c["id"], "reason": recent_reason})
                 continue
             if t == "medium" and c["id"] in medium_cd:
-                out["dropped"].append({"id": c["id"], "reason": "中层 24 小时冷却"})
+                out["dropped"].append({"id": c["id"], "reason": medium_reason})
                 continue
             (strong if t == "strong" else medium).append(c)
         out["eligible"]["strong"] = [c["id"] for c in strong]
         out["eligible"]["medium"] = [c["id"] for c in medium]
-        out["picks"] = [{**c, "tier": "strong"} for c in strong[:MAX_PICKS]]
-        room = MAX_PICKS - len(out["picks"])
+        out["picks"] = [{**c, "tier": "strong"} for c in strong[:p["max_picks"]]]
+        room = p["max_picks"] - len(out["picks"])
         if room > 0 and medium:
-            prob = TASK_MEDIUM_PROB if intent_type == "task" else MEDIUM_PROB
+            prob = p["task_medium_prob"] if intent_type == "task" else p["medium_prob"]
             if rng.random() < prob:
                 n = min(room, _weighted_choice(SHOW_COUNT_WEIGHTS, rng))
                 out["gate"] = f"medium_open:{n}"
@@ -128,9 +152,9 @@ def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=Non
             else:
                 out["gate"] = "medium_closed"
 
-    # 无由来浮现：5% 概率，和相关度无关（寒暄时也可能有）
-    limit = RECALL_TOP if intent_type == "recall" else MAX_PICKS
-    if serendipity_pool and rng.random() < SERENDIPITY_PROB:
+    # 无由来浮现：默认 5% 概率，和相关度无关（寒暄时也可能有）
+    limit = p["recall_top"] if intent_type == "recall" else p["max_picks"]
+    if limit > 0 and serendipity_pool and rng.random() < p["serendipity_prob"]:
         picked_ids = {p["id"] for p in out["picks"]}
         pool = [m for m in serendipity_pool if m["id"] not in seren_cd and m["id"] not in recent and m["id"] not in picked_ids]
         if pool:

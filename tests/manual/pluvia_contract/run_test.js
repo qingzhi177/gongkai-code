@@ -452,7 +452,8 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     const r1 = await fetch(GW + '/api/config/current');
     const r2 = await fetch(GW + '/api/config/chat_targets?x=1');
     const r3 = await fetch(GW + '/api/config/providers');
-    ok(r1.status === 403 && r2.status === 403 && r3.status === 200, 'T23', [r1.status, r2.status, r3.status]);
+    const r4 = await fetch(GW + '/api/config/aux_target');
+    ok(r1.status === 403 && r2.status === 403 && r3.status === 200 && r4.status === 403, 'T23', [r1.status, r2.status, r3.status, r4.status]);
   }
 
   console.log('T24 影子对比：每轮把用户的话和旧逻辑的决定发给 /compose/turn（不影响回复）');
@@ -475,6 +476,88 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
       pluvia: { v: '0.2', turn: { id: 'tsh2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '起个标题 [A]' }] }));
     await sleep(300);
     ok(since(m2).mem.filter(x => x.k === 'compose').length === 0, 'T24 不进记忆的请求（标题生成等）不发 compose');
+  }
+
+  console.log('T25 辅助请求（翻译等）可以指定模型：Dashboard「模块模型配置」→「辅助请求」');
+  {
+    const setAux = async t => {
+      await fetch('http://127.0.0.1:3998/_test/aux', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(t || {}) });
+      return (await fetch(GW + '/reload-config', { method: 'POST' })).json();
+    };
+    const AH = { 'anthropic-version': '2023-06-01' };
+    const oaAux = (content, stream) => ({ model: 'fake-model', stream, memory_skip: true,
+      pluvia: { v: '0.2', client: 'pluvia', aux: 'translate', system: 'append' },
+      messages: [{ role: 'system', content: '翻译成中文' }, { role: 'user', content }] });
+    const anAux = (content, stream) => ({ model: 'fake-model', stream, max_tokens: 512, memory_skip: true,
+      pluvia: { v: '0.2', aux: 'translate' }, system: '翻译成中文', messages: [{ role: 'user', content }] });
+
+    // 1) OpenAI 格式的供应商（比如 DeepSeek）
+    await setAux({ name: 'ds', base_url: 'http://127.0.0.1:3997/oa/v1/', api_key: 'kd', model: 'cheap-model', api_format: 'openai' });
+    let m = mark();
+    const s1 = oaSummary(await sseCollect(await post('/v1/chat/completions', oaAux('Hello [A]', true))));
+    await sleep(200);
+    let d = since(m), ups = upReqs(d);
+    ok(s1.text === '译文：你好' && s1.reasoning === '' && s1.finish === 'stop' && s1.done, 'T25 OpenAI 格式、流式：译文完整，推理过程不转发', s1);
+    ok(ups.length === 1 && ups[0]._target === 'oa' && ups[0].model === 'cheap-model' && ups[0]._auth === 'Bearer kd' && ups[0].stream === true
+      && ups[0].messages.length === 2 && ups[0].messages[0].role === 'system' && ups[0].messages[0].content === '翻译成中文'
+      && ups[0].messages[1].content === 'Hello [A]' && !('system' in ups[0]) && !('tools' in ups[0]),
+      'T25 换成 /chat/completions 格式，发给指定的供应商和模型', ups);
+    ok(!d.mem.some(x => ['search', 'save', 'thinking', 'compose'].includes(x.k)), 'T25 照样不检索、不存', d.mem.map(x => x.k));
+    m = mark();
+    const s2 = anSummary(await sseCollect(await post('/v1/messages', anAux('Hello [A]', true), AH)));
+    ok(s2.content.length === 1 && s2.content[0].type === 'text' && s2.content[0].text === '译文：你好' && s2.stop === 'end_turn' && s2.msgStarts === 1,
+      'T25 Anthropic 格式的前端、流式', s2);
+    const j3 = await (await post('/v1/chat/completions', oaAux('Hello [A]', false))).json();
+    ok(j3.choices && j3.choices[0].message.content === '译文：你好' && j3.choices[0].finish_reason === 'stop', 'T25 OpenAI 格式的前端、非流式', j3);
+    const j4 = await (await post('/v1/messages', anAux('Hello [A]', false), AH)).json();
+    ok(j4.content && j4.content.length === 1 && j4.content[0].text === '译文：你好' && j4.stop_reason === 'end_turn', 'T25 Anthropic 格式的前端、非流式', j4);
+    await sleep(200);
+    ups = upReqs(since(m));
+    ok(ups.length === 3 && ups.every(x => x._target === 'oa') && ups[1].stream === undefined, 'T25 都走指定的供应商', ups.map(x => [x._target, x.stream]));
+
+    // 2) 指定的供应商出错（模型名填错之类）→ 退回当前中转 + 前端选的模型
+    m = mark();
+    const s5 = oaSummary(await sseCollect(await post('/v1/chat/completions', oaAux('Hello [H]', true))));
+    await sleep(200);
+    ups = upReqs(since(m));
+    ok(s5.text === '你好呀' && ups.length === 2 && ups[0]._target === 'oa' && !ups[1]._target && ups[1].model === 'fake-model',
+      'T25 指定的供应商出错时退回当前中转', { s5, ups: ups.map(x => (x._target || 'primary') + ':' + x.model) });
+
+    // 3) Anthropic 格式的供应商
+    await setAux({ name: 'hk', base_url: 'http://127.0.0.1:3997/aux/v1', api_key: 'kh', model: 'small-model', api_format: 'anthropic' });
+    m = mark();
+    const s6 = oaSummary(await sseCollect(await post('/v1/chat/completions', oaAux('Hello [A]', true))));
+    await sleep(200);
+    ups = upReqs(since(m));
+    ok(s6.text === '辅助模型回答' && ups.length === 1 && ups[0]._target === 'aux' && ups[0].model === 'small-model' && ups[0]._auth === 'Bearer kh'
+      && ups[0].system[0].text === '翻译成中文', 'T25 Anthropic 格式的供应商', ups);
+
+    // 4) 普通聊天不受影响
+    m = mark();
+    const s7 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-aux',
+      pluvia: { v: '0.2', turn: { id: 'tax1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [A]' }] })));
+    await sleep(300);
+    ups = upReqs(since(m));
+    ok(s7.text === '你好呀' && ups.length === 1 && !ups[0]._target && ups[0].model === 'fake-model', 'T25 普通聊天照常走当前中转', ups.map(x => x._target || 'primary'));
+
+    // 5) 清除以后回到默认
+    await setAux({});
+    m = mark();
+    const s8 = oaSummary(await sseCollect(await post('/v1/chat/completions', oaAux('Hello [A]', true))));
+    await sleep(200);
+    ups = upReqs(since(m));
+    ok(s8.text === '你好呀' && ups.length === 1 && !ups[0]._target && ups[0].model === 'fake-model', 'T25 清除以后用前端选的模型、走当前中转', ups);
+  }
+
+  console.log('T26 中转说「没有可用账号」时不再重试，直接换备用');
+  {
+    const m = mark();
+    const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-na',
+      pluvia: { v: '0.2', turn: { id: 'tna1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [N]' }] })));
+    await sleep(300);
+    const ups = upReqs(since(m));
+    ok(s.text === '备用中转回答' && ups.filter(x => !x._target).length === 1 && ups.some(x => x._target === 'backup'),
+      'T26 主中转只试 1 次', ups.map(x => x._target || 'primary'));
   }
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);

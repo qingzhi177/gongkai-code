@@ -2,7 +2,7 @@ from fastapi import FastAPI, UploadFile
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 import sqlite3
 import re
 import os
@@ -35,6 +35,7 @@ from app.pipeline.narrative import NarrativeGenerateRequest, get_narrative_pendi
 from app.pipeline import summary as summary_pipeline
 from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回编排（影子模式）
 from app.recall import traces as recall_traces
+from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 
 load_dotenv()
 
@@ -2802,6 +2803,35 @@ async def recall_trace_detail(trace_id: int):
 async def recall_stats(days: int = 7):
     return recall_traces.stats(days=days)
 
+class SettingsUpdate(BaseModel):
+    values: Dict[str, Any] = {}
+
+class SettingsReset(BaseModel):
+    keys: List[str] = []
+
+@app.get("/recall/settings")
+async def get_recall_settings():
+    """召回参数（门槛、概率、冷却、精排）：名称、说明、默认值、当前值。Dashboard「召回对比」页用。"""
+    return app_settings.describe("recall")
+
+@app.put("/recall/settings")
+async def put_recall_settings(req: SettingsUpdate):
+    """保存召回参数（只改传进来的；任何一个不合法就整批不存）。立即生效，不用重启。"""
+    try:
+        app_settings.update("recall", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("recall")}
+
+@app.post("/recall/settings/reset")
+async def reset_recall_settings(req: SettingsReset):
+    """恢复默认（keys 为空就是全部恢复）"""
+    try:
+        app_settings.reset("recall", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("recall")}
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -2844,10 +2874,13 @@ async def get_pipeline_status():
 # ============ Model Config API (扩展) ============
 
 
+# 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "aux"]
+
 @app.get("/config/models")
 async def get_all_model_configs():
     """获取所有模块的模型配置"""
-    purposes = ["chat", "l1_extract", "embedding", "narrative", "summary"]
+    purposes = MODEL_PURPOSES
     configs = {}
 
     conn = get_conn()
@@ -2881,6 +2914,8 @@ class ModelConfigUpdate(BaseModel):
 @app.put("/config/models/{purpose}")
 async def update_model_config(purpose: str, req: ModelConfigUpdate):
     """更新指定模块的模型配置"""
+    if purpose not in MODEL_PURPOSES:
+        return {"status": "error", "message": f"没有这个用途：{purpose}"}
     conn = get_conn()
     c = conn.cursor()
 
@@ -2904,7 +2939,34 @@ async def update_model_config(purpose: str, req: ModelConfigUpdate):
     conn.commit()
     conn.close()
 
+    if purpose == "aux":   # 网关缓存着辅助请求用的供应商，通知它重新读
+        return {"status": "ok", "gateway_reloaded": await notify_gateway_reload()}
     return {"status": "ok"}
+
+@app.post("/config/models/{purpose}/clear")
+async def clear_model_config(purpose: str):
+    """清除指定模块的模型配置（回到默认行为）"""
+    if purpose not in MODEL_PURPOSES:
+        return {"status": "error", "message": f"没有这个用途：{purpose}"}
+    conn = get_conn()
+    conn.execute("DELETE FROM model_configs WHERE purpose=?", (purpose,))
+    conn.commit()
+    conn.close()
+    if purpose == "aux":
+        return {"status": "ok", "gateway_reloaded": await notify_gateway_reload()}
+    return {"status": "ok"}
+
+@app.get("/config/aux_target")
+async def get_aux_target():
+    """给网关用：Pluvia 辅助请求（翻译思考链等）指定的供应商和模型。没设置时 configured=false。
+
+    含解密后的 api_key，只给本机网关调用；网关的 /api 代理会拦掉这个路径，不对外。
+    """
+    cfg = await get_model_config("aux")
+    if not cfg.get("configured") or not cfg.get("base_url") or not cfg.get("api_key") or not cfg.get("model"):
+        return {"configured": False}
+    return {"configured": True, "name": cfg.get("provider_name") or "", "base_url": cfg["base_url"],
+            "api_key": cfg["api_key"], "model": cfg["model"], "api_format": cfg.get("api_format") or "openai"}
 
 # ============ 生成逻辑 ============
 # 叙事 / 摘要 / 画像的生成和大模型调用已经搬到 app/（app/pipeline/、app/llm.py），上面的接口从那里导入。

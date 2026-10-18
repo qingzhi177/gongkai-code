@@ -4,6 +4,7 @@
 但不返回给网关注入，冷却也只看影子自己的记录，和网关旧逻辑互不干扰。
 """
 import asyncio
+import functools
 import json
 import random
 import time
@@ -11,6 +12,7 @@ import uuid
 from datetime import timedelta
 
 import timeutil
+from app import settings as app_settings
 from app.config import get_conn
 from app.recall import cards, channels, decide as decide_mod, intent as intent_mod
 from app.recall import rerank as rerank_mod
@@ -52,13 +54,14 @@ def ledger_statuses(mode):
     return ("shadow",) if mode == "shadow" else ("delivered",)
 
 
-def load_cooldown(conn, backend, session_id, mode, now=None):
+def load_cooldown(conn, backend, session_id, mode, now=None, params=None):
     now = now or timeutil.utc_now()
+    p = decide_mod.params_from(params)
     st = ledger_statuses(mode)
     qs = ",".join("?" * len(st))
     trace_ids = [r[0] for r in conn.execute(
         "SELECT id FROM recall_traces WHERE backend=? AND session_id=? AND mode=? ORDER BY id DESC LIMIT ?",
-        (backend, session_id, mode, decide_mod.RECENT_TURNS)).fetchall()]
+        (backend, session_id, mode, int(p["recent_turns"]))).fetchall()]
     recent = set()
     if trace_ids:
         recent = {int(r[0]) for r in conn.execute(
@@ -71,13 +74,26 @@ def load_cooldown(conn, backend, session_id, mode, now=None):
             f"SELECT item_id FROM injections WHERE status IN ({qs}) AND item_type='moment' AND created_at >= ?",
             (*st, t)).fetchall()}
 
-    return {"recent": recent, "medium": since(decide_mod.MEDIUM_COOLDOWN_H),
-            "serendipity": since(decide_mod.SERENDIPITY_COOLDOWN_D * 24)}
+    return {"recent": recent, "medium": since(p["medium_cooldown_h"]),
+            "serendipity": since(p["serendipity_cooldown_d"] * 24)}
 
 
-async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=None, rng=None):
+def load_params():
+    """这一轮用的参数（Dashboard 上调过的优先，读不到就全用默认值）"""
+    try:
+        return app_settings.get("recall")
+    except Exception as e:
+        print(f"[RECALL] 读取召回参数失败，用默认值：{e}")
+        return {}
+
+
+async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=None, rng=None, params=None):
+    settings = load_params() if params is None else params
+    p = decide_mod.params_from(settings)
     embed_fn = embed_fn or channels.embed
-    rerank_fn = rerank_fn or rerank_mod.rerank
+    rerank_fn = rerank_fn or functools.partial(rerank_mod.rerank, model=settings.get("rerank_model"),
+                                               timeout=settings.get("rerank_timeout"),
+                                               enabled=settings.get("rerank_enabled"))
     fts_fn = fts_fn or channels.fts_search_async
     rng = rng or random.Random()
     t0 = time.monotonic()
@@ -118,17 +134,17 @@ async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=No
 
     conn = get_conn()
     try:
-        cooldown = load_cooldown(conn, backend, session_id, mode)
+        cooldown = load_cooldown(conn, backend, session_id, mode, params=p)
         pool = channels.serendipity_pool()
         d = decide_mod.decide(cands, intent["type"], cooldown, bool(rr_info and rr_info.get("ok")),
-                              serendipity_pool=pool, rng=rng)
+                              serendipity_pool=pool, rng=rng, params=p)
         card = cards.format_card(d["picks"], intent["type"])
         lat["total"] = int((time.monotonic() - t0) * 1000)
         now = timeutil.utc_now_str()
         legacy = req.get("legacy")
         legacy_json = json.dumps(legacy, ensure_ascii=False)[:LEGACY_MAX_CHARS] if legacy is not None else None
         picks_brief = [{"id": p["id"], "tier": p["tier"], "score": p.get("score")} for p in d["picks"]]
-        decision = {**{k: d[k] for k in ("eligible", "dropped", "gate", "basis")}, "picks": picks_brief,
+        decision = {**{k: d[k] for k in ("eligible", "dropped", "gate", "basis")}, "picks": picks_brief, "params": p,
                     "candidates": [{"id": c["id"], "rerank": c.get("rerank"), "vec_sim": c.get("vec_sim"),
                                     "rrf": c.get("rrf")} for c in cands[:15]]}
         cur = conn.execute(

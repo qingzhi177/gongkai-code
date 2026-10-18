@@ -21,6 +21,7 @@ sys.path.insert(0, str(HERE.parent.parent / "services" / "memory-service"))
 
 import db  # noqa: E402
 from app import config  # noqa: E402
+from app import settings as S  # noqa: E402
 from app.recall import cards, decide as D, intent, orchestrator, traces  # noqa: E402
 
 PASS = FAIL = 0
@@ -120,6 +121,25 @@ def test_decide():
         hits += bool(rr["picks"])
     check("无由来 7 天冷却", hits == 0)
 
+    # 可调参数（Dashboard 上改的）
+    r = D.decide([C(1, 0.7), C(2, 0.68), C(3, 0.66)], "normal", nocd, True, rng=random.Random(1),
+                 params={"t_high": 0.65, "max_picks": 1})
+    check("参数：调低强门槛、每轮 1 条", [p["id"] for p in r["picks"]] == [1] and r["eligible"]["strong"] == [1, 2, 3], r)
+    r = D.decide([C(4, 0.6)], "normal", nocd, True, rng=random.Random(0), params={"medium_prob": 1.0})
+    check("参数：中层概率 100%", r["gate"].startswith("medium_open") or r["picks"] == [], r)
+    opened = sum(bool(D.decide([C(4, 0.6)], "normal", nocd, True, rng=random.Random(sd), params={"medium_prob": 1.0})["gate"]
+                      .startswith("medium_open")) for sd in range(50))
+    check("参数：中层概率 100% 时每次都开放", opened == 50, opened)
+    hits = sum(bool(D.decide([], "greeting", nocd, True, serendipity_pool=pool, rng=random.Random(sd),
+                             params={"serendipity_prob": 0})["picks"]) for sd in range(200))
+    check("参数：无由来概率 0 时不出现", hits == 0, hits)
+    r = D.decide([C(1, 0.9)], "normal", {"recent": {1}, "medium": set(), "serendipity": set()}, True,
+                 rng=random.Random(1), params={"recent_turns": 8})
+    check("参数：冷却说明跟着改", r["dropped"] == [{"id": 1, "reason": "最近 8 轮出现过"}], r["dropped"])
+    r = D.decide([C(1, 0.9)], "normal", nocd, True, rng=random.Random(1), params={"max_picks": 0, "serendipity_prob": 1})
+    check("参数：每轮 0 条就什么都不想起", r["picks"] == [], r["picks"])
+    check("参数：没传的用默认值", D.params_from({"t_high": 0.8})["t_low"] == D.T_LOW and D.params_from(None)["t_high"] == D.T_HIGH)
+
 
 # ---------- 4. 端到端（假嵌入 / 假精排 / 假向量）----------
 class FakeCollection:
@@ -197,12 +217,76 @@ def test_e2e():
           and st["rerank_tried_turns"] == 4 and st["rerank_ok_turns"] == 3, st)
 
 
+# ---------- 5. 可调参数（app_settings）----------
+def test_settings():
+    print("\n[5] 召回参数：保存、校验、恢复默认，召回编排用上")
+
+    def err(fn):
+        try:
+            fn()
+            return None
+        except ValueError as e:
+            return str(e)
+
+    d = S.describe("recall")
+    items = {x["key"]: x for x in d["items"]}
+    check("默认值", items["t_high"]["value"] == D.T_HIGH and not items["t_high"]["overridden"] and d["updated_at"] is None
+          and items["rerank_enabled"]["type"] == "bool" and items["max_picks"]["type"] == "int", items["t_high"])
+    v = S.update("recall", {"t_high": 0.7, "medium_prob": "0.5", "rerank_enabled": "0", "max_picks": 3})
+    check("保存（字符串会转成对应类型）", v["t_high"] == 0.7 and v["medium_prob"] == 0.5 and v["rerank_enabled"] is False
+          and v["max_picks"] == 3, v)
+    check("保存后马上生效（不等缓存过期）", S.get("recall")["t_high"] == 0.7)
+    items = {x["key"]: x for x in S.describe("recall")["items"]}
+    check("标记改过的", items["t_high"]["overridden"] and items["t_high"]["updated_at"] and not items["t_low"]["overridden"])
+    e = err(lambda: S.update("recall", {"t_low": 0.8, "medium_prob": 0.9}))
+    check("中门槛高于强门槛：拒绝，整批不存", e and "中门槛" in e and S.get("recall")["medium_prob"] == 0.5, e)
+    check("超出范围：拒绝", "之间" in (err(lambda: S.update("recall", {"t_high": 1.5})) or ""))
+    check("整数参数填小数：拒绝", "整数" in (err(lambda: S.update("recall", {"max_picks": 2.5})) or ""))
+    check("不认识的参数：拒绝", "没有这个参数" in (err(lambda: S.update("recall", {"foo": 1})) or ""))
+    check("空字符串：拒绝", err(lambda: S.update("recall", {"t_high": ""})) is not None
+          and err(lambda: S.update("recall", {"rerank_model": "  "})) is not None)
+    S.update("recall", {"t_high": 0.9, "t_low": 0.8})
+    e = err(lambda: S.reset("recall", ["t_high"]))
+    check("恢复默认后会冲突（强门槛 0.75 < 中门槛 0.8）：拒绝、不改", e and S.get("recall")["t_high"] == 0.9, e)
+    v = S.reset("recall", ["t_high", "t_low"])
+    check("恢复单项", v["t_high"] == D.T_HIGH and v["t_low"] == D.T_LOW and v["medium_prob"] == 0.5, v)
+
+    # 召回编排用上 Dashboard 的参数
+    S.update("recall", {"t_high": 0.95, "medium_prob": 0, "serendipity_prob": 0, "rerank_enabled": False,
+                        "rerank_model": "test-rerank"})
+
+    async def fake_embed(q):
+        return [0.1] * 4
+
+    async def fake_fts(q, n=30):
+        return [(3, 3.0)]
+
+    async def fake_rerank(q, docs):
+        return [0.9 for _ in docs], {"model": "fake", "ok": True, "ms": 5}
+
+    coll = FakeCollection({3: 0.82})   # 3 号前面没被注入过，不受冷却影响
+    req = {"session_id": "conv_s", "user_text": "下雨了，想起那首歌", "backend": "api", "shadow": True}
+    res = asyncio.run(orchestrator.compose_turn(req, coll, embed_fn=fake_embed, rerank_fn=fake_rerank, fts_fn=fake_fts,
+                                                rng=random.Random(1)))
+    t = traces.get_trace(res["trace_id"])
+    check("强门槛调到 0.95：0.9 分只算中层；中层概率 0：不注入", res["picks"] == [] and t["decision"]["gate"] == "medium_closed"
+          and t["decision"]["params"]["t_high"] == 0.95, t["decision"])
+    res = asyncio.run(orchestrator.compose_turn({**req, "session_id": "conv_s2"}, coll, embed_fn=fake_embed, fts_fn=fake_fts,
+                                                rng=random.Random(1)))
+    t = traces.get_trace(res["trace_id"])
+    check("精排开关和模型也用 Dashboard 的", t["rerank"]["model"] == "test-rerank" and t["rerank"]["ok"] is False
+          and t["rerank"]["error"] == "未启用" and t["decision"]["basis"] == "vec_sim", t["rerank"])
+    v = S.reset("recall")
+    check("全部恢复默认", v == {x["key"]: x["default"] for x in S.SPECS["recall"]} and S.describe("recall")["updated_at"] is None)
+
+
 def main():
     try:
         test_intent()
         test_cards()
         test_decide()
         test_e2e()
+        test_settings()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

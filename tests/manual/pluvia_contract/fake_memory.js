@@ -12,6 +12,10 @@ app.get('/config/chat_targets', (q, r) => r.json({ targets: [
   { id: 2, name: 'backup', base_url: 'http://127.0.0.1:3997/backup/v1', api_key: 'k2', models: ['vendor/fake.model:batch', 'vendor/fake.model'], active: false },
   { id: 3, name: 'other', base_url: 'http://127.0.0.1:3997/other/v1', api_key: 'k3', models: ['some-other-model'], active: false }
 ] }));
+// 辅助请求指定的模型：测试脚本用 POST /_test/aux 设置（body 为空对象就是清除），再调网关的 /reload-config
+let auxTarget = { configured: false };
+app.get('/config/aux_target', (q, r) => r.json(auxTarget));
+app.post('/_test/aux', (q, r) => { auxTarget = q.body && q.body.base_url ? { configured: true, ...q.body } : { configured: false }; r.json({ ok: true }); });
 app.get('/last_session', (q, r) => r.json({ last_ts: '2026-10-14 01:00:00' }));
 app.post('/search', (q, r) => {
   log('search', q.body);
