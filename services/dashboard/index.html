@@ -140,6 +140,7 @@
             <button class="tab" onclick="showPanel('profile')">画像</button>
             <button class="tab" onclick="showPanel('custom_prompt')">交互偏好</button>
             <button class="tab" onclick="showPanel('pipeline')">记忆管线</button>
+            <button class="tab" onclick="showPanel('recall')">召回对比</button>
             <button class="tab" onclick="showPanel('extraction')">记忆提取</button>
             <button class="tab" onclick="showPanel('narrative')">共同经历</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
@@ -329,6 +330,27 @@
                 <tbody id="jobs-table"></tbody>
             </table>
             </div>
+        </div>
+
+        <!-- 召回对比（Phase 2 影子模式）-->
+        <div id="recall" class="panel">
+            <h3>召回对比（影子模式）</h3>
+            <p style="font-size:13px;color:#666;line-height:1.7;margin:8px 0 14px;">每一轮聊天，网关照旧用现在的浮现逻辑；新的召回编排在旁边也算一遍，只记录、不注入。这里对比两边各会想起什么。<br>新逻辑：识别意图 → 向量 + 关键词检索 → 精排打分 → 分成强 / 中 / 回忆 / 无由来 → 冷却。点一行看详细过程。</p>
+            <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));">
+                <div class="stat-card"><div class="number" id="rc-turns">-</div><div class="label">近 7 天的轮数</div></div>
+                <div class="stat-card"><div class="number" id="rc-legacy">-</div><div class="label">旧逻辑注入了的</div></div>
+                <div class="stat-card"><div class="number" id="rc-new">-</div><div class="label">新逻辑会注入的</div></div>
+                <div class="stat-card"><div class="number" id="rc-rerank">-</div><div class="label">精排成功</div></div>
+                <div class="stat-card"><div class="number" id="rc-p50">-</div><div class="label">耗时 p50 / p90（毫秒）</div></div>
+            </div>
+            <div style="margin:10px 0;"><button class="btn btn-small" onclick="loadRecall()">刷新</button><span id="rc-intents" style="font-size:12px;color:#666;margin-left:10px;"></span></div>
+            <div style="overflow-x:auto;">
+            <table class="extraction-table">
+                <thead><tr><th>时间</th><th>这一轮的话</th><th>意图</th><th>旧逻辑</th><th>新逻辑</th><th>耗时</th></tr></thead>
+                <tbody id="rc-table"></tbody>
+            </table>
+            </div>
+            <div id="rc-detail" style="display:none;margin-top:16px;padding:14px;background:#f8f8f8;border-radius:8px;font-size:13px;line-height:1.7;"></div>
         </div>
 
         <!-- Extraction 页面 -->
@@ -649,6 +671,7 @@
             if (name === 'anchors') loadAnchors();
             if (name === 'logs') loadLogs();
             if (name === 'pipeline') { loadPipeline(); loadJobs(); }
+            if (name === 'recall') loadRecall();
             if (name === 'extraction') loadExtraction();
             if (name === 'narrative') loadNarrative();
             if (name === 'summary') loadSummary();
@@ -1314,6 +1337,89 @@ function rebuildProfile() {
                 msg.textContent = d.message || '';
                 msg.style.color = d.status === 'ok' ? '#28a745' : '#dc3545';
                 loadJobs();
+            });
+        }
+
+        // ============ 召回对比（Phase 2 影子模式）============
+        var RC_INTENT = { recall: '回忆', fact: '事实', task: '任务', emotion: '情绪', greeting: '寒暄', followup: '追问', normal: '普通' };
+        var RC_TIER = { strong: '强', medium: '中', recall: '回忆', serendipity: '无由来' };
+
+        function rcPicks(list, withTier) {
+            return (list || []).map(function(p) {
+                var tag = '';
+                if (withTier) {
+                    tag = '<span class="status-badge status-partial" style="margin-right:4px;">' + (RC_TIER[p.tier] || p.tier)
+                        + (p.score != null ? ' ' + Number(p.score).toFixed(2) : '') + '</span>';
+                }
+                return '<div>' + tag + escapeHtml(p.content || ('#' + p.id)) + '</div>';
+            }).join('');
+        }
+
+        function rcLegacyCell(lg) {
+            if (!lg) return '<span style="color:#aaa;">（没有记录）</span>';
+            if (lg.picked && lg.picked.length) return rcPicks(lg.picked, false);
+            if (lg.gate === 'closed') return '<span style="color:#aaa;">30% 门控没开</span>';
+            if (lg.trivial) return '<span style="color:#aaa;">太短，不召回</span>';
+            return '<span style="color:#aaa;">门控开了，没有过门槛的</span>';
+        }
+
+        function rcNewCell(t) {
+            if (t.new && t.new.length) return rcPicks(t.new, true);
+            var g = t.new_gate || '';
+            if (g === 'greeting') return '<span style="color:#aaa;">寒暄，不召回</span>';
+            if (g === 'medium_closed') return '<span style="color:#aaa;">有中层候选，这次没抽中</span>';
+            return '<span style="color:#aaa;">没有够相关的</span>';
+        }
+
+        function loadRecall() {
+            fetch(API + '/recall/stats').then(function(r) { return r.json(); }).then(function(s) {
+                document.getElementById('rc-turns').textContent = s.turns;
+                document.getElementById('rc-legacy').textContent = s.legacy_inject_turns;
+                document.getElementById('rc-new').textContent = s.new_inject_turns;
+                document.getElementById('rc-rerank').textContent = s.rerank_tried_turns ? (s.rerank_ok_turns + '/' + s.rerank_tried_turns) : '-';
+                document.getElementById('rc-p50').textContent = s.latency_p50 == null ? '-' : (s.latency_p50 + ' / ' + s.latency_p90);
+                var parts = [];
+                for (var k in (s.intents || {})) parts.push((RC_INTENT[k] || k) + ' ' + s.intents[k]);
+                document.getElementById('rc-intents').textContent = parts.length ? '意图分布：' + parts.join('，') : '';
+            });
+            fetch(API + '/recall/traces?limit=50').then(function(r) { return r.json(); }).then(function(d) {
+                var html = '';
+                (d.traces || []).forEach(function(t) {
+                    html += '<tr style="cursor:pointer;" onclick="showRecallTrace(' + t.id + ')">'
+                        + '<td style="white-space:nowrap;">' + formatTime(t.created_at) + '</td>'
+                        + '<td style="max-width:220px;word-break:break-all;">' + escapeHtml(t.user_text) + '</td>'
+                        + '<td>' + (RC_INTENT[t.intent] || t.intent || '') + '</td>'
+                        + '<td style="max-width:260px;">' + rcLegacyCell(t.legacy) + '</td>'
+                        + '<td style="max-width:300px;">' + rcNewCell(t) + (t.basis === 'vec_sim' && t.intent !== 'greeting' ? '<div style="color:#c77;font-size:11px;">精排不可用，用了向量相似度</div>' : '') + '</td>'
+                        + '<td>' + (t.latency == null ? '' : t.latency + 'ms') + '</td></tr>';
+                });
+                document.getElementById('rc-table').innerHTML = html || '<tr><td colspan="6" style="text-align:center;color:#888;">还没有记录。聊几句之后再来看。</td></tr>';
+            });
+        }
+
+        function showRecallTrace(id) {
+            fetch(API + '/recall/traces/' + id).then(function(r) { return r.json(); }).then(function(t) {
+                var sn = t.snippets || {}, dec = t.decision || {}, rr = t.rerank || {}, ch = t.channels || {}, lg = t.legacy || {};
+                var name = function(i) { var s = sn[String(i)]; return s ? escapeHtml(s.content) : ('#' + i); };
+                var html = '<div style="display:flex;justify-content:space-between;"><b>第 ' + t.id + ' 轮的详细过程</b>'
+                    + '<a href="javascript:void(0)" onclick="document.getElementById(\'rc-detail\').style.display=\'none\'">收起</a></div>';
+                html += '<div>检索用的文本：' + escapeHtml(t.query || '') + '</div>';
+                html += '<div>意图：' + (RC_INTENT[(t.intent || {}).type] || '') + ((t.intent || {}).matched ? '（命中「' + escapeHtml(t.intent.matched) + '」）' : '') + '</div>';
+                html += '<div>精排：' + (rr.skipped ? escapeHtml(rr.skipped) : (rr.ok ? (escapeHtml(rr.model || '') + '，' + rr.ms + 'ms') : ('失败：' + escapeHtml(rr.error || '') + '，改用向量相似度'))) + '</div>';
+                html += '<div style="margin-top:8px;"><b>候选（按精排分）</b></div><table class="extraction-table"><thead><tr><th>记忆</th><th>精排</th><th>向量</th></tr></thead><tbody>';
+                (dec.candidates || []).forEach(function(c) {
+                    html += '<tr><td>' + name(c.id) + '</td><td>' + (c.rerank == null ? '-' : Number(c.rerank).toFixed(3)) + '</td><td>' + (c.vec_sim == null ? '-' : Number(c.vec_sim).toFixed(3)) + '</td></tr>';
+                });
+                html += '</tbody></table>';
+                if ((dec.dropped || []).length) html += '<div>被冷却拿掉的：' + dec.dropped.map(function(x) { return name(x.id) + '（' + escapeHtml(x.reason) + '）'; }).join('；') + '</div>';
+                html += '<div style="margin-top:8px;"><b>新逻辑会注入的文字</b></div><pre style="white-space:pre-wrap;background:#fff;padding:8px;border-radius:6px;">' + (escapeHtml(t.card || '') || '（不注入）') + '</pre>';
+                if (lg.candidates && lg.candidates.length) {
+                    html += '<div><b>旧逻辑的候选（向量相似度，门槛 0.55）</b>：' + lg.candidates.map(function(c) { return name(c[0]) + ' ' + Number(c[1]).toFixed(3); }).join('；') + '</div>';
+                }
+                var el = document.getElementById('rc-detail');
+                el.innerHTML = html;
+                el.style.display = 'block';
+                el.scrollIntoView({ behavior: 'smooth' });
             });
         }
 

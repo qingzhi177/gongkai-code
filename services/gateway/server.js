@@ -27,6 +27,9 @@ const SHOW_COUNT_WEIGHTS = [
   { value: 2, weight: 0.2 }   // 20% 显示 2 条
 ];
 const SESSION_GAP_THRESHOLD_HOURS = 4;   // 会话间隔感知阈值
+// Phase 2 影子模式：每一轮把用户的话和这里旧逻辑的决定发给记忆服务的 /compose/turn，
+// 让新的召回编排也算一遍（只记录、不注入），在 Dashboard「召回对比」里对比。GATEWAY_COMPOSE_SHADOW=off 可以关掉。
+const COMPOSE_SHADOW = String(process.env.GATEWAY_COMPOSE_SHADOW || 'on').trim().toLowerCase() !== 'off';
 
 // bug修复：工具回环短路时不请求上游、没有真实 usage。缓存上一轮真实回答的 usage（按 conv_id），
 // 回环时取出返回，避免 Kelivo 把已显示的 token 数用 0 覆盖（工具场景显示 0 的根因）。
@@ -972,24 +975,31 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
   if (sessionNote) headerLines.push(`[${sessionNote}]`);
   const header = headerLines.join('\n');
 
+  // 影子对比：记下旧逻辑这一轮的决定，在每个出口发给 /compose/turn（不等结果，不影响这一轮）
+  const legacy = { gate: 'closed', picked: [], candidates: [], passed: [], serendipity: null, trivial: false };
+  const done = (text) => { shadowCompose(userMessage, convId, menuCtx, legacy); return text; };
+
   // 4. 随机门控：是否开放回忆？
   if (Math.random() > SURFACE_PROBABILITY) {
-    return header + '\n';
+    return done(header + '\n');
   }
+  legacy.gate = 'open';
 
   // 5. 主通道：相关度驱动
-  let selectedMemories = await relevanceDrivenSurfacing(userMessage);
+  let selectedMemories = await relevanceDrivenSurfacing(userMessage, legacy);
 
   // 6. 并行通道：无由来浮现
   if (Math.random() < SERENDIPITY_PROBABILITY) {
     const serendipityMemory = await serendipitousSurfacing(convId);
     if (serendipityMemory) {
+      legacy.serendipity = serendipityMemory.id;
       // 无由来浮现优先，但总数不超过 2 条
       selectedMemories = [serendipityMemory, ...selectedMemories].slice(0, 2);
     }
   }
 
-  if (selectedMemories.length === 0) return header + '\n';
+  legacy.picked = selectedMemories.map(m => m.id);
+  if (selectedMemories.length === 0) return done(header + '\n');
 
   // 7. 格式化为自然语言念头
   const formattedMemories = formatMemoriesAsThoughts(selectedMemories);
@@ -1000,15 +1010,45 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
   if (menuCtx) menuCtx.shownIds = shownIds;
   else await updateDisplayMetrics(shownIds);
 
-  return header + formattedMemories;
+  return done(header + formattedMemories);
+}
+
+// Phase 2 影子模式：把这一轮也交给记忆服务的召回编排算一遍（只记录轨迹、不注入），不等结果
+function shadowCompose(userMessage, convId, menuCtx, legacy) {
+  if (!COMPOSE_SHADOW || !userMessage || (menuCtx && menuCtx.skipShadow)) return;
+  const ctx = (menuCtx && menuCtx.shadow) || {};
+  const norm = id => String(id).replace(/^l1_/, '');
+  axios.post(`${MEMORY_SERVICE_URL}/compose/turn`, {
+    session_id: convId || '', user_text: userMessage,
+    prev_user: ctx.prevUser || '', prev_assistant: ctx.prevAssistant || '',
+    turn_key: ctx.turnKey || undefined, backend: 'api', client: ctx.client || '', shadow: true,
+    legacy: { ...legacy, picked: legacy.picked.map(norm), passed: legacy.passed.map(norm),
+      serendipity: legacy.serendipity == null ? null : norm(legacy.serendipity) },
+  }, { timeout: 15000 }).catch(e => console.log('[SHADOW] compose/turn 失败:', e.message));
+}
+
+// 影子对比用的上文：上一条用户消息、AI 上一条回复（「然后呢」这类短消息要靠它们检索）
+function shadowContext(req, lastUserIdx, pv, convId) {
+  const msgs = memoryMessages(req);
+  let prevUser = '', prevAssistant = '';
+  for (let i = lastUserIdx - 1; i >= 0; i--) {
+    const m = msgs[i];
+    if (!m) continue;
+    if (!prevAssistant && m.role === 'assistant') prevAssistant = toPlainText(m.content).slice(0, 300);
+    else if (!prevUser && m.role === 'user') prevUser = memoryText(req, m.content).slice(0, 300);
+    if (prevUser && prevAssistant) break;
+  }
+  const turnId = pv && pv.turn && pv.turn.id;
+  return { prevUser, prevAssistant, turnKey: turnId ? `${convId}:${turnId}` : null,
+    client: String(req.headers['x-client-name'] || (pv ? 'pluvia' : 'kelivo')) };
 }
 
 // 相关度驱动的记忆浮现（主通道）
-async function relevanceDrivenSurfacing(userMessage) {
+async function relevanceDrivenSurfacing(userMessage, legacy) {
   // 寒暄/极短回复（"嗯嗯""好呀""哈哈"）不走相关度召回：这类消息几乎和任何记忆都"有点像"
   // （实测"嗯嗯"的 vec_sim 也能到 0.5 左右），召回出来只会显得突兀。无由来浮现通道不受影响。
   const core = String(userMessage || '').replace(/[\s\p{P}\p{S}~～]/gu, '');
-  if (core.length <= 3) return [];
+  if (core.length <= 3) { if (legacy) legacy.trivial = true; return []; }
   try {
     const res = await axios.post(`${MEMORY_SERVICE_URL}/search`, {
       query: userMessage,
@@ -1021,6 +1061,7 @@ async function relevanceDrivenSurfacing(userMessage) {
     // 校准用日志：只记 id 和分数，不记内容
     console.log('[SURFACE] 候选 vec_sim:', memories.slice(0, 8).map(m => `${m.id}=${m.vec_sim}`).join(' '),
       '| 门槛', SURFACE_MIN_SIM);
+    if (legacy) legacy.candidates = memories.slice(0, 8).map(m => [String(m.id).replace(/^l1_/, ''), m.vec_sim]);
     memories = memories.filter(m => typeof m.vec_sim === 'number' && m.vec_sim >= SURFACE_MIN_SIM);
 
     // 冷却过滤
@@ -1031,6 +1072,7 @@ async function relevanceDrivenSurfacing(userMessage) {
       if (!lastShown) return true;
       return (now - lastShown) >= cooldownMs;
     });
+    if (legacy) legacy.passed = memories.map(m => m.id);
 
     if (memories.length === 0) return [];
 
@@ -2272,7 +2314,9 @@ async function chatCompletionsMain(req, res) {
     }
 
     // 获取画像、记忆目录、Shared Narrative、Recent Summary、Custom Prompt（含时间锚点 + 会话间隔感知）
-    const menuCtx = { shownIds: [] };   // 本轮浮现的记忆 id，回复成功后再计入展示指标
+    // shownIds：本轮浮现的记忆 id，回复成功后再计入展示指标；shadow：影子对比用的上文（Phase 2）
+    const menuCtx = { shownIds: [], skipShadow: isTitleGenerationRequest(req),
+      shadow: shadowContext(req, lastUserIdx, pv, convIdForMenu) };
     const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
       getProfile(),
       pvContinuing ? Promise.resolve('')

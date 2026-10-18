@@ -455,6 +455,28 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(r1.status === 403 && r2.status === 403 && r3.status === 200, 'T23', [r1.status, r2.status, r3.status]);
   }
 
+  console.log('T24 影子对比：每轮把用户的话和旧逻辑的决定发给 /compose/turn（不影响回复）');
+  {
+    const tail = '（此刻：10月16日 周五 21:30）';
+    const m = mark();
+    const r = await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sh',
+      pluvia: { v: '0.2', client: 'pluvia', turn: { id: 'tsh1', round: 1 }, tail },
+      messages: [{ role: 'user', content: '早 [A]' }, { role: 'assistant', content: '早呀' }, { role: 'user', content: '你好 [A]\n\n' + tail }] });
+    const s = oaSummary(await sseCollect(r)); await sleep(400);
+    const comp = since(m).mem.filter(x => x.k === 'compose');
+    const c = comp[0] && comp[0].b;
+    ok(s.text === '你好呀' && comp.length === 1, 'T24 回复照常，发了一次 compose', { text: s.text, n: comp.length });
+    ok(c && c.user_text === '你好 [A]' && c.prev_user === '早 [A]' && c.prev_assistant === '早呀' && c.session_id === 'conv-sh'
+      && c.turn_key === 'conv-sh:tsh1' && c.shadow === true && c.backend === 'api' && c.client === 'pluvia',
+      'T24 用户的话剥掉了「此刻」，带上文和 turn_key', c);
+    ok(c && c.legacy && ['open', 'closed'].includes(c.legacy.gate) && Array.isArray(c.legacy.picked), 'T24 带着旧逻辑这一轮的决定', c && c.legacy);
+    const m2 = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sh', memory_skip: true,
+      pluvia: { v: '0.2', turn: { id: 'tsh2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '起个标题 [A]' }] }));
+    await sleep(300);
+    ok(since(m2).mem.filter(x => x.k === 'compose').length === 0, 'T24 不进记忆的请求（标题生成等）不发 compose');
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

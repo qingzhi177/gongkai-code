@@ -33,6 +33,8 @@ from app.llm import get_model_config
 from app.pipeline.summary import get_summary_pending
 from app.pipeline.narrative import NarrativeGenerateRequest, get_narrative_pending
 from app.pipeline import summary as summary_pipeline
+from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回编排（影子模式）
+from app.recall import traces as recall_traces
 
 load_dotenv()
 
@@ -2762,6 +2764,43 @@ async def jobs_dismiss(job_id: int):
     """忽略失败的任务（不再显示在「失败」里）"""
     ok = jobs.dismiss(SQLITE_PATH, job_id)
     return {"status": "ok" if ok else "error", "message": "已忽略" if ok else "只有失败的任务可以忽略"}
+
+# ============ 召回编排（Phase 2；现在是影子模式，见 app/recall/）============
+
+class ComposeTurnRequest(BaseModel):
+    session_id: str = ""
+    conv_id: str = ""
+    user_text: str = ""
+    prev_user: str = ""
+    prev_assistant: str = ""
+    turn_key: Optional[str] = None
+    backend: str = "api"
+    client: str = ""
+    shadow: bool = True
+    legacy: Optional[dict] = None
+
+@app.post("/compose/turn")
+async def compose_turn_api(req: ComposeTurnRequest):
+    """每一轮聊天调一次：算出这一轮会想起什么。影子模式下只记录轨迹（recall_traces）、不返回注入内容。"""
+    try:
+        return await recall_orchestrator.compose_turn(_model_dict(req), collection=l1_collection)
+    except Exception as e:
+        logger.error(f"[RECALL] compose_turn 出错：{e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+
+@app.get("/recall/traces")
+async def recall_traces_list(limit: int = 50, session_id: Optional[str] = None):
+    """最近的召回轨迹（Dashboard「召回对比」）"""
+    return {"traces": recall_traces.list_traces(limit=limit, session_id=session_id)}
+
+@app.get("/recall/traces/{trace_id}")
+async def recall_trace_detail(trace_id: int):
+    t = recall_traces.get_trace(trace_id)
+    return t if t else JSONResponse({"error": "not found"}, status_code=404)
+
+@app.get("/recall/stats")
+async def recall_stats(days: int = 7):
+    return recall_traces.stats(days=days)
 
 # ============ Pipeline Status API ============
 

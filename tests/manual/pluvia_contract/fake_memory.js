@@ -27,5 +27,6 @@ app.get('/conv/:id/settings', (q, r) => r.json({}));
 app.post('/save_conversation', (q, r) => { log('save', q.body); r.json({ status: 'ok' }); });
 app.post('/thinking', (q, r) => { log('thinking', q.body); r.json({ ok: true }); });
 app.delete('/l0/conversation/:id', (q, r) => { log('delete', { id: q.params.id }); r.json({ status: 'ok', l1_removed: 2 }); });
+app.post('/compose/turn', (q, r) => { log('compose', q.body); r.json({ mode: 'shadow', card: '', picks: [] }); });
 app.use((q, r) => { log('other', { path: q.path, method: q.method }); r.json({ status: 'ok' }); });
 app.listen(3998, '127.0.0.1', () => console.log('fake memory on 3998'));
