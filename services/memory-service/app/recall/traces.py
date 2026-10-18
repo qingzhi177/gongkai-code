@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import timeutil
 from app.config import get_conn
+from app.recall import golden
 
 COLS = ("id", "turn_key", "backend", "session_id", "client", "mode", "query", "user_text", "intent", "channels",
         "rerank", "decision", "card", "legacy", "injected_chars", "latency", "created_at")
@@ -47,6 +48,7 @@ def list_traces(limit=50, session_id=None):
             lg = t.get("legacy") or {}
             ids |= {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
         snip = _snippets(conn, ids, n=40)
+        labeled = golden.label_counts(conn, [t["id"] for t in items])
     finally:
         conn.close()
     out = []
@@ -64,6 +66,7 @@ def list_traces(limit=50, session_id=None):
                        "trivial": lg.get("trivial")} if lg else None,
             "rerank_ok": bool((t.get("rerank") or {}).get("ok")),
             "latency": (t.get("latency") or {}).get("total"),
+            "labeled": labeled.get(t["id"], 0),
         })
     return out
 
@@ -82,6 +85,9 @@ def get_trace(trace_id):
         lg = t.get("legacy") or {}
         ids |= {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
         ids |= {int(c[0]) for c in lg.get("candidates", []) if isinstance(c, list) and str(c[0]).isdigit()}
+        labels = golden.labels_for(conn, trace_id)
+        ids |= {i for i in labels if i}
+        t["labels"] = {str(k): v for k, v in labels.items()}
         t["snippets"] = {str(k): v for k, v in _snippets(conn, ids, n=120).items()}
         return t
     finally:

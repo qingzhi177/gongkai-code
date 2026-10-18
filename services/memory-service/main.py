@@ -35,6 +35,7 @@ from app.pipeline.narrative import NarrativeGenerateRequest, get_narrative_pendi
 from app.pipeline import summary as summary_pipeline
 from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回编排（影子模式）
 from app.recall import traces as recall_traces
+from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 
 load_dotenv()
@@ -2831,6 +2832,35 @@ async def reset_recall_settings(req: SettingsReset):
     except ValueError as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
     return {"status": "ok", **app_settings.describe("recall")}
+
+class RecallLabelRequest(BaseModel):
+    trace_id: int
+    item_id: int = 0                # 0 = 整轮
+    label: Optional[str] = None     # should / should_not / none；空 = 清除
+
+@app.post("/recall/labels")
+async def set_recall_label(req: RecallLabelRequest):
+    """黄金集标注：某条候选「该想起 / 不该想起」，或整轮「什么都不该想起」。返回这一轮现在的全部标注。"""
+    try:
+        labels = recall_golden.set_label(req.trace_id, req.item_id, req.label)
+    except LookupError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=404)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", "labels": {str(k): v for k, v in labels.items()}}
+
+@app.get("/recall/calibration")
+async def recall_calibration():
+    """按黄金集标注算各个门槛的命中率 / 误浮现率、排序质量，够数时给出建议门槛（只用存下的精排分，不花钱）"""
+    cal = recall_golden.calibration()
+    cur = app_settings.get("recall")
+    cal["current"] = {"t_high": cur["t_high"], "t_low": cur["t_low"], "rerank_model": cur["rerank_model"]}
+    return cal
+
+@app.get("/recall/labels/export")
+async def export_recall_labels():
+    """导出黄金集（JSON）。只给你自己留档，不要放进公开仓库。"""
+    return recall_golden.export()
 
 # ============ Pipeline Status API ============
 

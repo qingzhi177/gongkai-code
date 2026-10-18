@@ -22,7 +22,7 @@ sys.path.insert(0, str(HERE.parent.parent / "services" / "memory-service"))
 import db  # noqa: E402
 from app import config  # noqa: E402
 from app import settings as S  # noqa: E402
-from app.recall import cards, decide as D, intent, orchestrator, traces  # noqa: E402
+from app.recall import cards, decide as D, golden as G, intent, orchestrator, traces  # noqa: E402
 
 PASS = FAIL = 0
 
@@ -280,6 +280,74 @@ def test_settings():
     check("全部恢复默认", v == {x["key"]: x["default"] for x in S.SPECS["recall"]} and S.describe("recall")["updated_at"] is None)
 
 
+# ---------- 6. 黄金集标注和门槛校准 ----------
+def mk_trace(cands, rerank_ok=True, user_text="测试"):
+    import json as _j
+    conn = config.get_conn()
+    rr = {"ok": True} if rerank_ok is True else ({"skipped": "寒暄或空消息"} if rerank_ok == "skip" else {"ok": False})
+    cur = conn.execute(
+        "INSERT INTO recall_traces (turn_key, backend, session_id, mode, query, user_text, intent, rerank, decision, created_at) "
+        "VALUES ('k', 'api', 'gold', 'shadow', ?, ?, '{}', ?, ?, '2026-10-19 00:00:00')",
+        (user_text, user_text, _j.dumps(rr), _j.dumps({"candidates": [{"id": i, "rerank": sc} for i, sc in cands]})))
+    conn.commit()
+    tid = cur.lastrowid
+    conn.close()
+    return tid
+
+
+def test_golden():
+    print("\n[6] 黄金集：标注、校准、导出")
+
+    def err(fn):
+        try:
+            fn()
+            return None
+        except (ValueError, LookupError) as e:
+            return type(e).__name__
+
+    t0 = mk_trace([(1, 0.9), (2, 0.4)])
+    check("标注：该想起", G.set_label(t0, 1, "should") == {1: "should"})
+    check("标注：不该想起", G.set_label(t0, 2, "should_not") == {1: "should", 2: "should_not"})
+    check("整轮「什么都不该想起」会去掉「该想起」，保留「不该想起」", G.set_label(t0, 0, "none") == {0: "none", 2: "should_not"})
+    check("再标「该想起」会去掉整轮的「什么都不该想起」", G.set_label(t0, 1, "should") == {1: "should", 2: "should_not"})
+    check("清除", G.set_label(t0, 2, None) == {1: "should"})
+    check("参数不对：拒绝", err(lambda: G.set_label(t0, 1, "none")) == "ValueError"
+          and err(lambda: G.set_label(t0, 0, "should")) == "ValueError" and err(lambda: G.set_label(t0, 1, "maybe")) == "ValueError")
+    check("没有这一轮：拒绝", err(lambda: G.set_label(999999, 1, "should")) == "LookupError")
+    tr = traces.get_trace(t0)
+    check("轨迹详情带标注", tr["labels"] == {"1": "should"})
+    lst = {x["id"]: x for x in traces.list_traces(limit=300)}
+    check("列表里标了几条", lst[t0]["labeled"] == 1 and all(v["labeled"] == 0 for k, v in lst.items() if k != t0))
+    G.set_label(t0, 1, None)
+
+    cal = G.calibration()
+    check("标注不够时不给建议", cal["suggest"]["ok"] is False and "再多标一些" in cal["suggest"]["reason"], cal["suggest"])
+
+    should = [0.9, 0.85, 0.8, 0.78, 0.7, 0.65, 0.6, 0.55, 0.5, 0.3]
+    neg = [0.2, 0.25, 0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.62, 0.66]
+    for k, (a, b) in enumerate(zip(should, neg)):
+        tid = mk_trace([(100 + k, a), (200 + k, b), (300 + k, 0.1)])
+        G.set_label(tid, 100 + k, "should")
+        G.set_label(tid, 200 + k, "should_not")
+    G.set_label(mk_trace([], rerank_ok="skip", user_text="嗯嗯"), 0, "none")       # 寒暄：本来就不检索，算反例
+    G.set_label(mk_trace([(400, 0.9)], rerank_ok=False), 400, "should")          # 精排失败的轮次不算
+    cal = G.calibration()
+    c = cal["counts"]
+    check("计数", c["turns"] == 12 and c["should"] == 10 and c["should_not"] == 10 and c["none_turns"] == 1 and c["skipped"] == 1, c)
+    row = {r["t"]: r for r in cal["rows"]}
+    check("命中率 / 误浮现率", row[0.65]["hit"] == 0.6 and row[0.65]["fp"] == round(1 / 11, 3)
+          and row[0.55]["hit"] == 0.8 and row[0.3]["hit"] == 1.0, [row[0.55], row[0.65]])
+    sg = cal["suggest"]
+    check("建议门槛：强 0.65（误浮现 ≤ 10% 的最低值）、中 0.55（命中率 ≥ 80% 的最高值）",
+          sg["ok"] and sg["t_high"] == 0.65 and sg["t_low"] == 0.55 and sg["notes"] == [], sg)
+    q = cal["quality"]
+    expect_mrr = round((sum(1.0 for a, b in zip(should, neg) if a >= b) + sum(0.5 for a, b in zip(should, neg) if a < b)) / 10, 3)
+    check("排序质量：前 5 命中、MRR", q["recall_at_5"] == 1.0 and q["mrr"] == expect_mrr, q)
+    ex = G.export()
+    check("导出", len(ex["items"]) == 12 and sum(1 for i in ex["items"] if i["nothing"]) == 1
+          and any(i["should"] and i["should_not"] for i in ex["items"]), len(ex["items"]))
+
+
 def main():
     try:
         test_intent()
@@ -287,6 +355,7 @@ def main():
         test_decide()
         test_e2e()
         test_settings()
+        test_golden()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")
