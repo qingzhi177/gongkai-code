@@ -143,6 +143,7 @@
             <button class="tab" onclick="showPanel('recall')">召回对比</button>
             <button class="tab" onclick="showPanel('extraction')">记忆提取</button>
             <button class="tab" onclick="showPanel('narrative')">共同经历</button>
+            <button class="tab" onclick="showPanel('episodes')">每日片段</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -421,6 +422,28 @@
             </div>
         </div>
 
+        <!-- 每日片段（Phase 4 第一步）-->
+        <div id="episodes" class="panel">
+            <h3>每日片段</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                每天把聊天整理成几段「我们的经历」，每个具体细节都标了出处，可以点开对照原文；对不上原文的句子会被自动删掉。
+                凌晨 4 点前算前一天；一天结束（或者安静 6 小时）以后自动整理，之后又有新消息就重新整理那一天。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后它是主题卷、章节、近七天摘要的素材。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="ep-enabled" onchange="setEpisodesEnabled(this.checked)"> 自动整理</label>
+                <button class="btn" onclick="settleEpisodes(null)">整理全部待整理的天</button>
+                <button class="btn" onclick="loadEpisodes()" style="background:#6c757d;">刷新</button>
+                <span id="ep-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="ep-days" style="margin-bottom:18px;"></div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                <h4 style="margin:0;" id="ep-list-title">全部片段</h4>
+                <a href="javascript:void(0)" id="ep-show-all" style="font-size:12px;display:none;" onclick="loadEpisodeList(null)">看全部</a>
+            </div>
+            <div id="ep-list"></div>
+        </div>
+
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
             <h3>近期摘要</h3>
@@ -689,6 +712,7 @@
             if (name === 'recall') loadRecall();
             if (name === 'extraction') loadExtraction();
             if (name === 'narrative') loadNarrative();
+            if (name === 'episodes') loadEpisodes();
             if (name === 'summary') loadSummary();
         }
 
@@ -1293,7 +1317,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1309,6 +1333,7 @@ function rebuildProfile() {
                 return s;
             }
             if (j.kind === 'profile_rebuild' && r.status === 'ok') return '完成（' + (r.batches || 0) + ' 批 · ' + (r.chars || 0) + ' 字）';
+            if (j.kind === 'settle_day' && r.status === 'ok') return r.day + '：' + (r.sessions || 0) + ' 段对话 · 写了 ' + (r.episodes || 0) + ' 个片段';
             return r.message || (r.status === 'ok' ? '完成' : (r.status || '完成'));
         }
 
@@ -1657,6 +1682,99 @@ function rebuildProfile() {
 
         // ============ Narrative 相关函数 ============
         var currentNarrativeId = null;
+
+        // ============ 每日片段 ============
+        var epCurrentDay = null;
+
+        function loadEpisodes() {
+            fetch(API + '/episodes/days').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('ep-enabled').checked = !!d.enabled;
+                var days = d.days || [];
+                var pend = days.filter(function(x) { return x.pending; }).length;
+                document.getElementById('ep-status').textContent = days.length ? ('共 ' + days.length + ' 天有聊天，' + (pend ? pend + ' 天待整理' : '都整理过了')) : '还没有聊天记录';
+                if (!days.length) { document.getElementById('ep-days').innerHTML = ''; return; }
+                var html = '<table><tr><th>日期</th><th>消息</th><th>状态</th><th>片段</th><th></th></tr>';
+                days.forEach(function(x) {
+                    var st, s = x.settled;
+                    if (!x.closed) st = '<span style="color:#888;">今天还没结束</span>';
+                    else if (x.pending && s) st = '<span style="color:#c77c00;">有新变化，待重新整理</span>';
+                    else if (x.pending) st = '<span style="color:#c77c00;">待整理</span>';
+                    else st = '<span style="color:#2e7d32;">已整理</span>' + (s.version > 1 ? '（第 ' + s.version + ' 版）' : '');
+                    var n = s ? (s.episodes || 0) : '';
+                    html += '<tr><td>' + x.day + '</td><td>' + x.messages + '</td><td>' + st
+                        + (s ? '<div style="font-size:11px;color:#999;">' + formatTime(s.settled_at) + '</div>' : '') + '</td>'
+                        + '<td>' + (n ? '<a href="javascript:void(0)" onclick="loadEpisodeList(\'' + x.day + '\')">' + n + ' 个</a>' : (s ? '0' : '')) + '</td>'
+                        + '<td><button class="btn" style="padding:3px 10px;font-size:12px;" onclick="settleEpisodes([\'' + x.day + '\'])">'
+                        + (s ? '重新整理' : '整理') + '</button></td></tr>';
+                });
+                document.getElementById('ep-days').innerHTML = html + '</table>';
+            }).catch(function(e) { document.getElementById('ep-status').textContent = '读取失败：' + e; });
+            loadEpisodeList(epCurrentDay);
+        }
+
+        function loadEpisodeList(day) {
+            epCurrentDay = day;
+            document.getElementById('ep-list-title').textContent = day ? (day + ' 的片段') : '全部片段';
+            document.getElementById('ep-show-all').style.display = day ? '' : 'none';
+            fetch(API + '/episodes' + (day ? '?day=' + day : '')).then(function(r) { return r.json(); }).then(function(d) {
+                var eps = d.episodes || [];
+                if (!eps.length) { document.getElementById('ep-list').innerHTML = '<div style="color:#888;font-size:13px;">还没有片段</div>'; return; }
+                var html = '';
+                eps.forEach(function(e) {
+                    var t1 = formatTime(e.start_ts), t2 = formatTime(e.end_ts);
+                    var span = t1 + ' – ' + (t2.substring(0, 10) === t1.substring(0, 10) ? t2.substring(11) : t2);
+                    html += '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:12px 14px;margin-bottom:10px;">'
+                        + '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;"><b>' + escapeHtml(e.title) + '</b>'
+                        + '<span style="font-size:12px;color:#888;">' + span + ' · 重要度 ' + (e.salience != null ? Number(e.salience).toFixed(1) : '-') + '</span></div>'
+                        + (e.mood ? '<div style="font-size:12px;color:#8e6bb8;margin:4px 0;">' + escapeHtml(e.mood) + '</div>' : '')
+                        + '<div style="margin:4px 0 6px;">' + (e.topics || []).map(function(t) {
+                            return '<span style="display:inline-block;font-size:11px;background:#f0f0f5;border-radius:10px;padding:1px 8px;margin:0 4px 2px 0;">' + escapeHtml(t) + '</span>'; }).join('') + '</div>'
+                        + '<div style="font-size:14px;line-height:1.8;white-space:pre-wrap;">' + escapeHtml(e.body) + '</div>'
+                        + '<div style="margin-top:6px;font-size:12px;"><a href="javascript:void(0)" onclick="toggleEpisodeSources(' + e.id + ')">出处和原文</a>'
+                        + ((e.issues || []).length ? ' · <span style="color:#c77c00;">校验时删掉了 ' + e.issues.length + ' 句</span>' : '') + '</div>'
+                        + '<div id="ep-src-' + e.id + '" style="display:none;margin-top:8px;"></div></div>';
+                });
+                document.getElementById('ep-list').innerHTML = html;
+            });
+        }
+
+        function toggleEpisodeSources(id) {
+            var el = document.getElementById('ep-src-' + id);
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.innerHTML = '<span style="color:#888;font-size:12px;">读取中…</span>';
+            fetch(API + '/episodes/' + id).then(function(r) { return r.json(); }).then(function(d) {
+                var html = '<div style="font-size:12px;color:#666;margin-bottom:4px;">带出处的原稿（[#n] 对应下面第 n 条原文）：</div>'
+                    + '<div style="font-size:13px;line-height:1.7;background:#f8f9fa;border-radius:6px;padding:8px 10px;white-space:pre-wrap;">' + escapeHtml(d.body_with_refs || '') + '</div>';
+                if ((d.issues || []).length) html += '<div style="font-size:12px;color:#c77c00;margin:6px 0;">校验删掉的句子：<br>' + d.issues.map(escapeHtml).join('<br>') + '</div>';
+                html += '<div style="font-size:12px;color:#666;margin:8px 0 4px;">原文：</div>';
+                (d.sources || []).forEach(function(s) {
+                    html += '<div style="font-size:12px;line-height:1.6;padding:3px 0;border-bottom:1px dashed #eee;">'
+                        + (s.n ? '<b>[#' + s.n + ']</b> ' : '') + '<span style="color:#888;">' + formatTime(s.ts) + ' ' + (s.role === 'user' ? '你' : '我') + '：</span>'
+                        + escapeHtml(s.content || '') + '</div>';
+                });
+                html += '<div style="font-size:11px;color:#aaa;margin-top:6px;">第 ' + d.version + ' 版 · ' + escapeHtml(d.model || '') + ' · ' + escapeHtml(d.prompt_version || '') + '</div>';
+                el.innerHTML = html;
+            }).catch(function(e) { el.textContent = '读取失败：' + e; });
+        }
+
+        function settleEpisodes(days) {
+            var body = days ? { days: days } : { pending: true };
+            document.getElementById('ep-status').textContent = '投递中…';
+            fetch(API + '/episodes/settle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    var q = d.queued || [];
+                    document.getElementById('ep-status').textContent = q.length ? ('已投递 ' + q.length + ' 天，正在后台一天一天整理（每天几十秒），稍后点「刷新」')
+                        : ((d.requested || []).length ? '这些天已经在排队了' : '没有待整理的天');
+                });
+        }
+
+        function setEpisodesEnabled(on) {
+            fetch(API + '/episodes/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    document.getElementById('ep-status').textContent = on ? '已开启自动整理' : '已关闭自动整理（还可以手动点「整理」）';
+                });
+        }
 
         function loadNarrative() {
             fetch(API + '/narrative/current').then(function(r) { return r.json(); }).then(function(d) {
@@ -2119,6 +2237,7 @@ function rebuildProfile() {
                     {key: 'embedding', label: '向量嵌入'},
                     {key: 'narrative', label: '共同经历叙事'},
                     {key: 'summary', label: '近期摘要'},
+                    {key: 'episode', label: '每日片段', hint: '不设置时用「共同经历叙事」的模型（那个也没设置就用「近期摘要」的）。要选写中文细腻、肯照原文引用的模型。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',
                      hint: '不设置时：用前端选的模型、走当前启用的中转。设置后，Pluvia 的翻译思考链这类小请求改走这里，可以选便宜、快的模型（OpenAI 格式和 Anthropic 格式的供应商都行）；它出错时会自动退回当前中转。选推理模型时，要确认它会把结果写在正文里（推理过程不会转发）。保存后立即生效。'}
                 ];

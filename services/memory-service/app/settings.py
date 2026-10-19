@@ -60,6 +60,10 @@ SPECS = {
         _item("rerank_timeout", float, R.RERANK_TIMEOUT, 0.3, 10.0, 0.1, "精排", "精排超时（秒）",
               "超过这个时间就放弃精排、改用向量相似度。"),
     ],
+    "episodes": [
+        _item("enabled", bool, True, None, None, None, "整理", "自动整理每日片段",
+              "每天把对话整理成片段（会调用模型，花一点点钱）。关掉以后只能手动点「整理」。"),
+    ],
 }
 
 TYPE_NAMES = {float: "float", int: "int", bool: "bool", str: "str"}

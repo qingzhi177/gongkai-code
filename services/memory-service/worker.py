@@ -207,6 +207,7 @@ def _check(result):
 def build_handlers():
     # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
+    from app.pipeline import episodes as episode_pipeline
     from app.pipeline import narrative as narrative_pipeline
     from app.pipeline import profile as profile_pipeline
     from app.pipeline import summary as summary_pipeline
@@ -224,7 +225,11 @@ def build_handlers():
     async def profile_rebuild(payload, job):
         return _check(await profile_pipeline.rebuild_profile())
 
-    return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild}
+    async def settle_day(payload, job):
+        return await episode_pipeline.settle_day(payload["day"])
+
+    return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
+            "settle_day": settle_day}
 
 
 def main():

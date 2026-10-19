@@ -38,6 +38,7 @@ from app.recall import traces as recall_traces
 from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
+from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2496,6 +2497,15 @@ async def enqueue_auto_jobs():
         job, created = _enqueue("extract", {"force": False})
         if created:
             queued.append("extract")
+        # 每日片段：过了日界（或安静 6 小时）、还没整理过（或整理后又有新消息）的天，按日期从早到晚投递
+        try:
+            if app_settings.get("episodes").get("enabled"):
+                days = episode_pipeline.enqueue_days(episode_pipeline.pending_days())
+                if days:
+                    queued += [f"settle_day:{d}" for d in days]
+                    logger.info(f"每日片段：投递整理 {', '.join(days)}")
+        except Exception as e:
+            logger.error(f"每日片段投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2555,7 +2565,8 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    msg = "检查已执行，" + ("已投递：" + "、".join(names.get(k, k) for k in queued) if queued else "没有需要新投递的任务")
+    label = lambda k: ("每日片段 " + k.split(":", 1)[1]) if k.startswith("settle_day:") else names.get(k, k)
+    msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
     return {"status": "ok", "message": msg, "queued": queued}
 
 @app.get("/auto/logs")
@@ -2887,6 +2898,42 @@ async def export_recall_labels():
     """导出黄金集（JSON）。只给你自己留档，不要放进公开仓库。"""
     return recall_golden.export()
 
+# ============ 每日片段（Phase 4 第一步；现在只生成、只在 Dashboard 上看，见 app/pipeline/episodes.py）============
+
+class SettleRequest(BaseModel):
+    days: List[str] = []
+    pending: bool = False      # true：整理所有待整理的天
+
+class EpisodeSettings(BaseModel):
+    enabled: bool
+
+@app.get("/episodes")
+async def episodes_list(day: Optional[str] = None, limit: int = 100):
+    return {"episodes": episode_pipeline.list_episodes(day=day, limit=limit)}
+
+@app.get("/episodes/days")
+async def episodes_days():
+    """每一天：消息数、整理状态、要不要整理；以及自动整理开没开"""
+    return {"days": episode_pipeline.day_overview(), "enabled": bool(app_settings.get("episodes").get("enabled"))}
+
+@app.post("/episodes/settle")
+async def episodes_settle(req: SettleRequest):
+    """手动整理某几天（或所有待整理的天）：投递 settle_day 任务，worker 按日期从早到晚一天一天做"""
+    days = episode_pipeline.pending_days() if req.pending else [d for d in req.days if re.match(r"^\d{4}-\d{2}-\d{2}$", d)]
+    days = sorted(set(days))
+    return {"status": "ok", "requested": days, "queued": episode_pipeline.enqueue_days(days, source="dashboard", skip_dead=False)}
+
+@app.put("/episodes/settings")
+async def episodes_settings(req: EpisodeSettings):
+    app_settings.update("episodes", {"enabled": req.enabled})
+    return {"status": "ok", "enabled": req.enabled}
+
+@app.get("/episodes/{episode_id}")
+async def episode_detail(episode_id: int):
+    """片段详情：带出处的原稿，以及出处对应的原文"""
+    e = episode_pipeline.get_episode(episode_id)
+    return e if e else JSONResponse({"error": "not found"}, status_code=404)
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -2930,7 +2977,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():
