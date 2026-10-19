@@ -23,6 +23,7 @@ ALIBABA_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 from vector_store import VectorCollection  # noqa: E402
 import timeutil  # noqa: E402  存储一律 UTC，给模型看时换算成用户时区
 import db  # noqa: E402  统一的数据库连接 + 迁移
+from app import branches as conv_branches  # noqa: E402  分支会话的上文
 l1_collection = VectorCollection(SQLITE_PATH, owner_type="l1")
 
 EXTRACT_PROMPT = '''你是一个记忆提取助手。这是一段私人对话的记忆提取，像给未来的自己写便签。
@@ -381,6 +382,14 @@ def get_pending_segments(force=False):
                 "SELECT id, role, content, ts FROM l0_messages WHERE conv_id=? AND status='active' AND id < ? "
                 "ORDER BY id DESC LIMIT ?", (conv_id, seg[0][0], CONTEXT_MESSAGES)
             ).fetchall()[::-1]
+            if len(ctx) < CONTEXT_MESSAGES:
+                # 分支会话的开头：自己前面没几句，从原会话的分支点往前补上文（app/branches.py）
+                anc = conv_branches.anchor(conn, conv_id)
+                if anc:
+                    ctx = conn.execute(
+                        "SELECT id, role, content, ts FROM l0_messages WHERE conv_id=? AND status='active' AND id <= ? "
+                        "ORDER BY id DESC LIMIT ?", (anc[0], anc[1], CONTEXT_MESSAGES - len(ctx))
+                    ).fetchall()[::-1] + ctx
             out.append((conv_id, client, ctx, seg))
         return out
     finally:

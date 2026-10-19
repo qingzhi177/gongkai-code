@@ -88,7 +88,7 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
   console.log('T1 能力协商');
   {
     const j = await (await fetch(GW + '/v1/pluvia/contract')).json();
-    ok(j.contract === '0.2' && ['turn', 'tail', 'client_tools', 'tool_events'].every(f => j.features.includes(f)), 'contract 0.2 + 四项 features', j);
+    ok(j.contract === '0.2' && ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of'].every(f => j.features.includes(f)), 'contract 0.2 + 五项 features', j);
   }
 
   console.log('T2 OpenAI 流式 + tail（含此刻/离上一句）');
@@ -558,6 +558,27 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     const ups = upReqs(since(m));
     ok(s.text === '备用中转回答' && ups.filter(x => !x._target).length === 1 && ups.some(x => x._target === 'backup'),
       'T26 主中转只试 1 次', ups.map(x => x._target || 'primary'));
+  }
+
+  console.log('T27 分支会话：pluvia.branch_of 透传给记忆服务（约定 12）');
+  {
+    const hist = [{ role: 'user', content: '早 [A]' }, { role: 'assistant', content: '早呀' }, { role: 'user', content: '换个说法 [A]' }];
+    const send = async (conv, tid, branch) => {
+      const m = mark();
+      const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: conv,
+        pluvia: { v: '0.2', turn: { id: tid, round: 1 }, tail: '', ...(branch !== undefined ? { branch_of: branch } : {}) }, messages: hist })));
+      await sleep(300);
+      return { s, sv: saves(since(m)) };
+    };
+    let r = await send('conv-br', 'tbr1', { conversation_id: 'conv-orig', turn_id: 't9' });
+    ok(r.s.text === '你好呀' && r.sv.length === 1 && r.sv[0].b.branch_of && r.sv[0].b.branch_of.conversation_id === 'conv-orig'
+      && r.sv[0].b.branch_of.turn_id === 't9' && r.sv[0].b.messages.length === 4, 'T27 带上 branch_of，历史照常整段发给记忆服务（由它去掉重合部分）', r.sv[0] && r.sv[0].b);
+    r = await send('conv-br2', 'tbr2', { turn_id: 'x' });
+    ok(r.sv.length === 1 && !('branch_of' in r.sv[0].b), 'T27 没有 conversation_id 的 branch_of 当没带', r.sv[0] && r.sv[0].b.branch_of);
+    r = await send('conv-br3', 'tbr3', { conversation_id: 'conv-br3' });
+    ok(r.sv.length === 1 && !('branch_of' in r.sv[0].b), 'T27 从自己分出来的当没带', r.sv[0] && r.sv[0].b.branch_of);
+    r = await send('conv-br4', 'tbr4');
+    ok(r.sv.length === 1 && !('branch_of' in r.sv[0].b), 'T27 普通会话不带', r.sv[0] && r.sv[0].b.branch_of);
   }
 
   console.log(`\n通过 ${pass}，失败 ${fail}`);

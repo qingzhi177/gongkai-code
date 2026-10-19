@@ -9,8 +9,11 @@
 - pipeline/summary.py    近期摘要
 - pipeline/narrative.py  共同经历叙事
 - pipeline/profile.py    画像重建
+- recall/            召回编排（意图、检索通道、精排、分层决策、轨迹、黄金集）
+- settings.py        Dashboard 上可调的参数（app_settings 表）
+- branches.py        分支会话：和原会话重合的历史不重复存
 
-还在 main.py 里、之后再拆的：检索和浮现（→ recall/）、L0 / L1 的读写（→ store/）、各类接口（→ api/）、提示词（→ prompts/）。
+还在 main.py 里、之后再拆的：旧的检索和浮现（/search 等）、L0 / L1 的读写（→ store/）、各类接口（→ api/）、提示词（→ prompts/）。
 同目录下的 db.py、timeutil.py、jobs.py、vector_store.py、text_index.py、extract_l1.py、worker.py 暂时保持原位，
 以后再挪进来。
 """

@@ -37,6 +37,7 @@ from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回�
 from app.recall import traces as recall_traces
 from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
+from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 
 load_dotenv()
 
@@ -167,6 +168,7 @@ class SaveRequest(BaseModel):
     conv_id: str
     client: str = "unknown"
     messages: List[dict]
+    branch_of: Optional[dict] = None   # 分支会话：{"conversation_id": 原会话, "turn_id": 分支点}（接入约定第 12 节）
 
 async def get_embedding(text):
     try:
@@ -907,12 +909,28 @@ async def save_conversation(req: SaveRequest):
 
     # Bug4 修复：收集没有 group_id 且没被内容级去重命中的消息，最后统一做序列对齐
     no_group_messages = []
+    branch_skip = None   # 分支会话：开头和原会话重合、不再存的条数（不是分支时为 None）
 
     try:
+        # 分支会话（接入约定第 12 节）：开头那段和原会话一样的历史只在原会话名下存一份，这里跳过，
+        # 免得同一段经历被提取成两份记忆。第一次带 branch_of 时登记重合部分，以后按登记的指纹跳过。
+        if req.branch_of or conv_branches.get(c, req.conv_id):
+            plain = []
+            for m in req.messages:
+                r_, t_ = m.get("role", ""), normalize_content(m.get("content", ""))
+                if t_ and r_ != "system":
+                    plain.append((r_, t_))
+            if conv_branches.register(c, req.conv_id, req.branch_of, plain, timeutil.utc_now_str()):
+                branch_skip = conv_branches.shared_len(c, req.conv_id, plain)
+        seen = 0
+
         for idx, msg in enumerate(req.messages):
             role = msg.get("role", "")
             content = normalize_content(msg.get("content", ""))
             if not content or role == "system":
+                continue
+            seen += 1
+            if branch_skip and seen <= branch_skip:
                 continue
             gid = (msg.get("group_id") or "").strip()
             ver = int(msg.get("version") or 0)
@@ -1011,7 +1029,10 @@ async def save_conversation(req: SaveRequest):
             return {"status": "ok", "saved": saved,
                     "l1_purged": len(l1_ids_to_purge),
                     "warning": f"L1已软删但向量清除失败: {e}"}
-    return {"status": "ok", "saved": saved, "l1_purged": len(l1_ids_to_purge)}
+    out = {"status": "ok", "saved": saved, "l1_purged": len(l1_ids_to_purge)}
+    if branch_skip is not None:
+        out["branch_shared"] = branch_skip
+    return out
 
 @app.get("/stats")
 async def stats():

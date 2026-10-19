@@ -274,7 +274,7 @@ function buildTurnMessages(messages, aiText) {
 
 // ============ Pluvia 接入约定 v0.2（docs/plan/pluvia-gateway-contract.md） ============
 // 只有 body 里带了 pluvia 对象的请求才走 v0.2 逻辑；Kelivo 等其它客户端的路径不变。
-const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events'] };
+const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of'] };
 
 // 网关时间头：auto（默认）= 前端已经带了「此刻：」就不再加 [当前时间]、带了「离上一句」就不再加 [距上次对话]，
 // 免得模型同时看到两个钟；on = 总是加；off = 都不加。在 .env 里设 GATEWAY_TIME_HEADER 修改。
@@ -292,11 +292,20 @@ function pluviaCtx(req) {
     ctx = {
       v: String(p.v || ''), turn, tail: typeof p.tail === 'string' ? p.tail : null,
       system: p.system === 'append' ? 'append' : 'ignore',                      // 约定 8.1
-      aux: (typeof p.aux === 'string' && p.aux.trim()) ? p.aux.trim() : null    // 约定 8.5
+      aux: (typeof p.aux === 'string' && p.aux.trim()) ? p.aux.trim() : null,   // 约定 8.5
+      branch_of: pluviaBranchOf(p.branch_of)                                    // 约定 12：分支会话
     };
   }
   req._pv = ctx;
   return ctx;
+}
+// 分支会话（约定 12）：{ conversation_id: 原会话, turn_id?: 分支点那一轮 }。不合法就当没带
+function pluviaBranchOf(b) {
+  if (!b || typeof b !== 'object') return null;
+  const cid = b.conversation_id == null ? '' : String(b.conversation_id).trim();
+  if (!cid || cid.length > 200) return null;
+  const tid = b.turn_id == null ? null : String(b.turn_id).slice(0, 200);
+  return { conversation_id: cid, turn_id: tid };
 }
 function isPluviaClient(req) {
   return String(req.headers['x-client-name'] || '').trim().toLowerCase() === 'pluvia' || !!pluviaCtx(req);
@@ -2278,8 +2287,13 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
   const cut = pv.turn ? turnCut(memMsgs, pv.turn.round) : memMsgs.length;
   const cleaned = cleanMessagesForSave(memMsgs.slice(0, cut), aiText,
     { stripStamp: !req._tailOk, mergeAssistant: true, pluviaDecor: true });
+  // 分支会话：告诉记忆服务从哪里分出来，和原会话重合的那段历史只在原会话名下存一份（约定 12）
+  const branchOf = (pv.branch_of && pv.branch_of.conversation_id !== convId) ? pv.branch_of : undefined;
   axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
-    conv_id: convId, client: req.headers['x-client-name'] || 'pluvia', messages: cleaned
+    conv_id: convId, client: req.headers['x-client-name'] || 'pluvia', messages: cleaned, branch_of: branchOf
+  }).then(r => {
+    if (branchOf && r.data && r.data.branch_shared != null)
+      console.log(`[PLUVIA] 分支会话 ${convId}（从 ${branchOf.conversation_id} 分出）：和原会话重合 ${r.data.branch_shared} 条，不重复存`);
   }).catch(err => console.error('保存对话失败:', err.message));
   updateDisplayMetrics(shownIds);
   const thinkText = allThinks.join('\n\n');
