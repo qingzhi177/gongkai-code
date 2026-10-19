@@ -14,7 +14,7 @@ from datetime import timedelta
 import timeutil
 from app import settings as app_settings
 from app.config import get_conn
-from app.recall import cards, channels, decide as decide_mod, intent as intent_mod
+from app.recall import cards, channels, decide as decide_mod, intent as intent_mod, timeparse
 from app.recall import rerank as rerank_mod
 
 RRF_K = 60
@@ -31,15 +31,18 @@ def build_query(user_text, prev_user="", prev_assistant=""):
     return " ".join(parts)
 
 
-def fuse(vec, fts, intent_type):
-    """RRF 融合（只看名次）。回忆 / 事实意图时关键词通道权重更高。返回 [(id, rrf)]"""
-    w_vec, w_fts = 1.0, (1.0 if intent_type in ("recall", "fact") else 0.6)
+def fuse(vec, fts, intent_type, timed=()):
+    """RRF 融合（只看名次）。回忆 / 事实意图时关键词、时间通道权重更高。返回 [(id, rrf)]"""
+    strong = intent_type in ("recall", "fact")
+    w_vec, w_fts, w_time = 1.0, (1.0 if strong else 0.6), (1.0 if strong else 0.8)
     scores = {}
     for rank, (mid, _) in enumerate(vec):
         scores[mid] = scores.get(mid, 0.0) + w_vec / (RRF_K + rank + 1)
     for rank, (mid, sc) in enumerate(fts):
         if sc > 0:
             scores[mid] = scores.get(mid, 0.0) + w_fts / (RRF_K + rank + 1)
+    for rank, (mid, _) in enumerate(timed):
+        scores[mid] = scores.get(mid, 0.0) + w_time / (RRF_K + rank + 1)
     return sorted(scores.items(), key=lambda x: -x[1])[:TOP_N]
 
 
@@ -118,12 +121,21 @@ async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=No
         emb, fts = await asyncio.gather(timed(embed_fn(query), "embed"), timed(fts_fn(query), "fts"))
         vec = channels.vector_search(collection, emb, n=TOP_N)
         chan = {"vector": vec[:TOP_N], "fts": fts[:TOP_N], "embed_ok": emb is not None}
-        fused = fuse(vec, fts, intent["type"])
+        # 时间通道：只看这一轮用户自己的话（拼上上文的检索文本里可能带着别的时间）
+        ranges = timeparse.parse(user_text) if settings.get("time_enabled", True) else []
+        hits = channels.time_search(ranges, n=TOP_N) if ranges else []
+        if ranges:
+            chan["time"] = {"ranges": [{k: r[k] for k in ("label", "from", "to")} for r in ranges],
+                            "hits": [mid for mid, _ in hits]}
+        fused = fuse(vec, fts, intent["type"], hits)
         meta = channels.load_meta([mid for mid, _ in fused])
         vec_sim = dict(vec)
         for mid, rrf in fused:
             if mid in meta:
-                cands.append({**meta[mid], "rrf": round(rrf, 5), "vec_sim": vec_sim.get(mid)})
+                c = {**meta[mid], "rrf": round(rrf, 5), "vec_sim": vec_sim.get(mid)}
+                if ranges and timeparse.contains(ranges, c.get("ts")):
+                    c["in_time"] = True
+                cands.append(c)
         t2 = time.monotonic()
         scores, rr_info = await rerank_fn(query, [doc_text(c) for c in cands])
         lat["rerank"] = int((time.monotonic() - t2) * 1000)
@@ -146,7 +158,8 @@ async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=No
         picks_brief = [{"id": p["id"], "tier": p["tier"], "score": p.get("score")} for p in d["picks"]]
         decision = {**{k: d[k] for k in ("eligible", "dropped", "gate", "basis")}, "picks": picks_brief, "params": p,
                     "candidates": [{"id": c["id"], "rerank": c.get("rerank"), "vec_sim": c.get("vec_sim"),
-                                    "rrf": c.get("rrf")} for c in cands[:15]]}
+                                    "rrf": c.get("rrf"), **({"in_time": True} if c.get("in_time") else {})}
+                                   for c in cands[:15]]}
         cur = conn.execute(
             "INSERT INTO recall_traces (turn_key, backend, session_id, client, mode, query, user_text, intent, channels, "
             "rerank, decision, card, legacy, injected_chars, latency, created_at) "

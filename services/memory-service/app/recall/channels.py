@@ -1,5 +1,5 @@
-"""检索通道（方案 8.2 节）。现在有：稠密向量、稀疏关键词（FTS5 + jieba）。
-字面（L0 原文）、共同语汇、时间、结构化通道等对应的数据层（Phase 4）做出来以后再加。
+"""检索通道（方案 8.2 节）。现在有：稠密向量、稀疏关键词（FTS5 + jieba）、时间（话里提到的日期范围，见 timeparse.py）。
+字面（L0 原文）、共同语汇、结构化通道等对应的数据层（Phase 4）做出来以后再加。
 """
 import asyncio
 import os
@@ -64,6 +64,28 @@ def vector_search(collection, embedding, n=30):
         if s.startswith("l1_") and s[3:].isdigit():
             out.append((int(s[3:]), round(float(sim), 4)))
     return out
+
+
+def time_search(ranges, n=30):
+    """时间通道：发生在这些日期范围里的瞬间。返回 [(l1_id, 1.0)]，核心的、情绪浓的排前面"""
+    if not ranges:
+        return []
+    conn = get_conn()
+    try:
+        out, seen = [], set()
+        for r in ranges:
+            rows = conn.execute(
+                "SELECT id FROM l1_memories WHERE status='active' AND COALESCE(visibility, 1.0) > 0 "
+                "AND datetime(ts) >= ? AND datetime(ts) < ? "
+                "ORDER BY COALESCE(is_core, 0) DESC, COALESCE(arousal, 0) DESC, id DESC LIMIT ?",
+                (r["start"], r["end"], n)).fetchall()
+            for (i,) in rows:
+                if i not in seen:
+                    seen.add(i)
+                    out.append((int(i), 1.0))
+        return out[:n]
+    finally:
+        conn.close()
 
 
 def fts_search(query, n=30):

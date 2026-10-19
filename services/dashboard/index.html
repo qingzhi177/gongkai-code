@@ -1582,6 +1582,8 @@ function rebuildProfile() {
                 html += '<div>检索用的文本：' + escapeHtml(t.query || '') + '</div>';
                 html += '<div>意图：' + (RC_INTENT[(t.intent || {}).type] || '') + ((t.intent || {}).matched ? '（命中「' + escapeHtml(t.intent.matched) + '」）' : '') + '</div>';
                 html += '<div>精排：' + (rr.skipped ? escapeHtml(rr.skipped) : (rr.ok ? (escapeHtml(rr.model || '') + '，' + rr.ms + 'ms') : ('失败：' + escapeHtml(rr.error || '') + '，改用向量相似度'))) + '</div>';
+                if (ch.time && ch.time.ranges) html += '<div>时间：' + ch.time.ranges.map(function(r) { return '「' + escapeHtml(r.label) + '」' + (r.from === r.to ? r.from : r.from + ' ~ ' + r.to); }).join('、')
+                    + '，这段时间里的记忆 ' + (ch.time.hits || []).length + ' 条（在这段时间里的候选会加分）</div>';
                 if (dec.params) html += '<div>这一轮用的参数：强门槛 ' + dec.params.t_high + '，中门槛 ' + dec.params.t_low + '，中层概率 ' + dec.params.medium_prob
                     + '，向量兜底 ' + dec.params.min_sim + '，每轮最多 ' + dec.params.max_picks + ' 条</div>';
                 var none = labels['0'] === 'none';
@@ -1592,7 +1594,7 @@ function rebuildProfile() {
                 var shown = {};
                 (dec.candidates || []).forEach(function(c) {
                     shown[c.id] = true;
-                    html += '<tr><td>' + name(c.id) + '</td><td>' + (c.rerank == null ? '-' : Number(c.rerank).toFixed(3)) + '</td><td>' + (c.vec_sim == null ? '-' : Number(c.vec_sim).toFixed(3)) + '</td><td style="white-space:nowrap;">' + rcLabelBtns(t.id, c.id, labels[String(c.id)]) + '</td></tr>';
+                    html += '<tr><td>' + name(c.id) + (c.in_time ? ' <span style="color:#5b6abf;font-size:11px;white-space:nowrap;">在这段时间</span>' : '') + '</td><td>' + (c.rerank == null ? '-' : Number(c.rerank).toFixed(3)) + '</td><td>' + (c.vec_sim == null ? '-' : Number(c.vec_sim).toFixed(3)) + '</td><td style="white-space:nowrap;">' + rcLabelBtns(t.id, c.id, labels[String(c.id)]) + '</td></tr>';
                 });
                 var extra = (lg.picked || []).map(Number).filter(function(i) { return !shown[i]; });
                 for (var k in labels) { if (k !== '0' && !shown[k] && extra.indexOf(Number(k)) < 0) extra.push(Number(k)); }

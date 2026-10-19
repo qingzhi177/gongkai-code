@@ -139,6 +139,8 @@ def test_decide():
     r = D.decide([C(1, 0.9)], "normal", nocd, True, rng=random.Random(1), params={"max_picks": 0, "serendipity_prob": 1})
     check("参数：每轮 0 条就什么都不想起", r["picks"] == [], r["picks"])
     check("参数：没传的用默认值", D.params_from({"t_high": 0.8})["t_low"] == D.T_LOW and D.params_from(None)["t_high"] == D.T_HIGH)
+    r = D.decide([{**C(1, 0.7), "in_time": True}, C(2, 0.72)], "normal", nocd, True, rng=random.Random(1))
+    check("时间加分：发生在话里那段时间的 0.7 + 0.08 进入强层", r["eligible"]["strong"] == [1] and r["picks"][0]["id"] == 1, r["eligible"])
 
 
 # ---------- 4. 端到端（假嵌入 / 假精排 / 假向量）----------
@@ -348,6 +350,51 @@ def test_golden():
           and any(i["should"] and i["should_not"] for i in ex["items"]), len(ex["items"]))
 
 
+# ---------- 7. 时间通道 ----------
+def test_time_channel():
+    print("\n[7] 时间通道：话里提到「昨天」，昨天的记忆进候选并加分")
+    from datetime import timedelta
+    import timeutil
+    now = timeutil.utc_now()
+    y_noon = (timeutil.to_local(now) - timedelta(days=1)).replace(hour=12, minute=0, second=0)
+    y_ts = timeutil.to_utc_str(y_noon.isoformat())
+    conn = config.get_conn()
+    conn.execute("INSERT INTO l1_memories (id, content, ts, event_type, arousal, status) VALUES "
+                 "(60, '昨天一起听了雨声', ?, 'event', 0.5, 'active')", (y_ts,))
+    conn.execute("INSERT INTO l1_memories (id, content, ts, event_type, arousal, status) VALUES "
+                 "(61, '很早以前也听过雨', '2025-01-01 12:00:00', 'event', 0.5, 'active')")
+    conn.commit()
+    conn.close()
+
+    async def fake_embed(q):
+        return [0.1] * 4
+
+    async def fake_fts(q, n=30):
+        return []
+
+    async def fake_rerank(q, docs):
+        return [0.7 for _ in docs], {"model": "fake", "ok": True, "ms": 5}
+
+    coll = FakeCollection({61: 0.6})          # 向量只找到了很早以前那条；昨天那条只能靠时间通道
+    req = {"session_id": "conv_time", "user_text": "昨天我们听的那个声音真好", "backend": "api", "shadow": True}
+    res = asyncio.run(orchestrator.compose_turn(req, coll, embed_fn=fake_embed, rerank_fn=fake_rerank, fts_fn=fake_fts,
+                                                rng=random.Random(1), params={"medium_prob": 0, "serendipity_prob": 0}))
+    t = traces.get_trace(res["trace_id"])
+    tm = (t["channels"] or {}).get("time") or {}
+    check("轨迹记下了时间范围和命中", tm.get("ranges", [{}])[0].get("label") == "昨天" and 60 in tm.get("hits", []), tm)
+    cands = {c["id"]: c for c in t["decision"]["candidates"]}
+    check("昨天那条进了候选，标了在这段时间；很早以前那条没标", cands.get(60, {}).get("in_time") is True
+          and 61 in cands and not cands[61].get("in_time"), cands)
+    check("昨天那条 0.7 + 0.08 成了强层，另一条没有", [p["id"] for p in res["picks"]] == [60]
+          and res["picks"][0]["tier"] == "strong", res["picks"])
+    res2 = asyncio.run(orchestrator.compose_turn({**req, "session_id": "conv_time2"}, coll, embed_fn=fake_embed,
+                                                 rerank_fn=fake_rerank, fts_fn=fake_fts, rng=random.Random(1),
+                                                 params={"medium_prob": 0, "serendipity_prob": 0, "time_enabled": False}))
+    t2 = traces.get_trace(res2["trace_id"])
+    check("关掉时间通道：不找、不加分", "time" not in (t2["channels"] or {}) and res2["picks"] == []
+          and 60 not in {c["id"] for c in t2["decision"]["candidates"]}, t2["channels"])
+
+
 def main():
     try:
         test_intent()
@@ -356,6 +403,7 @@ def main():
         test_e2e()
         test_settings()
         test_golden()
+        test_time_channel()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

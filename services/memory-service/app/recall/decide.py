@@ -10,7 +10,8 @@ Dashboard「召回对比」页可以改（存在 app_settings 表，见 app/sett
 | 无由来   | 5% 概率                      | 从情绪浓 / 核心记忆里抽 1 条，冷却 7 天     |
 
 - 精排不可用时退回向量相似度：vec_sim ≥ SURFACE_MIN_SIM（0.55）的只算「中」，不会有「强」。
-- 寒暄 / 很短的回复不走相关度召回；「当下任务」把中层概率降到 10%；「情绪」给情绪浓的记忆加 0.05 分。
+- 寒暄 / 很短的回复不走相关度召回；「当下任务」把中层概率降到 10%；「情绪」给情绪浓的记忆加 0.05 分；
+  话里提到了时间（昨天、上周三、去年夏天……），发生在那段时间里的记忆加 0.08 分。
 - 不回填：一条因为冷却被拿掉，不会拿下一条更弱的来凑数。
 - 每轮最多 2 条（回忆模式 3 条）。
 
@@ -36,9 +37,10 @@ RECENT_TURNS = 5
 MEDIUM_COOLDOWN_H = 24
 SERENDIPITY_COOLDOWN_D = 7
 EMOTION_BONUS = 0.05
+TIME_BONUS = 0.08
 
 PARAM_KEYS = ("t_high", "t_low", "min_sim", "medium_prob", "task_medium_prob", "serendipity_prob", "max_picks",
-              "recall_top", "recent_turns", "medium_cooldown_h", "serendipity_cooldown_d", "emotion_bonus")
+              "recall_top", "recent_turns", "medium_cooldown_h", "serendipity_cooldown_d", "emotion_bonus", "time_bonus")
 
 
 def params_from(params=None):
@@ -46,7 +48,7 @@ def params_from(params=None):
     p = {"t_high": T_HIGH, "t_low": T_LOW, "min_sim": MIN_SIM, "medium_prob": MEDIUM_PROB,
          "task_medium_prob": TASK_MEDIUM_PROB, "serendipity_prob": SERENDIPITY_PROB, "max_picks": MAX_PICKS,
          "recall_top": RECALL_TOP, "recent_turns": RECENT_TURNS, "medium_cooldown_h": MEDIUM_COOLDOWN_H,
-         "serendipity_cooldown_d": SERENDIPITY_COOLDOWN_D, "emotion_bonus": EMOTION_BONUS}
+         "serendipity_cooldown_d": SERENDIPITY_COOLDOWN_D, "emotion_bonus": EMOTION_BONUS, "time_bonus": TIME_BONUS}
     for k, v in (params or {}).items():
         if k in p and v is not None:
             p[k] = v
@@ -101,6 +103,8 @@ def decide(cands, intent_type, cooldown, rerank_ok, serendipity_pool=(), rng=Non
         s = c["score"]
         if intent_type == "emotion" and (c.get("arousal") or 0) >= 0.6:
             s = round(s + p["emotion_bonus"], 4)
+        if c.get("in_time"):
+            s = round(s + p["time_bonus"], 4)
         scored.append({**c, "score": s})
     scored.sort(key=lambda c: -c["score"])
 
