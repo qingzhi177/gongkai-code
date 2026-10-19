@@ -395,6 +395,12 @@ def test_time_channel():
           and 60 not in {c["id"] for c in t2["decision"]["candidates"]}, t2["channels"])
 
 
+def test_warm_up():
+    print("\n[8] 启动预热")
+    out = asyncio.run(orchestrator.warm_up(delay=0))
+    check("预热跑完了 FTS、嵌入、精排三步，出错也不抛", set(out) == {"fts", "embed", "rerank"}, out)
+
+
 def main():
     try:
         test_intent()
@@ -404,6 +410,7 @@ def main():
         test_settings()
         test_golden()
         test_time_channel()
+        test_warm_up()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

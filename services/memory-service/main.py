@@ -122,12 +122,16 @@ async def lifespan(app: FastAPI):
     scheduler.start()
     print(f"[SCHEDULER] 定时检查已启动（间隔 {AUTO_CHECK_INTERVAL_MIN} 分钟）")
     supervisor = asyncio.create_task(_supervise_worker()) if WORKER_AUTOSTART else None
+    # 召回预热：jieba 词典、嵌入 / 精排的连接，重启后第一轮不用多等（RECALL_WARMUP=0 可以关掉）
+    warm = asyncio.create_task(recall_orchestrator.warm_up()) if os.getenv("RECALL_WARMUP", "1") != "0" else None
     try:
         yield
     finally:
         scheduler.shutdown(wait=False)
         if supervisor:
             supervisor.cancel()
+        if warm and not warm.done():
+            warm.cancel()
         _stop_worker()
         print("[SCHEDULER] 定时检查已停止")
 

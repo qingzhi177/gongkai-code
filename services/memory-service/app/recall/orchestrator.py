@@ -6,6 +6,7 @@
 import asyncio
 import functools
 import json
+import logging
 import random
 import time
 import uuid
@@ -88,6 +89,29 @@ def load_params():
     except Exception as e:
         print(f"[RECALL] 读取召回参数失败，用默认值：{e}")
         return {}
+
+
+async def warm_up(delay=3.0):
+    """启动预热（记忆服务启动后在后台跑一次）：jieba 词典和 FTS 对账、嵌入和精排的 HTTPS 连接。
+    这样重启后的第一轮召回不用再多等这 1–3 秒。出错只打印，不影响启动。返回各步耗时（毫秒）或失败原因。"""
+    await asyncio.sleep(delay)
+    out = {}
+
+    async def step(name, coro):
+        t = time.monotonic()
+        try:
+            await coro
+            out[name] = int((time.monotonic() - t) * 1000)
+        except Exception as e:
+            out[name] = f"失败：{type(e).__name__}"
+
+    settings = load_params()
+    await step("fts", channels.fts_search_async("预热", n=1))
+    await step("embed", channels.embed("你好"))
+    if settings.get("rerank_enabled", True):
+        await step("rerank", rerank_mod.rerank("你好", ["你好呀"], model=settings.get("rerank_model"), timeout=5))
+    logging.getLogger(__name__).info(f"[RECALL] 启动预热：{out}（毫秒）")
+    return out
 
 
 async def compose_turn(req, collection, embed_fn=None, rerank_fn=None, fts_fn=None, rng=None, params=None):

@@ -21,6 +21,10 @@ services/gateway/gateway.log
 # 备份文件与运行日志（不入库）
 *.bak_*
 data/logs/*.log
+# 日志轮转留下的旧日志（scripts/install_logrotate.sh）
+data/logs/*.log.*
+data/*.log.*
+services/gateway/gateway.log.*
 
 # MCP Ops 数据库备份文件（不入库）
 data/db_backups/

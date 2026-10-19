@@ -1,0 +1,12 @@
+# 日志轮转（用 scripts/install_logrotate.sh 安装：@REPO@ 换成仓库目录，生成 data/run/logrotate.conf，挂进用户自己的 crontab）
+# 每天检查一次：超过 5MB 的转存，保留 5 份（旧的压缩）。
+# copytruncate：复制后清空原文件。记忆服务、worker、网关都是追加写（O_APPEND），清空后会接着从头写，不用重启服务。
+@REPO@/data/logs/auto_trigger.log @REPO@/data/logs/worker.log @REPO@/services/gateway/gateway.log @REPO@/data/extract.log @REPO@/data/backup.log {
+    size 5M
+    rotate 5
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
