@@ -42,6 +42,7 @@ from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
 from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇（现在只生成、不注入）
+from app.pipeline import loops as loops_pipeline       # Phase 4：未完的事（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2529,6 +2530,16 @@ async def enqueue_auto_jobs():
                     queued.append("lexicon_scan")
         except Exception as e:
             logger.error(f"共同语汇投递失败：{e}", exc_info=True)
+        # 未完的事：还有没扫过的对话块就投递（平时由每日片段整理完顺手投递，这里兜底）；自动过期不调用模型，每次检查都跑
+        try:
+            if loops_pipeline.cfg().get("enabled"):
+                if loops_pipeline.pending_chunks() and loops_pipeline.enqueue_scan():
+                    queued.append("loops_scan")
+                expired = loops_pipeline.expire()
+                if expired:
+                    logger.info(f"未完的事：自动过期 {expired}")
+        except Exception as e:
+            logger.error(f"未完的事投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2588,7 +2599,7 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇")
+    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇", loops_scan="未完的事")
     prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 "}
     label = lambda k: next((p + k.split(":", 1)[1] for pre, p in prefixes.items() if k.startswith(pre)), names.get(k, k))
     msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
@@ -3118,6 +3129,73 @@ async def lexicon_merge(lid: int, req: LexiconMerge):
     """并进另一个词（这个词和它的别名都变成那个词的别名）"""
     return _lex_op(lexicon_pipeline.merge, lid, req.into)
 
+# ============ 未完的事（Phase 4 第五步；现在只生成、只在 Dashboard 上看，见 app/pipeline/loops.py）============
+
+class LoopEdit(BaseModel):
+    text: Optional[str] = None
+    kind: Optional[str] = None
+    owner: Optional[str] = None
+    due: Optional[str] = None          # 空字符串 = 去掉期限
+    policy: Optional[str] = None
+
+class LoopClose(BaseModel):
+    status: str = "done"               # done（有结果了）/ dropped（不用再管了）
+    result: Optional[str] = None
+
+def _loop_op(fn, *args):
+    try:
+        out = fn(*args)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", "result": out}
+
+@app.get("/loops")
+async def loops_overview():
+    """进行中的、了结了的、开窗预览、扫描进度"""
+    return {**loops_pipeline.overview(), "settings_spec": app_settings.describe("loops")}
+
+@app.get("/loops/pack")
+async def loops_pack():
+    """以后开窗时会列出的几件（现在只是预览，不放进聊天）"""
+    return {"pack": loops_pipeline.pack()}
+
+@app.post("/loops/scan")
+async def loops_scan_now():
+    return {"status": "ok", "queued": loops_pipeline.enqueue_scan(source="dashboard")}
+
+@app.post("/loops")
+async def loops_add(req: LoopEdit):
+    """自己加一件"""
+    return _loop_op(loops_pipeline.add, req.kind or "plan", req.text, req.owner or "user", req.due or None,
+                    req.policy or "when_relevant")
+
+@app.put("/loops/settings")
+async def loops_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("loops", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("loops")}
+
+@app.get("/loops/{lid}")
+async def loops_detail(lid: int):
+    try:
+        return loops_pipeline.detail(lid)
+    except ValueError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+@app.put("/loops/{lid}")
+async def loops_edit(lid: int, req: LoopEdit):
+    return _loop_op(loops_pipeline.edit, lid, req.text, req.kind, req.owner, req.due, req.policy)
+
+@app.post("/loops/{lid}/close")
+async def loops_close(lid: int, req: LoopClose):
+    return _loop_op(loops_pipeline.close, lid, req.status, req.result)
+
+@app.post("/loops/{lid}/reopen")
+async def loops_reopen(lid: int):
+    return _loop_op(loops_pipeline.reopen, lid)
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -3161,7 +3239,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():

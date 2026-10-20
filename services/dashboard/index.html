@@ -146,6 +146,7 @@
             <button class="tab" onclick="showPanel('episodes')">每日片段</button>
             <button class="tab" onclick="showPanel('arcs')">叙事卷</button>
             <button class="tab" onclick="showPanel('lexicon')">共同语汇</button>
+            <button class="tab" onclick="showPanel('loops')">未完的事</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -495,6 +496,33 @@
                 <div id="lx-rejected" style="margin-top:8px;"></div></details>
         </div>
 
+        <div id="loops" class="panel">
+            <h3>未完的事</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                答应过的事、一起的计划、在等的结果、放在心上的牵挂、说好下次再聊的话题、定期的约定……每天整理完对话以后自动找，每一件都附一句原话做证据。
+                之后的对话里有了下文（比如结果出来了），会自动标成「有结果了」并记下后续。每件事都可以选跟进方式：<b>相关时可以提</b>、<b>到期时才提</b>、<b>不主动提</b>
+                （标了「不主动提」的，我永远不会主动问起，只有你自己提起时才接）。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后每次开始聊天时，会把下面「开窗预览」里的几件告诉我，每个会话最多主动提一次。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="lp-enabled" onchange="saveLoopSettings({enabled: this.checked})"> 自动找</label>
+                <button class="btn" onclick="scanLoops()">现在扫描</button>
+                <button class="btn" onclick="toggleAddLoop()" style="background:#28a745;">自己加一件</button>
+                <button class="btn" onclick="loadLoops()" style="background:#6c757d;">刷新</button>
+                <span id="lp-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="lp-add" style="display:none;background:#f8f9fa;border-radius:8px;padding:10px 12px;margin-bottom:14px;"></div>
+            <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+                <div style="font-size:13px;margin-bottom:6px;"><b>开窗预览</b>：以后开始聊天时会告诉我的几件（先列快到期的，「不主动提」的不在这里）</div>
+                <div id="lp-pack" style="font-size:13px;line-height:1.9;"></div>
+            </div>
+            <div id="lp-open"></div>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="lp-closed-title">了结了的</summary>
+                <div id="lp-closed" style="margin-top:8px;"></div></details>
+            <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
+                <div id="lp-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
             <h3>近七天摘要（新版）</h3>
@@ -783,6 +811,7 @@
             if (name === 'episodes') loadEpisodes();
             if (name === 'arcs') loadArcs();
             if (name === 'lexicon') loadLexicon();
+            if (name === 'loops') loadLoops();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -1387,7 +1416,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1413,6 +1442,9 @@ function rebuildProfile() {
             if (j.kind.indexOf('digest_') === 0 && r.status === 'rejected') return '没通过校验，没有发布';
             if (j.kind === 'lexicon_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
                 + ((r.new || []).length ? ' · 新词：' + r.new.join('、') : '') + ((r.activated || []).length ? ' · 自动收下：' + r.activated.join('、') : '');
+            if (j.kind === 'loops_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
+                + ((r.new || []).length ? ' · 新的：' + r.new.join('、') : '') + ((r.closed || []).length ? ' · 有了下文：' + r.closed.join('、') : '')
+                + (r.mentioned ? ' · 又提起 ' + r.mentioned + ' 次' : '') + ((r.expired || []).length ? ' · 自动过期 ' + r.expired.length + ' 件' : '');
             if (j.kind === 'narrate_arc') {
                 if (r.status === 'ok') return '《' + (r.title || '') + '》第 ' + r.version + ' 版 · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '');
                 if (r.status === 'rejected') return '没通过校验，保留旧版本';
@@ -2371,6 +2403,174 @@ function rebuildProfile() {
                 });
         }
 
+        // ============ 未完的事 ============
+        var loopCache = {}, loopMeta = { kinds: {}, policies: {}, owners: {}, status_cn: {} };
+
+        function loadLoops() {
+            fetch(API + '/loops').then(function(r) { return r.json(); }).then(function(d) {
+                loopMeta = { kinds: d.kinds || {}, policies: d.policies || {}, owners: d.owners || {}, status_cn: d.status_cn || {} };
+                document.getElementById('lp-enabled').checked = !!(d.settings || {}).enabled;
+                var c = d.counts || {};
+                document.getElementById('lp-status').textContent = '进行中 ' + (c.open || 0) + ' 件 · 了结 ' + ((c.done || 0) + (c.dropped || 0) + (c.expired || 0))
+                    + ' 件 · 扫过 ' + d.scanned_chunks + ' 段对话' + (d.pending_chunks ? ' · 还有 ' + d.pending_chunks + ' 段没扫' : '');
+                loopCache = {};
+                [].concat(d.open, d.closed).forEach(function(x) { loopCache[x.id] = x; });
+                document.getElementById('lp-pack').innerHTML = (d.pack || []).length
+                    ? d.pack.map(function(p) { return '<div>· ' + escapeHtml(p.line) + '</div>'; }).join('') : '<span style="color:#888;">（现在没有要提的）</span>';
+                document.getElementById('lp-open').innerHTML = '<h4 style="margin:6px 0 8px;">进行中</h4>'
+                    + (d.open.map(loopCard).join('') || '<div style="color:#888;font-size:13px;">还没有</div>');
+                document.getElementById('lp-closed-title').textContent = '了结了的（' + d.closed.length + '）';
+                document.getElementById('lp-closed').innerHTML = d.closed.map(loopClosedCard).join('') || '<div style="color:#888;font-size:12px;">没有</div>';
+                renderLoopSettings(d.settings_spec || {});
+            }).catch(function(e) { document.getElementById('lp-status').textContent = '读取失败：' + e; });
+        }
+
+        function loopBadge(text, bg) {
+            return '<span style="font-size:11px;background:' + (bg || '#f0f0f5') + ';border-radius:8px;padding:1px 7px;margin-left:4px;">' + escapeHtml(text) + '</span>';
+        }
+
+        function loopSelect(id, options, value, onchange) {
+            return '<select id="' + id + '"' + (onchange ? ' onchange="' + onchange + '"' : '') + ' style="padding:3px 5px;border:1px solid #ddd;border-radius:6px;font-size:12px;">'
+                + Object.keys(options).map(function(k) { return '<option value="' + k + '"' + (k === value ? ' selected' : '') + '>' + escapeHtml(options[k]) + '</option>'; }).join('')
+                + '</select>';
+        }
+
+        function loopInfo(x) {
+            var parts = [];
+            if (x.created_ts) parts.push((x.source === 'dashboard' ? '你在 ' + formatTime(x.created_ts).substring(0, 10) + ' 加的' : formatTime(x.created_ts).substring(0, 10) + ' 第一次说'));
+            if (x.mention_count) parts.push('后来又提起 ' + x.mention_count + ' 次');
+            if (x.mention_count && x.last_mentioned_at) parts.push('最近 ' + formatTime(x.last_mentioned_at).substring(0, 10));
+            return parts.join(' · ');
+        }
+
+        function loopCard(x) {
+            var pol = x.follow_up_policy;
+            return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:10px 14px;margin-bottom:8px;' + (pol === 'never_push' ? 'opacity:.75;' : '') + '">'
+                + '<div style="font-size:14px;line-height:1.7;">' + escapeHtml(x.line) + loopBadge(loopMeta.owners[x.owner] ? loopMeta.owners[x.owner] + '的事' : '')
+                + (x.edited ? ' <span style="font-size:11px;color:#aaa;">（你改过）</span>' : '') + '</div>'
+                + (x.created_quote ? '<div style="font-size:12px;color:#666;margin-top:3px;">原话：「' + escapeHtml(x.created_quote) + '」</div>' : '')
+                + '<div style="font-size:12px;color:#888;margin-top:3px;">' + loopInfo(x) + '</div>'
+                + '<div style="margin-top:6px;font-size:12px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">'
+                + '<span>跟进：' + loopSelect('lp-pol-' + x.id, loopMeta.policies, pol, 'setLoopPolicy(' + x.id + ', this.value)') + '</span>'
+                + '<a href="javascript:void(0)" onclick="closeLoop(' + x.id + ', \'done\')">有结果了</a>'
+                + '<a href="javascript:void(0)" style="color:#888;" onclick="closeLoop(' + x.id + ', \'dropped\')">不用再管了</a>'
+                + '<a href="javascript:void(0)" onclick="toggleLoop(' + x.id + ')">经过和修改</a></div>'
+                + '<div id="lp-detail-' + x.id + '" style="display:none;margin-top:8px;"></div></div>';
+        }
+
+        function loopClosedCard(x) {
+            var bg = { done: '#e6f4ea', dropped: '#f0f0f0', expired: '#fdf2e3' }[x.status];
+            var by = { scan: '从对话里看出来的', dashboard: '你标的', auto: '自动' }[x.closed_by] || '';
+            return '<div style="background:#fff;border:1px solid #eee;border-radius:8px;padding:8px 12px;margin-bottom:6px;">'
+                + '<div style="font-size:13px;line-height:1.7;">' + loopBadge(loopMeta.status_cn[x.status] || x.status, bg) + ' ' + escapeHtml(x.text) + '</div>'
+                + (x.closed_text ? '<div style="font-size:13px;margin-top:2px;">后续：' + escapeHtml(x.closed_text) + '</div>' : '')
+                + (x.closed_quote ? '<div style="font-size:12px;color:#666;">原话：「' + escapeHtml(x.closed_quote) + '」</div>' : '')
+                + '<div style="font-size:12px;color:#888;margin-top:2px;">' + (x.closed_ts ? formatTime(x.closed_ts).substring(0, 10) + ' · ' : '') + by
+                + ' · <a href="javascript:void(0)" onclick="toggleLoop(' + x.id + ')">经过</a>'
+                + ' · <a href="javascript:void(0)" onclick="loopPost(' + x.id + ', \'reopen\')">重新打开</a></div>'
+                + '<div id="lp-detail-' + x.id + '" style="display:none;margin-top:8px;"></div></div>';
+        }
+
+        var LOOP_EVENT = { created: '出现', mentioned: '又提起', done: '有结果了', dropped: '不用再管了', expired: '自动过期', reopened: '重新打开', edited: '修改' };
+
+        function toggleLoop(id) {
+            var el = document.getElementById('lp-detail-' + id);
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.textContent = '读取中…';
+            fetch(API + '/loops/' + id).then(function(r) { return r.json(); }).then(function(x) {
+                var inp = 'style="width:100%;padding:5px 7px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px;"';
+                var h = '<div style="font-size:12px;color:#666;margin-bottom:4px;">经过：</div>'
+                    + (x.events || []).map(function(e) {
+                        return '<div style="font-size:12px;line-height:1.7;"><span style="color:#888;">' + formatTime(e.ts || e.created_at).substring(0, 16) + ' ' + (LOOP_EVENT[e.event] || e.event) + '</span>'
+                            + (e.quote ? ' 「' + escapeHtml(e.quote) + '」' : '') + (e.detail && e.event !== 'created' ? ' <span style="color:#666;">' + escapeHtml(e.detail) + '</span>' : '') + '</div>';
+                    }).join('');
+                if (x.status === 'open') h += '<div style="margin-top:10px;font-size:12px;color:#666;">修改：</div>'
+                    + '<input id="lp-e-text-' + id + '" ' + inp + ' value="' + escapeHtml(x.text) + '" placeholder="是什么事（用「我」「你」来写）">'
+                    + '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;margin-bottom:6px;">'
+                    + '种类 ' + loopSelect('lp-e-kind-' + id, loopMeta.kinds, x.kind)
+                    + ' 谁的事 ' + loopSelect('lp-e-owner-' + id, loopMeta.owners, x.owner)
+                    + ' 软期限 <input type="date" id="lp-e-due-' + id + '" value="' + (x.due_at || '') + '" style="padding:2px 5px;border:1px solid #ddd;border-radius:6px;">'
+                    + ' <span style="color:#888;">（清空 = 没有期限）</span></div>'
+                    + '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="saveLoop(' + id + ')">保存</button>';
+                el.innerHTML = h;
+            }).catch(function(e) { el.textContent = '读取失败：' + e; });
+        }
+
+        function loopPost(id, action, body, method) {
+            return fetch(API + '/loops/' + id + (action ? '/' + action : ''), { method: method || 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}) }).then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') alert(d.message);
+                    loadLoops();
+                    return d;
+                });
+        }
+
+        function setLoopPolicy(id, policy) { loopPost(id, '', { policy: policy }, 'PUT'); }
+
+        function saveLoop(id) {
+            loopPost(id, '', { text: document.getElementById('lp-e-text-' + id).value.trim(), kind: document.getElementById('lp-e-kind-' + id).value,
+                owner: document.getElementById('lp-e-owner-' + id).value, due: document.getElementById('lp-e-due-' + id).value || '' }, 'PUT');
+        }
+
+        function closeLoop(id, status) {
+            var x = loopCache[id];
+            var r = prompt(status === 'done' ? '「' + x.text + '」有结果了——写一句后续（可以不填）：' : '「' + x.text + '」不用再管了？可以写一句原因（可以不填）：', '');
+            if (r === null) return;
+            loopPost(id, 'close', { status: status, result: r.trim() });
+        }
+
+        function toggleAddLoop() {
+            var el = document.getElementById('lp-add');
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.innerHTML = '<input id="lp-a-text" style="width:100%;padding:6px 8px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px;" placeholder="是什么事，比如：我们说好周末一起列旅行清单">'
+                + '<div style="display:flex;flex-wrap:wrap;gap:8px;align-items:center;font-size:12px;">'
+                + '种类 ' + loopSelect('lp-a-kind', loopMeta.kinds, 'plan') + ' 谁的事 ' + loopSelect('lp-a-owner', loopMeta.owners, 'both')
+                + ' 软期限 <input type="date" id="lp-a-due" style="padding:2px 5px;border:1px solid #ddd;border-radius:6px;">'
+                + ' 跟进 ' + loopSelect('lp-a-policy', loopMeta.policies, 'when_relevant')
+                + ' <button class="btn" style="padding:3px 12px;font-size:12px;background:#28a745;" onclick="addLoop()">加上</button></div>';
+        }
+
+        function addLoop() {
+            var body = { text: document.getElementById('lp-a-text').value.trim(), kind: document.getElementById('lp-a-kind').value,
+                owner: document.getElementById('lp-a-owner').value, due: document.getElementById('lp-a-due').value || null, policy: document.getElementById('lp-a-policy').value };
+            fetch(API + '/loops', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); return; }
+                    document.getElementById('lp-add').style.display = 'none';
+                    loadLoops();
+                });
+        }
+
+        function scanLoops() {
+            fetch(API + '/loops/scan', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('lp-status').textContent = d.queued ? '已开始扫描，稍后点「刷新」' : '扫描已经在进行中了';
+            });
+        }
+
+        function renderLoopSettings(spec) {
+            var items = (spec.items || []).filter(function(it) { return it.type !== 'bool'; });
+            document.getElementById('lp-settings').innerHTML = items.map(function(it) {
+                return '<div style="margin-bottom:8px;"><label>' + escapeHtml(it.label) + ' <input type="number" id="lp-s-' + it.key + '" value="' + it.value + '" min="' + it.min + '" max="' + it.max + '" step="' + it.step
+                    + '" style="width:70px;padding:3px 5px;border:1px solid #ddd;border-radius:6px;"></label>'
+                    + '<div style="font-size:12px;color:#888;">' + escapeHtml(it.help) + '（默认 ' + it.default + '）</div></div>';
+            }).join('') + '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="saveLoopSettings()">保存设置</button> <span id="lp-s-status" style="font-size:12px;"></span>';
+        }
+
+        function saveLoopSettings(values) {
+            if (!values) {
+                values = {};
+                ['expire_after_days', 'stale_days', 'pack_size'].forEach(function(k) { var el = document.getElementById('lp-s-' + k); if (el) values[k] = el.value; });
+            }
+            fetch(API + '/loops/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); return; }
+                    if ('enabled' in values) document.getElementById('lp-status').textContent = values.enabled ? '已开启自动找' : '已关闭（还可以手动点「现在扫描」）';
+                    else loadLoops();
+                });
+        }
+
         // ============ 日摘、周摘、近七天摘要（新版）============
         function digestBlock(d, title) {
             var h = '<div style="font-size:12px;color:#888;margin-bottom:4px;">' + title + (d.version ? ' · 第 ' + d.version + ' 版' : '') + ' · ' + formatTime(d.created_at) + '</div>'
@@ -2664,6 +2864,7 @@ function rebuildProfile() {
                     {key: 'episode', label: '每日片段', hint: '不设置时用「共同经历叙事」的模型（那个也没设置就用「近期摘要」的）。要选写中文细腻、肯照原文引用的模型。'},
                     {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'lexicon', label: '共同语汇', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'loops', label: '未完的事', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',
