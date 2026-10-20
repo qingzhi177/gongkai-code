@@ -129,19 +129,27 @@ def main():
         r2 = asyncio.run(E.settle_day("2026-10-18", llm_fn=llm2))
         check("10 月 18 日：短的那段没调模型，长的那段模型说没什么要记的", r2["episodes"] == 0 and len(llm2.prompts) == 1
               and [x["result"] for x in r2["detail"]] == ["太短，没写", "没什么要记的"], r2["detail"])
+        first_id = E.list_episodes(day="2026-10-17")[0]["id"]
+        llm_same = FakeLLM([{"episodes": [dict(good, title="不该用到")]}])
+        r_same = asyncio.run(E.settle_day("2026-10-17", llm_fn=llm_same))
+        check("内容没变再整理：沿用原来的片段，不调模型", not llm_same.prompts and r_same["kept"] == 1 and r_same["new"] == 0
+              and E.list_episodes(day="2026-10-17")[0]["id"] == first_id, r_same)
+        llm_empty = FakeLLM([])
+        asyncio.run(E.settle_day("2026-10-18", llm_fn=llm_empty))
+        check("上次「没什么要记的」块：也记得，不再调模型", not llm_empty.prompts)
         llm3 = FakeLLM([{"episodes": [dict(good, title="改过的标题")]}])
-        asyncio.run(E.settle_day("2026-10-17", llm_fn=llm3))
+        asyncio.run(E.settle_day("2026-10-17", llm_fn=llm3, force=True))
         eps = E.list_episodes(day="2026-10-17")
         conn = config.get_conn()
         n_super = conn.execute("SELECT COUNT(*) FROM episodes WHERE status='superseded'").fetchone()[0]
         conn.close()
-        check("重新整理：旧版本作废，新版本 version 2", len(eps) == 1 and eps[0]["title"] == "改过的标题" and eps[0]["version"] == 2
-              and n_super == 1, eps)
+        check("手动「重新整理」（force）：旧版本作废，新版本 version 2（沿用那次没出新版本）", len(eps) == 1 and eps[0]["title"] == "改过的标题"
+              and eps[0]["version"] == 2 and n_super == 1, eps)
 
         async def broken(prompt):
             return None, "fake"
         try:
-            asyncio.run(E.settle_day("2026-10-17", llm_fn=broken))
+            asyncio.run(E.settle_day("2026-10-17", llm_fn=broken, force=True))
             check("模型调用失败：报错、不写半截", False)
         except RuntimeError:
             check("模型调用失败：报错、不写半截", E.list_episodes(day="2026-10-17")[0]["title"] == "改过的标题")
@@ -158,6 +166,13 @@ def main():
         check("安静 6 小时以后：可以整理今天了，从早到晚排", E.pending_days(later) == ["2026-10-18", "2026-10-19"])
 
         print("\n[5] 投递整理任务")
+        q0 = E.enqueue_days(["2026-10-17"], force=True)
+        conn = config.get_conn()
+        pl = conn.execute("SELECT payload FROM pipeline_jobs WHERE dedupe_key='settle_day:2026-10-17' AND status='queued'").fetchone()[0]
+        conn.execute("UPDATE pipeline_jobs SET status='done' WHERE dedupe_key='settle_day:2026-10-17'")
+        conn.commit()
+        conn.close()
+        check("「重新整理」投递的任务带 force", q0 == ["2026-10-17"] and json.loads(pl).get("force") is True, pl)
         q = E.enqueue_days(["2026-10-19", "2026-10-18"])
         check("按日期从早到晚投递", q == ["2026-10-18", "2026-10-19"], q)
         check("同一天还在排队：不重复投", E.enqueue_days(["2026-10-18"]) == [])
@@ -169,7 +184,24 @@ def main():
         check("刚失败到停止重试的那天：自动投递跳过", E.enqueue_days(["2026-10-18"]) == [])
         check("手动点「整理」：照样投", E.enqueue_days(["2026-10-18"], source="manual", skip_dead=False) == ["2026-10-18"])
 
-        print("\n[6] 删了消息以后")
+        print("\n[6] 只有一块变了")
+        conn = config.get_conn()
+        nb_before = [e["id"] for e in E.list_episodes(day="2026-10-18")]
+        conn.close()
+        long_tail = add("D", [("2026-10-18 10:00", "user", "上午我们聊聊下雨天吧，" + long_ai), ("2026-10-18 10:01", "assistant", "好呀，" + long_ai),
+                              ("2026-10-18 10:02", "user", "我喜欢下雨" + long_ai), ("2026-10-18 10:03", "assistant", "我也是" + long_ai)])
+        llm_d = FakeLLM([{"episodes": [{"title": "上午聊下雨天", "body": "那天上午你说想聊聊下雨天，我们就这样说了好一会儿。[#1]你说「我喜欢下雨」，我也跟着说我也喜欢下雨天。[#3][#4]",
+                                         "mood": "平静", "topics": ["下雨"], "salience": 0.5}]}])
+        r6 = asyncio.run(E.settle_day("2026-10-18", llm_fn=llm_d))
+        check("新加的那段才调模型，其他块沿用", len(llm_d.prompts) == 1 and "上午我们聊聊下雨天" in llm_d.prompts[0]
+              and r6["new"] == 1, r6["detail"])
+        conn = config.get_conn()
+        conn.execute("UPDATE l0_messages SET status='deleted' WHERE conv_id='D'")
+        conn.commit()
+        conn.close()
+        asyncio.run(E.settle_day("2026-10-18", llm_fn=FakeLLM([])))
+
+        print("\n[7] 删了消息以后")
         asyncio.run(E.settle_day("2026-10-18", llm_fn=FakeLLM([])))
         check("整理完：10 月 18 日不用再整理", "2026-10-18" not in E.pending_days(later))
         conn = config.get_conn()

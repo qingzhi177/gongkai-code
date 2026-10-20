@@ -144,6 +144,7 @@
             <button class="tab" onclick="showPanel('extraction')">记忆提取</button>
             <button class="tab" onclick="showPanel('narrative')">共同经历</button>
             <button class="tab" onclick="showPanel('episodes')">每日片段</button>
+            <button class="tab" onclick="showPanel('arcs')">叙事卷</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -444,6 +445,28 @@
             <div id="ep-list"></div>
         </div>
 
+        <!-- 叙事卷（Phase 4 第二步）-->
+        <div id="arcs" class="panel">
+            <h3>叙事卷</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                把每日片段按主题归成一条条跨越时间的长线（比如「一起听歌」「下雨天」）。新主题积累到 3 个片段、跨 2 天以上，会在这里请你确认；
+                确认以后自动写成一卷，之后每攒够 2 个新片段追加一小节。每句都标了出处，可以点开对照。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后聊天时只放卷的目录（标题 + 一句话）。
+            </div>
+            <div style="margin-bottom:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="arc-enabled" onchange="setArcsEnabled(this.checked)"> 自动归卷和写卷</label>
+                <button class="btn" onclick="routeArcs()">现在归卷</button>
+                <button class="btn" onclick="loadArcs()" style="background:#6c757d;">刷新</button>
+                <span id="arc-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="arc-proposed"></div>
+            <div id="arc-active"></div>
+            <details style="margin-top:14px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="arc-cand-title">还在积累的候选主题</summary>
+                <div id="arc-candidates" style="margin-top:8px;"></div></details>
+            <details style="margin-top:10px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="arc-rej-title">拒绝过的主题</summary>
+                <div id="arc-rejected" style="margin-top:8px;"></div></details>
+        </div>
+
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
             <h3>近期摘要</h3>
@@ -713,6 +736,7 @@
             if (name === 'extraction') loadExtraction();
             if (name === 'narrative') loadNarrative();
             if (name === 'episodes') loadEpisodes();
+            if (name === 'arcs') loadArcs();
             if (name === 'summary') loadSummary();
         }
 
@@ -1317,7 +1341,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1333,7 +1357,15 @@ function rebuildProfile() {
                 return s;
             }
             if (j.kind === 'profile_rebuild' && r.status === 'ok') return '完成（' + (r.batches || 0) + ' 批 · ' + (r.chars || 0) + ' 字）';
-            if (j.kind === 'settle_day' && r.status === 'ok') return r.day + '：' + (r.sessions || 0) + ' 段对话 · 写了 ' + (r.episodes || 0) + ' 个片段';
+            if (j.kind === 'settle_day' && r.status === 'ok') return r.day + '：' + (r.sessions || 0) + ' 段对话 · ' + (r.episodes || 0) + ' 个片段'
+                + (r.kept ? '（沿用 ' + r.kept + ' 个，新写 ' + (r.new || 0) + ' 个）' : '');
+            if (j.kind === 'route_arcs' && r.status === 'ok') return '归了 ' + (r.routed || 0) + ' 个片段'
+                + ((r.new_arcs || []).length ? ' · 新主题 ' + r.new_arcs.length + ' 个' : '') + ((r.proposed || []).length ? ' · 待确认 ' + r.proposed.length + ' 个' : '')
+                + ((r.narrate || []).length ? ' · 要写 ' + r.narrate.length + ' 卷' : '');
+            if (j.kind === 'narrate_arc') {
+                if (r.status === 'ok') return '《' + (r.title || '') + '》第 ' + r.version + ' 版 · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '');
+                if (r.status === 'rejected') return '没通过校验，保留旧版本';
+            }
             return r.message || (r.status === 'ok' ? '完成' : (r.status || '完成'));
         }
 
@@ -1704,8 +1736,8 @@ function rebuildProfile() {
                     html += '<tr><td>' + x.day + '</td><td>' + x.messages + '</td><td>' + st
                         + (s ? '<div style="font-size:11px;color:#999;">' + formatTime(s.settled_at) + '</div>' : '') + '</td>'
                         + '<td>' + (n ? '<a href="javascript:void(0)" onclick="loadEpisodeList(\'' + x.day + '\')">' + n + ' 个</a>' : (s ? '0' : '')) + '</td>'
-                        + '<td><button class="btn" style="padding:3px 10px;font-size:12px;" onclick="settleEpisodes([\'' + x.day + '\'])">'
-                        + (s ? '重新整理' : '整理') + '</button></td></tr>';
+                        + '<td><button class="btn" style="padding:3px 10px;font-size:12px;" ' + (s ? 'title="整天全部重写（平时有新消息时只重写变了的部分）" ' : '')
+                        + 'onclick="settleEpisodes([\'' + x.day + '\']' + (s ? ', true' : '') + ')">' + (s ? '重新整理' : '整理') + '</button></td></tr>';
                 });
                 document.getElementById('ep-days').innerHTML = html + '</table>';
             }).catch(function(e) { document.getElementById('ep-status').textContent = '读取失败：' + e; });
@@ -1758,8 +1790,9 @@ function rebuildProfile() {
             }).catch(function(e) { el.textContent = '读取失败：' + e; });
         }
 
-        function settleEpisodes(days) {
-            var body = days ? { days: days } : { pending: true };
+        function settleEpisodes(days, force) {
+            if (force && !confirm('整天全部重写？（会重新调用模型；这一天的片段会换成新写的版本）')) return;
+            var body = days ? { days: days, force: !!force } : { pending: true };
             document.getElementById('ep-status').textContent = '投递中…';
             fetch(API + '/episodes/settle', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
                 .then(function(r) { return r.json(); }).then(function(d) {
@@ -1773,6 +1806,159 @@ function rebuildProfile() {
             fetch(API + '/episodes/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) })
                 .then(function(r) { return r.json(); }).then(function(d) {
                     document.getElementById('ep-status').textContent = on ? '已开启自动整理' : '已关闭自动整理（还可以手动点「整理」）';
+                });
+        }
+
+        // ============ 叙事卷 ============
+        var ARC_STATUS = { candidate: '候选', proposed: '待确认', active: '进行中', dormant: '休眠', rejected: '已拒绝' };
+        var arcCache = {};
+
+        function loadArcs() {
+            fetch(API + '/arcs').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('arc-enabled').checked = !!d.enabled;
+                var by = { candidate: [], proposed: [], active: [], dormant: [], rejected: [] };
+                (d.arcs || []).forEach(function(a) { arcCache[a.id] = a; (by[a.status] || []).push(a); });
+                var written = by.active.length + by.dormant.length;
+                document.getElementById('arc-status').textContent = (d.unrouted ? d.unrouted + ' 个片段还没归卷' : '片段都归过卷了')
+                    + ' · ' + written + ' 卷' + (by.proposed.length ? ' · ' + by.proposed.length + ' 个等你确认' : '');
+                var html = '';
+                if (by.proposed.length) {
+                    html += '<h4 style="margin:6px 0 8px;">等你确认的新主题</h4>';
+                    by.proposed.forEach(function(a) { html += arcCard(a); });
+                }
+                document.getElementById('arc-proposed').innerHTML = html;
+                html = '';
+                if (written) {
+                    html += '<h4 style="margin:14px 0 8px;">叙事卷</h4>';
+                    by.active.concat(by.dormant).forEach(function(a) { html += arcCard(a); });
+                } else if (!by.proposed.length) {
+                    html = '<div style="color:#888;font-size:13px;">还没有叙事卷。片段多起来以后，模型会提议新主题，请你确认。</div>';
+                }
+                document.getElementById('arc-active').innerHTML = html;
+                document.getElementById('arc-cand-title').textContent = '还在积累的候选主题（' + by.candidate.length + '）';
+                document.getElementById('arc-candidates').innerHTML = by.candidate.map(function(a) {
+                    return '<div style="font-size:13px;padding:6px 0;border-bottom:1px dashed #eee;"><b>' + escapeHtml(a.title) + '</b>'
+                        + (a.theme ? ' <span style="color:#888;">— ' + escapeHtml(a.theme) + '</span>' : '')
+                        + ' <span style="color:#999;font-size:12px;">· ' + a.episodes + ' 个片段 / ' + a.days + ' 天</span>'
+                        + ' <a href="javascript:void(0)" onclick="toggleArc(' + a.id + ')">看片段</a>'
+                        + ' · <a href="javascript:void(0)" onclick="confirmArc(' + a.id + ')">直接确认</a>'
+                        + ' · <a href="javascript:void(0)" style="color:#c0392b;" onclick="rejectArc(' + a.id + ')">不要</a>'
+                        + '<div id="arc-detail-' + a.id + '" style="display:none;margin-top:6px;"></div></div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">没有</div>';
+                document.getElementById('arc-rej-title').textContent = '拒绝过的主题（' + by.rejected.length + '）';
+                document.getElementById('arc-rejected').innerHTML = by.rejected.map(function(a) {
+                    return '<div style="font-size:13px;padding:4px 0;">' + escapeHtml(a.title)
+                        + ' <a href="javascript:void(0)" onclick="arcPost(' + a.id + ', \'restore\')">撤销拒绝</a></div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">没有</div>';
+            }).catch(function(e) { document.getElementById('arc-status').textContent = '读取失败：' + e; });
+        }
+
+        function arcCard(a) {
+            var chip = { proposed: '#c77c00', active: '#2e7d32', dormant: '#888' }[a.status] || '#888';
+            var span = a.first_day ? (a.first_day === a.last_day ? a.first_day : a.first_day + ' ～ ' + a.last_day) : '';
+            var h = '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:12px 14px;margin-bottom:10px;">'
+                + '<div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:baseline;">'
+                + '<div><b style="font-size:15px;">' + escapeHtml(a.title) + '</b> <span style="font-size:11px;color:#fff;background:' + chip
+                + ';border-radius:8px;padding:1px 7px;">' + ARC_STATUS[a.status] + '</span></div>'
+                + '<span style="font-size:12px;color:#888;">' + a.episodes + ' 个片段 · ' + a.days + ' 天' + (span ? ' · ' + span : '')
+                + (a.version ? ' · 第 ' + a.version + ' 版' : '') + '</span></div>'
+                + (a.theme ? '<div style="font-size:12px;color:#888;margin-top:3px;">' + escapeHtml(a.theme) + '</div>' : '')
+                + (a.summary ? '<div style="font-size:14px;line-height:1.7;margin-top:6px;">' + escapeHtml(a.summary) + '</div>' : '')
+                + (a.status === 'active' || a.status === 'dormant' ? (a.version ? '' : '<div style="font-size:12px;color:#888;margin-top:6px;">正在写第一版…</div>')
+                    + (a.needs_rebuild ? '<div style="font-size:12px;color:#c77c00;margin-top:4px;">引用的片段重新整理过，等着整卷重写</div>' : '')
+                    + (a.unwritten ? '<div style="font-size:12px;color:#888;margin-top:4px;">还有 ' + a.unwritten + ' 个新片段没写进去（攒够就写）</div>' : '') : '')
+                + '<div style="margin-top:8px;font-size:12px;">';
+            if (a.status === 'proposed') {
+                h += '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="confirmArc(' + a.id + ')">确认开卷</button> '
+                    + '<button class="btn" style="padding:3px 12px;font-size:12px;background:#6f42c1;" onclick="confirmArc(' + a.id + ', true)">改个名再确认</button> '
+                    + '<button class="btn" style="padding:3px 12px;font-size:12px;background:#c0392b;" onclick="rejectArc(' + a.id + ')">不要</button> '
+                    + '<a href="javascript:void(0)" onclick="toggleArc(' + a.id + ')">看看有哪些片段</a>';
+            } else {
+                h += '<a href="javascript:void(0)" onclick="toggleArc(' + a.id + ')">展开</a>'
+                    + ' · <a href="javascript:void(0)" onclick="renameArc(' + a.id + ')">改名</a>'
+                    + ' · <a href="javascript:void(0)" onclick="rebuildArc(' + a.id + ')">整卷重写</a>';
+            }
+            return h + '</div><div id="arc-detail-' + a.id + '" style="display:none;margin-top:10px;"></div></div>';
+        }
+
+        function toggleArc(id) {
+            var el = document.getElementById('arc-detail-' + id);
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.innerHTML = '<span style="color:#888;font-size:12px;">读取中…</span>';
+            fetch(API + '/arcs/' + id).then(function(r) { return r.json(); }).then(function(a) {
+                var h = '';
+                (a.sections || []).forEach(function(s, i) {
+                    h += '<div style="margin-bottom:10px;"><div style="font-weight:600;font-size:14px;margin-bottom:3px;">' + escapeHtml(s.title) + '</div>'
+                        + '<div style="font-size:14px;line-height:1.8;white-space:pre-wrap;">' + escapeHtml(s.body) + '</div>'
+                        + '<a href="javascript:void(0)" style="font-size:12px;" onclick="var x=document.getElementById(\'arc-src-' + id + '-' + i + '\');x.style.display=x.style.display===\'none\'?\'block\':\'none\'">出处</a>'
+                        + '<div id="arc-src-' + id + '-' + i + '" style="display:none;margin-top:4px;font-size:12px;line-height:1.7;background:#f8f9fa;border-radius:6px;padding:6px 10px;">'
+                        + '<div style="white-space:pre-wrap;margin-bottom:4px;">' + escapeHtml(s.body_with_refs || '') + '</div>'
+                        + (s.sources || []).map(function(x) { return '<div><b>[#' + x.n + ']</b> ' + (x.day || '') + '《' + escapeHtml(x.title || ('片段 ' + x.id)) + '》'
+                            + (x.status && x.status !== 'active' ? ' <span style="color:#c77c00;">（已重新整理）</span>' : '') + '</div>'; }).join('')
+                        + '</div></div>';
+                });
+                var NARR = { 0: '还没写进去', 1: '已写进去', 2: '没通过校验' };
+                h += '<div style="font-size:12px;color:#666;margin:8px 0 4px;">素材（' + (a.materials || []).length + ' 个片段）：</div>'
+                    + (a.materials || []).map(function(m) {
+                        return '<div style="font-size:12px;line-height:1.7;">' + m.day + '《' + escapeHtml(m.title) + '》'
+                            + (m.label ? ' <span style="color:#888;">— ' + escapeHtml(m.label) + '</span>' : '')
+                            + (a.status === 'active' || a.status === 'dormant' ? ' <span style="color:#aaa;">· ' + NARR[m.narrated] + '</span>' : '') + '</div>';
+                    }).join('');
+                if ((a.issues || []).length) h += '<div style="font-size:12px;color:#c77c00;margin-top:6px;">最近一次写卷时校验删掉的：<br>' + a.issues.map(escapeHtml).join('<br>') + '</div>';
+                if (a.version) h += '<div style="font-size:11px;color:#aaa;margin-top:6px;">第 ' + a.version + ' 版 · ' + escapeHtml(a.model || '') + ' · ' + escapeHtml(a.prompt_version || '')
+                    + ' · ' + formatTime(a.updated_at) + '</div>';
+                el.innerHTML = h;
+            }).catch(function(e) { el.textContent = '读取失败：' + e; });
+        }
+
+        function arcPost(id, action, body, method) {
+            return fetch(API + '/arcs/' + id + (action ? '/' + action : ''), { method: method || 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}) }).then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') alert(d.message);
+                    loadArcs();
+                    return d;
+                });
+        }
+
+        function confirmArc(id, rename) {
+            var a = arcCache[id] || {};
+            if (rename) {
+                var t = prompt('给这一卷起个名字（20 个字以内）：', a.title || '');
+                if (!t) return;
+                arcPost(id, 'confirm', { title: t.trim() });
+            } else {
+                arcPost(id, 'confirm', {});
+            }
+            document.getElementById('arc-status').textContent = '已确认，正在后台写第一版（大约一两分钟），稍后点「刷新」';
+        }
+
+        function rejectArc(id) {
+            if (!confirm('不要「' + ((arcCache[id] || {}).title || '') + '」这个主题了吗？以后也不会再提（可以在「拒绝过的主题」里撤销）。')) return;
+            arcPost(id, 'reject');
+        }
+
+        function renameArc(id) {
+            var t = prompt('新的名字（20 个字以内）：', (arcCache[id] || {}).title || '');
+            if (!t) return;
+            arcPost(id, '', { title: t.trim() }, 'PUT');
+        }
+
+        function rebuildArc(id) {
+            if (!confirm('整卷重写？（会重新调用模型，从头写一遍）')) return;
+            arcPost(id, 'rebuild').then(function() { document.getElementById('arc-status').textContent = '正在后台整卷重写，稍后点「刷新」'; });
+        }
+
+        function routeArcs() {
+            fetch(API + '/arcs/route', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('arc-status').textContent = d.queued ? '已开始归卷，稍后点「刷新」' : '归卷已经在进行中了';
+            });
+        }
+
+        function setArcsEnabled(on) {
+            fetch(API + '/arcs/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) })
+                .then(function(r) { return r.json(); }).then(function() {
+                    document.getElementById('arc-status').textContent = on ? '已开启自动归卷和写卷' : '已关闭（还可以手动点「现在归卷」）';
                 });
         }
 
@@ -2238,6 +2424,8 @@ function rebuildProfile() {
                     {key: 'narrative', label: '共同经历叙事'},
                     {key: 'summary', label: '近期摘要'},
                     {key: 'episode', label: '每日片段', hint: '不设置时用「共同经历叙事」的模型（那个也没设置就用「近期摘要」的）。要选写中文细腻、肯照原文引用的模型。'},
+                    {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',
                      hint: '不设置时：用前端选的模型、走当前启用的中转。设置后，Pluvia 的翻译思考链这类小请求改走这里，可以选便宜、快的模型（OpenAI 格式和 Anthropic 格式的供应商都行）；它出错时会自动退回当前中转。选推理模型时，要确认它会把结果写在正文里（推理过程不会转发）。保存后立即生效。'}
                 ];

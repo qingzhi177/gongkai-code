@@ -8,10 +8,12 @@
 删掉一半以上、或者一个出处都没有的，整个片段不要。
 怎么存：同一天重新整理时，旧版本标成 superseded，新版本 version + 1；settle_days 记下整理到了哪条消息，
 这一天之后再有新消息进来（比如改了、重新生成了），会重新整理。
+重新整理时，内容没变的那几块（chunk_key 一样）沿用原来的片段、不再调模型；手动点「重新整理」（force）才全部重写。
 
 现在只生成、只在 Dashboard 上看，还不注入聊天。以后它是主题卷、章节、近七天摘要的素材，也是「那天……」的召回单元。
 导入旧聊天以后，按日期从早到晚一天一天整理（POST /episodes/settle），就是从原文生成的。
 """
+import hashlib
 import json
 import re
 from datetime import date, datetime, time, timedelta, timezone
@@ -110,6 +112,14 @@ def chunks(rows):
     if cur:
         out.append(cur)
     return out
+
+
+def chunk_key(part):
+    """一块对话的指纹（消息 id + 内容）：重新整理时，指纹没变的块沿用原来的片段"""
+    h = hashlib.sha1()
+    for r in part:
+        h.update(f"{r[0]}:{hashlib.sha1((r[2] or '').encode('utf-8')).hexdigest()[:8]}\n".encode())
+    return h.hexdigest()[:16]
 
 
 def substantial(rows):
@@ -216,24 +226,46 @@ def verify(ep, line_map):
 
 # ---------- 整理一天 ----------
 
-async def settle_day(day, llm_fn=None):
-    """整理一天：每段对话写 0 到 2 个片段，校验后整天一起写库（旧版本作废）。模型调用失败时抛异常（任务会重试），不写半截。"""
+async def settle_day(day, llm_fn=None, force=False):
+    """整理一天：每段对话写 0 到 2 个片段，校验后整天一起写库（旧版本作废）。模型调用失败时抛异常（任务会重试），不写半截。
+    force=False 时，内容没变的块沿用原来的片段（也记得上次「没什么要记的」块），只重写变了的块。"""
     day = to_day(day)
     llm_fn = llm_fn or default_llm
     conn = get_conn()
     try:
         sessions = sessions_for_day(conn, day)
+        existing, prev_empty = {}, set()
+        if not force:
+            for eid, key in conn.execute("SELECT id, chunk_key FROM episodes WHERE day=? AND status='active' AND chunk_key IS NOT NULL",
+                                         (day.isoformat(),)):
+                existing.setdefault(key, []).append(eid)
+            r = conn.execute("SELECT detail FROM settle_days WHERE day=?", (day.isoformat(),)).fetchone()
+            try:
+                prev_empty = {x.get("chunk") for x in json.loads(r[0] or "[]") if x.get("result") == "没什么要记的"} if r else set()
+            except (ValueError, AttributeError):
+                prev_empty = set()
     finally:
         conn.close()
+    keep = []
     last_id = max((r[0] for s in sessions for r in s["rows"]), default=None)
     n_msgs = sum(len(s["rows"]) for s in sessions)
     detail, new_eps, version_used, model_used = [], [], None, None
     for s in sessions:
         for part in chunks(s["rows"]):
-            info = {"conv_id": s["conv_id"], "messages": len(part),
+            key = chunk_key(part)
+            info = {"conv_id": s["conv_id"], "messages": len(part), "chunk": key,
                     "from": timeutil.local_str(part[0][3]), "to": timeutil.local_str(part[-1][3])}
             if not substantial(part):
                 info["result"] = "太短，没写"
+                detail.append(info)
+                continue
+            if key in existing:
+                keep += existing[key]
+                info["result"] = f"没变，沿用 {len(existing[key])} 段"
+                detail.append(info)
+                continue
+            if key in prev_empty:
+                info.update(result="没什么要记的", reused=True)
                 detail.append(info)
                 continue
             prompt, line_map, version_used = build_prompt(part)
@@ -248,7 +280,7 @@ async def settle_day(day, llm_fn=None):
                     info.setdefault("issues", []).extend(issues)
                 if clean:
                     clean.update(conv_id=s["conv_id"], start_ts=timeutil.to_utc_str(part[0][3]),
-                                 end_ts=timeutil.to_utc_str(part[-1][3]), issues=issues)
+                                 end_ts=timeutil.to_utc_str(part[-1][3]), issues=issues, chunk_key=key)
                     new_eps.append(clean)
                     written += 1
             info["result"] = f"写了 {written} 段" if written else ("没什么要记的" if not eps else "都没通过校验")
@@ -258,29 +290,30 @@ async def settle_day(day, llm_fn=None):
     try:
         conn.execute("BEGIN IMMEDIATE")
         prev = conn.execute("SELECT MAX(version) FROM episodes WHERE day=?", (day.isoformat(),)).fetchone()[0] or 0
-        conn.execute("UPDATE episodes SET status='superseded' WHERE day=? AND status='active'", (day.isoformat(),))
+        keep_sql = f" AND id NOT IN ({','.join('?' * len(keep))})" if keep else ""     # 注意：NOT IN (NULL) 什么都匹配不上
+        conn.execute("UPDATE episodes SET status='superseded' WHERE day=? AND status='active'" + keep_sql, (day.isoformat(), *keep))
         for e in new_eps:
             conn.execute(
                 "INSERT INTO episodes (day, conv_id, start_ts, end_ts, title, body, body_with_refs, mood, topics, refs, "
-                "salience, status, version, issues, model, prompt_version, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)",
+                "salience, status, version, issues, model, prompt_version, created_at, chunk_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?)",
                 (day.isoformat(), e["conv_id"], e["start_ts"], e["end_ts"], e["title"], e["body"], e["body_with_refs"],
                  e["mood"], json.dumps(e["topics"], ensure_ascii=False), json.dumps(e["refs"]), e["salience"],
-                 prev + 1, json.dumps(e["issues"], ensure_ascii=False), model_used, version_used, now))
+                 prev + 1, json.dumps(e["issues"], ensure_ascii=False), model_used, version_used, now, e["chunk_key"]))
         conn.execute(
             "INSERT INTO settle_days (day, status, last_l0_id, messages, sessions, episodes, detail, version, settled_at) "
             "VALUES (?, 'done', ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(day) DO UPDATE SET status='done', last_l0_id=excluded.last_l0_id, "
             "messages=excluded.messages, sessions=excluded.sessions, episodes=excluded.episodes, detail=excluded.detail, "
             "version=excluded.version, settled_at=excluded.settled_at",
-            (day.isoformat(), last_id, n_msgs, len(sessions), len(new_eps), json.dumps(detail, ensure_ascii=False), prev + 1, now))
+            (day.isoformat(), last_id, n_msgs, len(sessions), len(new_eps) + len(keep), json.dumps(detail, ensure_ascii=False), prev + 1, now))
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
-    return {"status": "ok", "day": day.isoformat(), "sessions": len(sessions), "episodes": len(new_eps),
-            "version": prev + 1, "detail": detail}
+    return {"status": "ok", "day": day.isoformat(), "sessions": len(sessions), "episodes": len(new_eps) + len(keep),
+            "new": len(new_eps), "kept": len(keep), "version": prev + 1, "detail": detail}
 
 
 # ---------- 哪些天要整理、查看 ----------
@@ -340,9 +373,10 @@ def _recently_dead(conn, day, hours=24):
     return bool(t and (timeutil.utc_now() - t).total_seconds() < hours * 3600)
 
 
-def enqueue_days(days, source="auto", skip_dead=True):
+def enqueue_days(days, source="auto", skip_dead=True, force=False):
     """按日期从早到晚投递 settle_day 任务（同一天已经在排队的不重复投）。
-    自动投递时跳过 24 小时内失败到停止重试的那几天，免得每次检查都再失败一遍（手动点「整理」不跳过）。返回新投递的日期。"""
+    自动投递时跳过 24 小时内失败到停止重试的那几天，免得每次检查都再失败一遍（手动点「整理」不跳过）。
+    force=True（手动点「重新整理」）：整天全部重写；那天已经在排队的话，改成 force。返回新投递（或改成 force）的日期。"""
     import jobs
     from app.config import SQLITE_PATH
     conn = get_conn()
@@ -354,8 +388,10 @@ def enqueue_days(days, source="auto", skip_dead=True):
     for d in sorted(days):
         if d in dead:
             continue
-        job, created = jobs.enqueue(SQLITE_PATH, "settle_day", payload={"day": d}, dedupe_key=f"settle_day:{d}", source=source)
-        if created:
+        payload = {"day": d, "force": True} if force else {"day": d}
+        job, created = jobs.enqueue(SQLITE_PATH, "settle_day", payload=payload, dedupe_key=f"settle_day:{d}", source=source,
+                                    update_if_queued=force)
+        if created or (force and job and job.get("status") == "queued" and (job.get("payload") or {}).get("force")):
             queued.append(d)
     return queued
 

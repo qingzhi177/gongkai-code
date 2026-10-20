@@ -207,6 +207,7 @@ def _check(result):
 def build_handlers():
     # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
+    from app.pipeline import arcs as arc_pipeline
     from app.pipeline import episodes as episode_pipeline
     from app.pipeline import narrative as narrative_pipeline
     from app.pipeline import profile as profile_pipeline
@@ -226,10 +227,22 @@ def build_handlers():
         return _check(await profile_pipeline.rebuild_profile())
 
     async def settle_day(payload, job):
-        return await episode_pipeline.settle_day(payload["day"])
+        result = await episode_pipeline.settle_day(payload["day"], force=bool(payload.get("force")))
+        try:                                  # 片段整理好了 → 归卷（主题卷）
+            if arc_pipeline.cfg().get("enabled"):
+                arc_pipeline.enqueue_route()
+        except Exception as e:
+            logger.error(f"[JOB] 投递归卷失败：{e}")
+        return result
+
+    async def route_arcs(payload, job):
+        return await arc_pipeline.route_arcs()
+
+    async def narrate_arc(payload, job):
+        return await arc_pipeline.narrate_arc(int(payload["arc_id"]))
 
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
-            "settle_day": settle_day}
+            "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc}
 
 
 def main():

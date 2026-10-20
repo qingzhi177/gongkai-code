@@ -39,6 +39,7 @@ from app.recall import golden as recall_golden   # 黄金集标注和门槛校�
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
+from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2506,6 +2507,13 @@ async def enqueue_auto_jobs():
                     logger.info(f"每日片段：投递整理 {', '.join(days)}")
         except Exception as e:
             logger.error(f"每日片段投递失败：{e}", exc_info=True)
+        # 主题卷：还有没归过卷的片段就投递归卷（平时由每日片段整理完顺手投递，这里兜底）
+        try:
+            if arc_pipeline.cfg().get("enabled") and arc_pipeline.pending_route_count():
+                if arc_pipeline.enqueue_route():
+                    queued.append("route_arcs")
+        except Exception as e:
+            logger.error(f"归卷投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2565,6 +2573,7 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
+    names["route_arcs"] = "归卷"
     label = lambda k: ("每日片段 " + k.split(":", 1)[1]) if k.startswith("settle_day:") else names.get(k, k)
     msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
     return {"status": "ok", "message": msg, "queued": queued}
@@ -2903,6 +2912,7 @@ async def export_recall_labels():
 class SettleRequest(BaseModel):
     days: List[str] = []
     pending: bool = False      # true：整理所有待整理的天
+    force: bool = False        # true：整天全部重写（默认内容没变的块沿用原来的片段）
 
 class EpisodeSettings(BaseModel):
     enabled: bool
@@ -2921,7 +2931,8 @@ async def episodes_settle(req: SettleRequest):
     """手动整理某几天（或所有待整理的天）：投递 settle_day 任务，worker 按日期从早到晚一天一天做"""
     days = episode_pipeline.pending_days() if req.pending else [d for d in req.days if re.match(r"^\d{4}-\d{2}-\d{2}$", d)]
     days = sorted(set(days))
-    return {"status": "ok", "requested": days, "queued": episode_pipeline.enqueue_days(days, source="dashboard", skip_dead=False)}
+    return {"status": "ok", "requested": days,
+            "queued": episode_pipeline.enqueue_days(days, source="dashboard", skip_dead=False, force=req.force and not req.pending)}
 
 @app.put("/episodes/settings")
 async def episodes_settings(req: EpisodeSettings):
@@ -2933,6 +2944,65 @@ async def episode_detail(episode_id: int):
     """片段详情：带出处的原稿，以及出处对应的原文"""
     e = episode_pipeline.get_episode(episode_id)
     return e if e else JSONResponse({"error": "not found"}, status_code=404)
+
+# ============ 主题卷（Phase 4 第二步；现在只生成、只在 Dashboard 上看，见 app/pipeline/arcs.py）============
+
+class ArcEdit(BaseModel):
+    title: Optional[str] = None
+    theme: Optional[str] = None
+
+class ArcSettings(BaseModel):
+    enabled: bool
+
+def _arc_op(fn, *args):
+    try:
+        fn(*args)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", "arc": arc_pipeline.get_arc(args[0])}
+
+@app.get("/arcs")
+async def arcs_list():
+    """全部主题卷（含候选、待确认、拒绝过的），还有多少片段没归过卷、自动归卷开没开"""
+    return {"arcs": arc_pipeline.list_arcs(), "unrouted": arc_pipeline.pending_route_count(),
+            "enabled": bool(arc_pipeline.cfg().get("enabled")), "settings": app_settings.describe("arcs")}
+
+@app.post("/arcs/route")
+async def arcs_route():
+    """现在归卷（投递 route_arcs 任务）"""
+    return {"status": "ok", "queued": arc_pipeline.enqueue_route(source="dashboard")}
+
+@app.put("/arcs/settings")
+async def arcs_settings(req: ArcSettings):
+    app_settings.update("arcs", {"enabled": req.enabled})
+    return {"status": "ok", "enabled": req.enabled}
+
+@app.get("/arcs/{arc_id}")
+async def arc_detail(arc_id: int):
+    a = arc_pipeline.get_arc(arc_id)
+    return a if a else JSONResponse({"error": "not found"}, status_code=404)
+
+@app.post("/arcs/{arc_id}/confirm")
+async def arc_confirm(arc_id: int, req: ArcEdit = ArcEdit()):
+    """确认开卷（可以顺便改名），然后自动写第一版"""
+    return _arc_op(arc_pipeline.confirm, arc_id, req.title, req.theme)
+
+@app.post("/arcs/{arc_id}/reject")
+async def arc_reject(arc_id: int):
+    return _arc_op(arc_pipeline.reject, arc_id)
+
+@app.post("/arcs/{arc_id}/restore")
+async def arc_restore(arc_id: int):
+    return _arc_op(arc_pipeline.restore, arc_id)
+
+@app.put("/arcs/{arc_id}")
+async def arc_rename(arc_id: int, req: ArcEdit):
+    return _arc_op(arc_pipeline.rename, arc_id, req.title, req.theme)
+
+@app.post("/arcs/{arc_id}/rebuild")
+async def arc_rebuild(arc_id: int):
+    """整卷重写"""
+    return _arc_op(arc_pipeline.rebuild, arc_id)
 
 # ============ Pipeline Status API ============
 
@@ -2977,7 +3047,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():
