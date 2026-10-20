@@ -40,6 +40,7 @@ from app import settings as app_settings   # Dashboard 上可调的参数（召�
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
+from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2514,6 +2515,12 @@ async def enqueue_auto_jobs():
                     queued.append("route_arcs")
         except Exception as e:
             logger.error(f"归卷投递失败：{e}", exc_info=True)
+        # 日摘、周摘、近七天摘要：输入变了的投递（平时由每日片段整理完顺手投递；近七天的窗口每天往前挪，这里也会发现）
+        try:
+            if digest_pipeline.cfg().get("enabled"):
+                queued += digest_pipeline.enqueue_stale()
+        except Exception as e:
+            logger.error(f"摘要投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2573,8 +2580,9 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    names["route_arcs"] = "归卷"
-    label = lambda k: ("每日片段 " + k.split(":", 1)[1]) if k.startswith("settle_day:") else names.get(k, k)
+    names.update(route_arcs="归卷", digest_recent="近七天摘要")
+    prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 "}
+    label = lambda k: next((p + k.split(":", 1)[1] for pre, p in prefixes.items() if k.startswith(pre)), names.get(k, k))
     msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
     return {"status": "ok", "message": msg, "queued": queued}
 
@@ -3004,6 +3012,31 @@ async def arc_rebuild(arc_id: int):
     """整卷重写"""
     return _arc_op(arc_pipeline.rebuild, arc_id)
 
+# ============ 日摘、周摘、近七天摘要（Phase 4 第三步；现在只生成、只在 Dashboard 上看，见 app/pipeline/digests.py）============
+
+class DigestSettings(BaseModel):
+    enabled: bool
+
+@app.get("/digests")
+async def digests_overview():
+    """近七天摘要、最近的日摘和周摘、哪些还没写、自动开没开"""
+    return digest_pipeline.overview()
+
+@app.post("/digests/refresh")
+async def digests_refresh():
+    """现在检查一遍：输入变了的日摘、周摘、近七天摘要都投递（日摘优先）"""
+    return {"status": "ok", "queued": digest_pipeline.enqueue_stale(source="dashboard")}
+
+@app.put("/digests/settings")
+async def digests_settings(req: DigestSettings):
+    app_settings.update("digests", {"enabled": req.enabled})
+    return {"status": "ok", "enabled": req.enabled}
+
+@app.get("/digests/{digest_id}")
+async def digest_detail(digest_id: int):
+    d = digest_pipeline.get_digest(digest_id)
+    return d if d else JSONResponse({"error": "not found"}, status_code=404)
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -3047,7 +3080,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():

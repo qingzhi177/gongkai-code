@@ -469,7 +469,24 @@
 
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
-            <h3>近期摘要</h3>
+            <h3>近七天摘要（新版）</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:10px;">
+                每天的片段整理好以后写一份「日摘」（几行），一周结束写「周摘」，再由最近七天的日摘写成「近七天摘要」——没有聊天的日子会如实写进去。
+                <b>新版现在只在这里看，还不会放进聊天里</b>；以后由它替代下面的旧版近期摘要。
+            </div>
+            <div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="dg-enabled" onchange="setDigestsEnabled(this.checked)"> 自动写</label>
+                <button class="btn" onclick="refreshDigests()">现在检查更新</button>
+                <button class="btn" onclick="loadDigests()" style="background:#6c757d;">刷新</button>
+                <span id="dg-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="dg-recent" style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:12px 14px;margin-bottom:10px;"></div>
+            <details style="margin-bottom:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="dg-days-title">每天的日摘</summary>
+                <div id="dg-days" style="margin-top:8px;"></div></details>
+            <details style="margin-bottom:20px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="dg-weeks-title">周摘</summary>
+                <div id="dg-weeks" style="margin-top:8px;"></div></details>
+
+            <h3 style="margin-top:24px;">近期摘要（旧版，现在放进聊天的是这一份）</h3>
             <div style="margin:15px 0;">
                 <button class="btn" onclick="generateSummary()">生成摘要</button>
                 <button class="btn" onclick="editSummary()" style="background:#28a745;">编辑</button>
@@ -737,7 +754,7 @@
             if (name === 'narrative') loadNarrative();
             if (name === 'episodes') loadEpisodes();
             if (name === 'arcs') loadArcs();
-            if (name === 'summary') loadSummary();
+            if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
         function loadStats() {
@@ -1341,7 +1358,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1362,6 +1379,9 @@ function rebuildProfile() {
             if (j.kind === 'route_arcs' && r.status === 'ok') return '归了 ' + (r.routed || 0) + ' 个片段'
                 + ((r.new_arcs || []).length ? ' · 新主题 ' + r.new_arcs.length + ' 个' : '') + ((r.proposed || []).length ? ' · 待确认 ' + r.proposed.length + ' 个' : '')
                 + ((r.narrate || []).length ? ' · 要写 ' + r.narrate.length + ' 卷' : '');
+            if (j.kind === 'digest_day' && r.status === 'ok') return r.cleared ? r.day + '：没有片段了，日摘作废' : r.day + '：' + (r.lines || 0) + ' 行';
+            if ((j.kind === 'digest_week' || j.kind === 'digest_recent') && r.status === 'ok') return r.empty ? '这段时间没有聊天' : '用了 ' + (r.days || 0) + ' 天的日摘';
+            if (j.kind.indexOf('digest_') === 0 && r.status === 'rejected') return '没通过校验，没有发布';
             if (j.kind === 'narrate_arc') {
                 if (r.status === 'ok') return '《' + (r.title || '') + '》第 ' + r.version + ' 版 · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '');
                 if (r.status === 'rejected') return '没通过校验，保留旧版本';
@@ -2191,6 +2211,64 @@ function rebuildProfile() {
         // ============ Summary 相关函数 ============
         var currentSummaryId = null;
 
+        // ============ 日摘、周摘、近七天摘要（新版）============
+        function digestBlock(d, title) {
+            var h = '<div style="font-size:12px;color:#888;margin-bottom:4px;">' + title + (d.version ? ' · 第 ' + d.version + ' 版' : '') + ' · ' + formatTime(d.created_at) + '</div>'
+                + '<div style="font-size:14px;line-height:1.8;white-space:pre-wrap;">' + escapeHtml(d.body || '') + '</div>';
+            if ((d.refs || []).length) h += '<a href="javascript:void(0)" style="font-size:12px;" onclick="toggleDigestSources(' + d.id + ')">出处</a>'
+                + '<div id="dg-src-' + d.id + '" style="display:none;margin-top:4px;font-size:12px;line-height:1.7;background:#f8f9fa;border-radius:6px;padding:6px 10px;"></div>';
+            return h;
+        }
+
+        function loadDigests() {
+            fetch(API + '/digests').then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('dg-enabled').checked = !!d.enabled;
+                var p = d.pending || {};
+                var todo = (p.days ? p.days + ' 天的日摘、' : '') + (p.weeks ? p.weeks + ' 周的周摘、' : '') + (p.recent ? '近七天摘要、' : '');
+                document.getElementById('dg-status').textContent = (todo ? '待更新：' + todo.replace(/、$/, '') : '都是最新的')
+                    + ((d.failed || []).length ? ' · ' + d.failed.length + ' 份没通过校验' : '');
+                var w = d.window || [];
+                document.getElementById('dg-recent').innerHTML = d.recent ? digestBlock(d.recent, '近七天（' + w[0] + ' ～ ' + w[1] + '）')
+                    : '<span style="color:#888;font-size:13px;">还没有近七天摘要（日摘写好以后会自动写）</span>';
+                document.getElementById('dg-days-title').textContent = '每天的日摘（' + (d.days || []).length + '）';
+                document.getElementById('dg-days').innerHTML = (d.days || []).map(function(x) {
+                    return '<div style="padding:8px 0;border-bottom:1px dashed #eee;">' + digestBlock(x, x.period_start) + '</div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">还没有</div>';
+                document.getElementById('dg-weeks-title').textContent = '周摘（' + (d.weeks || []).length + '）';
+                document.getElementById('dg-weeks').innerHTML = (d.weeks || []).map(function(x) {
+                    return '<div style="padding:8px 0;border-bottom:1px dashed #eee;">' + digestBlock(x, x.period_start + ' ～ ' + x.period_end) + '</div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">还没有（一周结束后才写）</div>';
+            }).catch(function(e) { document.getElementById('dg-status').textContent = '读取失败：' + e; });
+        }
+
+        function toggleDigestSources(id) {
+            var el = document.getElementById('dg-src-' + id);
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.textContent = '读取中…';
+            fetch(API + '/digests/' + id).then(function(r) { return r.json(); }).then(function(d) {
+                el.innerHTML = '<div style="white-space:pre-wrap;margin-bottom:4px;">' + escapeHtml(d.body_with_refs || '') + '</div>'
+                    + (d.sources || []).map(function(s) {
+                        return '<div><b>[#' + s.n + ']</b> ' + (d.kind === 'day' ? (s.day || '') + '《' + escapeHtml(s.title || '') + '》'
+                            : escapeHtml(s.title || '') + '：' + escapeHtml((s.body || '').replace(/\n/g, ' ')))
+                            + (s.status && s.status !== 'active' ? ' <span style="color:#c77c00;">（已更新过）</span>' : '') + '</div>';
+                    }).join('');
+            }).catch(function(e) { el.textContent = '读取失败：' + e; });
+        }
+
+        function refreshDigests() {
+            fetch(API + '/digests/refresh', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('dg-status').textContent = (d.queued || []).length ? '已投递 ' + d.queued.length + ' 个任务，稍后点「刷新」' : '都是最新的，不用更新';
+            });
+        }
+
+        function setDigestsEnabled(on) {
+            fetch(API + '/digests/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) })
+                .then(function(r) { return r.json(); }).then(function() {
+                    document.getElementById('dg-status').textContent = on ? '已开启自动写' : '已关闭（还可以手动点「现在检查更新」）';
+                });
+        }
+
         function loadSummary() {
             // 加载当前摘要
             fetch(API + '/summary/current').then(function(r) { return r.json(); }).then(function(d) {
@@ -2425,6 +2503,7 @@ function rebuildProfile() {
                     {key: 'summary', label: '近期摘要'},
                     {key: 'episode', label: '每日片段', hint: '不设置时用「共同经历叙事」的模型（那个也没设置就用「近期摘要」的）。要选写中文细腻、肯照原文引用的模型。'},
                     {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',
                      hint: '不设置时：用前端选的模型、走当前启用的中转。设置后，Pluvia 的翻译思考链这类小请求改走这里，可以选便宜、快的模型（OpenAI 格式和 Anthropic 格式的供应商都行）；它出错时会自动退回当前中转。选推理模型时，要确认它会把结果写在正文里（推理过程不会转发）。保存后立即生效。'}

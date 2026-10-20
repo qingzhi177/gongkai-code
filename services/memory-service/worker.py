@@ -208,6 +208,7 @@ def build_handlers():
     # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
     from app.pipeline import arcs as arc_pipeline
+    from app.pipeline import digests as digest_pipeline
     from app.pipeline import episodes as episode_pipeline
     from app.pipeline import narrative as narrative_pipeline
     from app.pipeline import profile as profile_pipeline
@@ -233,6 +234,11 @@ def build_handlers():
                 arc_pipeline.enqueue_route()
         except Exception as e:
             logger.error(f"[JOB] 投递归卷失败：{e}")
+        try:                                  # → 那天的日摘（日摘写完会接着投递周摘、近七天摘要）
+            if digest_pipeline.cfg().get("enabled"):
+                digest_pipeline.enqueue_day(payload["day"])
+        except Exception as e:
+            logger.error(f"[JOB] 投递日摘失败：{e}")
         return result
 
     async def route_arcs(payload, job):
@@ -241,8 +247,18 @@ def build_handlers():
     async def narrate_arc(payload, job):
         return await arc_pipeline.narrate_arc(int(payload["arc_id"]))
 
+    async def digest_day(payload, job):
+        return await digest_pipeline.digest_day(payload["day"])
+
+    async def digest_week(payload, job):
+        return await digest_pipeline.digest_week(payload["week"])
+
+    async def digest_recent(payload, job):
+        return await digest_pipeline.digest_recent()
+
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
-            "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc}
+            "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc,
+            "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent}
 
 
 def main():

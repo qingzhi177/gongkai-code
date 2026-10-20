@@ -76,6 +76,10 @@ SPECS = {
         _item("dormant_days", int, 30, 7, 365, 1, "写卷", "多少天没新素材算休眠",
               "这么多天没有新素材的卷转为「休眠」，有新素材时自动醒来。"),
     ],
+    "digests": [
+        _item("enabled", bool, True, None, None, None, "摘要", "自动写日摘、周摘和近七天摘要",
+              "每日片段整理好以后自动写那天的日摘，一周结束写周摘，近七天摘要跟着更新（会调用模型，花一点点钱）。"),
+    ],
 }
 
 TYPE_NAMES = {float: "float", int: "int", bool: "bool", str: "str"}
