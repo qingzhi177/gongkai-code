@@ -208,12 +208,14 @@ def build_handlers():
     # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
     from app.pipeline import arcs as arc_pipeline
+    from app.pipeline import chapters as chapter_pipeline
     from app.pipeline import digests as digest_pipeline
     from app.pipeline import episodes as episode_pipeline
     from app.pipeline import lexicon as lexicon_pipeline
     from app.pipeline import loops as loops_pipeline
     from app.pipeline import narrative as narrative_pipeline
     from app.pipeline import profile as profile_pipeline
+    from app.pipeline import state as state_pipeline
     from app.pipeline import summary as summary_pipeline
 
     def extract(payload, job):
@@ -251,7 +253,19 @@ def build_handlers():
                 loops_pipeline.enqueue_scan()
         except Exception as e:
             logger.error(f"[JOB] 投递未完的事失败：{e}")
+        try:                                  # → 写章节（进行中的那章追加新片段）
+            if chapter_pipeline.cfg().get("enabled"):
+                chapter_pipeline.schedule()
+        except Exception as e:
+            logger.error(f"[JOB] 投递写章节失败：{e}")
         return result
+
+    def _state_soon():
+        try:                                  # 状态卡的材料可能变了：5 分钟后看一下（这期间别的任务还会改材料，攒一攒再写）
+            if state_pipeline.cfg().get("enabled"):
+                state_pipeline.enqueue(delay_sec=300)
+        except Exception as e:
+            logger.error(f"[JOB] 投递关系状态失败：{e}")
 
     async def route_arcs(payload, job):
         return await arc_pipeline.route_arcs()
@@ -266,18 +280,39 @@ def build_handlers():
         return await digest_pipeline.digest_week(payload["week"])
 
     async def digest_recent(payload, job):
-        return await digest_pipeline.digest_recent()
+        result = await digest_pipeline.digest_recent()
+        _state_soon()
+        return result
 
     async def lexicon_scan(payload, job):
         return await lexicon_pipeline.scan()
 
     async def loops_scan(payload, job):
-        return await loops_pipeline.scan()
+        result = await loops_pipeline.scan()
+        _state_soon()
+        return result
+
+    async def state_refresh(payload, job):
+        return await state_pipeline.refresh(force=bool(payload.get("force")))
+
+    async def write_chapter(payload, job):
+        return await chapter_pipeline.write_chapter(int(payload["chapter_id"]), waited=int(payload.get("waited") or 0))
+
+    async def propose_chapters(payload, job):
+        result = await chapter_pipeline.propose()
+        if chapter_pipeline.cfg().get("enabled"):
+            # 在等这次提议的章：看不出要分、分法不合格时现在就开始写；等你确认的提议照样等着
+            try:
+                result["queued"] = chapter_pipeline.schedule(exclude_job=job["id"])["queued"]
+            except Exception as e:
+                logger.error(f"[WORKER] 分章提议以后投递写章节失败：{e}")
+        return result
 
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
             "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc,
             "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent,
-            "lexicon_scan": lexicon_scan, "loops_scan": loops_scan}
+            "lexicon_scan": lexicon_scan, "loops_scan": loops_scan,
+            "state_refresh": state_refresh, "write_chapter": write_chapter, "propose_chapters": propose_chapters}
 
 
 def main():

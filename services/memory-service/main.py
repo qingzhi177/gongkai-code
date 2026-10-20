@@ -43,6 +43,8 @@ from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在�
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
 from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇（现在只生成、不注入）
 from app.pipeline import loops as loops_pipeline       # Phase 4：未完的事（现在只生成、不注入）
+from app.pipeline import state as state_pipeline       # Phase 4：关系状态卡（现在只生成、不注入）
+from app.pipeline import chapters as chapter_pipeline  # Phase 4：章节（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2540,6 +2542,19 @@ async def enqueue_auto_jobs():
                     logger.info(f"未完的事：自动过期 {expired}")
         except Exception as e:
             logger.error(f"未完的事投递失败：{e}", exc_info=True)
+        # 关系状态卡：材料变了就投递（平时由近七天摘要、未完的事写完顺手投递，这里兜底）
+        try:
+            if state_pipeline.cfg().get("enabled") and state_pipeline.is_stale():
+                if state_pipeline.enqueue():
+                    queued.append("state_refresh")
+        except Exception as e:
+            logger.error(f"关系状态投递失败：{e}", exc_info=True)
+        # 章节：有没写进去的片段、要重写的章、封存了还没写摘要的章就投递（平时由每日片段整理完顺手投递，这里兜底）
+        try:
+            if chapter_pipeline.cfg().get("enabled") and chapter_pipeline.pending_work():
+                queued += chapter_pipeline.schedule()["queued"]
+        except Exception as e:
+            logger.error(f"章节投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2599,8 +2614,9 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇", loops_scan="未完的事")
-    prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 "}
+    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇", loops_scan="未完的事",
+                 state_refresh="关系状态", propose_chapters="分章提议")
+    prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 ", "write_chapter:": "写章节 #"}
     label = lambda k: next((p + k.split(":", 1)[1] for pre, p in prefixes.items() if k.startswith(pre)), names.get(k, k))
     msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
     return {"status": "ok", "message": msg, "queued": queued}
@@ -3196,6 +3212,119 @@ async def loops_close(lid: int, req: LoopClose):
 async def loops_reopen(lid: int):
     return _loop_op(loops_pipeline.reopen, lid)
 
+# ============ 关系状态卡、话题边界（Phase 4 第六步；现在只生成、只在 Dashboard 上看，见 app/pipeline/state.py）============
+
+class TopicPolicy(BaseModel):
+    topic: Optional[str] = None
+    keywords: Optional[List[str]] = None
+    policy: Optional[str] = None
+    note: Optional[str] = None
+
+@app.get("/state")
+async def state_overview():
+    """现在的状态卡（以后放进聊天的样子）、每一行的出处、统计信号（只给你看）、话题边界、历史版本"""
+    return {**state_pipeline.overview(), "settings_spec": app_settings.describe("state")}
+
+@app.post("/state/refresh")
+async def state_refresh_now():
+    """现在重写（不管材料变没变）"""
+    return {"status": "ok", "queued": state_pipeline.enqueue(source="dashboard", force=True)}
+
+@app.put("/state/settings")
+async def state_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("state", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("state")}
+
+@app.get("/state/{sid}")
+async def state_version(sid: int):
+    d = state_pipeline.get_version(sid)
+    return d if d else JSONResponse({"error": "not found"}, status_code=404)
+
+@app.get("/topics")
+async def topics_list():
+    return {"policies": state_pipeline.policies(), "names": state_pipeline.POLICIES}
+
+@app.post("/topics")
+async def topics_add(req: TopicPolicy):
+    return _loop_op(state_pipeline.add_policy, req.topic, req.keywords or [], req.policy or "explicit_only", req.note or "")
+
+@app.put("/topics/{pid}")
+async def topics_edit(pid: int, req: TopicPolicy):
+    return _loop_op(state_pipeline.edit_policy, pid, req.topic, req.keywords, req.policy, req.note)
+
+@app.delete("/topics/{pid}")
+async def topics_delete(pid: int):
+    return _loop_op(state_pipeline.delete_policy, pid)
+
+# ============ 章节（Phase 4 第七步；现在只生成、只在 Dashboard 上看，见 app/pipeline/chapters.py）============
+
+class ChapterSeal(BaseModel):
+    end_day: Optional[str] = None
+    title: Optional[str] = None
+
+class ChapterRename(BaseModel):
+    title: Optional[str] = None
+
+class ChapterSplit(BaseModel):
+    chapters: Optional[List[Dict[str, Any]]] = None
+
+@app.get("/chapters")
+async def chapters_overview():
+    """章节目录（以后放进聊天的样子）、每一章的进度、进行中那章的正文、分章提议、旧的共同经历叙事（对比用）"""
+    return {**chapter_pipeline.overview(), "settings_spec": app_settings.describe("chapters")}
+
+@app.post("/chapters/schedule")
+async def chapters_schedule():
+    """现在检查：理顺章节结构，投递要写的章"""
+    return {"status": "ok", **chapter_pipeline.schedule()}
+
+@app.post("/chapters/propose")
+async def chapters_propose():
+    """帮我分章（投递分章提议任务）"""
+    return {"status": "ok", "queued": chapter_pipeline.enqueue_propose(source="dashboard")}
+
+@app.put("/chapters/settings")
+async def chapters_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("chapters", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("chapters")}
+
+@app.post("/chapters/proposals/{pid}/apply")
+async def chapters_apply(pid: int, req: ChapterSplit):
+    """确认分章（可以带上改过的分法）"""
+    return _loop_op(chapter_pipeline.apply_proposal, pid, req.chapters)
+
+@app.post("/chapters/proposals/{pid}/dismiss")
+async def chapters_dismiss(pid: int):
+    return _loop_op(chapter_pipeline.dismiss_proposal, pid)
+
+@app.get("/chapters/{cid}")
+async def chapter_detail(cid: int):
+    d = chapter_pipeline.get_chapter(cid)
+    return d if d else JSONResponse({"error": "not found"}, status_code=404)
+
+@app.post("/chapters/{cid}/seal")
+async def chapter_seal(cid: int, req: ChapterSeal):
+    """这一章到这里（封存），后面的日子进入新的一章"""
+    return _loop_op(chapter_pipeline.seal, cid, req.end_day, req.title)
+
+@app.post("/chapters/{cid}/unseal")
+async def chapter_unseal(cid: int):
+    return _loop_op(chapter_pipeline.unseal, cid)
+
+@app.put("/chapters/{cid}")
+async def chapter_rename(cid: int, req: ChapterRename):
+    return _loop_op(chapter_pipeline.rename, cid, req.title)
+
+@app.post("/chapters/{cid}/rebuild")
+async def chapter_rebuild(cid: int):
+    return _loop_op(chapter_pipeline.rebuild, cid)
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -3239,7 +3368,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "state", "chapter", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():

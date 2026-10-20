@@ -147,6 +147,8 @@
             <button class="tab" onclick="showPanel('arcs')">叙事卷</button>
             <button class="tab" onclick="showPanel('lexicon')">共同语汇</button>
             <button class="tab" onclick="showPanel('loops')">未完的事</button>
+            <button class="tab" onclick="showPanel('state')">关系状态</button>
+            <button class="tab" onclick="showPanel('chapters')">章节</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -523,6 +525,67 @@
                 <div id="lp-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
+        <div id="state" class="panel">
+            <h3>关系状态</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                一张「我们最近」的状态卡：节奏、你的天气、正在一起经历的、最近的亲近时刻，每一句都有出处（日摘、片段、未完的事、主题卷）。
+                它不是打分——每天几条消息、几点来、心情走向这些统计只在下面给你看，不会写进卡片。
+                你可以给不想被主动提起的话题设「话题边界」，卡片会避开它们，只留一句「轻放」。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后每次开始聊天时放进去。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="st-enabled" onchange="saveGroupSettings('state', {enabled: this.checked}, 'st-status', loadState)"> 自动更新</label>
+                <button class="btn" onclick="refreshState()">现在重写</button>
+                <button class="btn" onclick="loadState()" style="background:#6c757d;">刷新</button>
+                <span id="st-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+                <div style="font-size:13px;margin-bottom:6px;"><b>以后放进聊天的样子</b></div>
+                <div id="st-card" style="font-size:14px;line-height:1.9;white-space:pre-wrap;"></div>
+            </div>
+            <div id="st-lines" style="margin-bottom:14px;"></div>
+            <h4 style="margin:6px 0 8px;">话题边界</h4>
+            <div style="font-size:12px;color:#888;margin-bottom:6px;">「你提起时才提」：你不说我就不提；「不主动提起」：永远不主动提。关键词用来认出这个话题（不填就用话题名）。现在用在状态卡上，以后召回也会照着它来。</div>
+            <div id="st-topics" style="margin-bottom:8px;"></div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;margin-bottom:14px;">
+                <input id="st-t-topic" placeholder="话题，比如：工作上的事" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:150px;">
+                <input id="st-t-kw" placeholder="关键词，用顿号分开" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:200px;">
+                <select id="st-t-policy" style="padding:4px;border:1px solid #ddd;border-radius:6px;"><option value="explicit_only">你提起时才提</option><option value="excluded">不主动提起</option><option value="normal">正常</option></select>
+                <button class="btn" style="padding:3px 12px;font-size:12px;background:#28a745;" onclick="addTopic()">加上</button>
+            </div>
+            <details style="margin-bottom:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;">只给你看的统计（不进卡片）</summary>
+                <div id="st-signals" style="margin-top:8px;font-size:12px;"></div></details>
+            <details style="margin-bottom:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="st-hist-title">历史版本</summary>
+                <div id="st-history" style="margin-top:8px;font-size:12px;"></div></details>
+        </div>
+
+        <div id="chapters" class="panel">
+            <h3>章节</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                按时间走的共同经历：一章是我们关系里的一个时期。每天整理好片段以后，新的片段会写进「进行中」的那一章，每一句都有出处。
+                觉得一个阶段结束了，就点「这一章到这里」（可以顺便起标题）；一章跨得很长时，也会请模型提议在哪里分开，<b>要你确认才生效</b>。
+                以后导入旧聊天、补上更早的片段以后，会先请模型提议怎么分章，你确认以后再一章一章写。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后由章节目录和进行中的这一章，替代现在的「共同经历叙事」。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="ch-enabled" onchange="saveGroupSettings('chapters', {enabled: this.checked}, 'ch-status', loadChapters)"> 自动写</label>
+                <button class="btn" onclick="scheduleChapters()">现在检查</button>
+                <button class="btn" onclick="proposeChapters()" style="background:#6f42c1;">帮我分章</button>
+                <button class="btn" onclick="loadChapters()" style="background:#6c757d;">刷新</button>
+                <span id="ch-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+                <div style="font-size:13px;margin-bottom:6px;"><b>章节目录</b>（以后放进聊天的样子）</div>
+                <div id="ch-index" style="font-size:13px;line-height:1.9;white-space:pre-wrap;"></div>
+            </div>
+            <div id="ch-proposals"></div>
+            <div id="ch-list"></div>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">旧版共同经历叙事（对比用；现在放进聊天的还是它）</summary>
+                <div id="ch-legacy" style="margin-top:8px;font-size:13px;line-height:1.8;white-space:pre-wrap;"></div></details>
+            <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
+                <div id="ch-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
             <h3>近七天摘要（新版）</h3>
@@ -812,6 +875,8 @@
             if (name === 'arcs') loadArcs();
             if (name === 'lexicon') loadLexicon();
             if (name === 'loops') loadLoops();
+            if (name === 'state') loadState();
+            if (name === 'chapters') loadChapters();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -1416,7 +1481,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事', state_refresh: '关系状态', write_chapter: '写章节', propose_chapters: '分章提议' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1445,6 +1510,13 @@ function rebuildProfile() {
             if (j.kind === 'loops_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
                 + ((r.new || []).length ? ' · 新的：' + r.new.join('、') : '') + ((r.closed || []).length ? ' · 有了下文：' + r.closed.join('、') : '')
                 + (r.mentioned ? ' · 又提起 ' + r.mentioned + ' 次' : '') + ((r.expired || []).length ? ' · 自动过期 ' + r.expired.length + ' 件' : '');
+            if (j.kind === 'state_refresh' && r.status === 'ok') return r.empty ? '最近七天没有聊天' : '第 ' + r.version + ' 版 · ' + (r.lines || 0) + ' 行';
+            if (j.kind === 'state_refresh' && r.status === 'rejected') return '没通过校验，保留旧的';
+            if (j.kind === 'write_chapter' && (r.status === 'ok' || r.status === 'rejected')) return '第 ' + r.n + ' 章' + (r.rebuild ? '（整章重写）' : '')
+                + ' · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '') + (r.more ? ' · 还有，接着写' : '')
+                + (r.abstract ? ' · 写好了摘要' : '');
+            if (j.kind === 'propose_chapters' && r.status === 'ok') return r.proposal === 'pending' ? '提议分成 ' + r.chapters.length + ' 章，等你确认' : '看不出要分章';
+            if (j.kind === 'propose_chapters' && r.status === 'rejected') return '模型给的分法不合格，没有提议';
             if (j.kind === 'narrate_arc') {
                 if (r.status === 'ok') return '《' + (r.title || '') + '》第 ' + r.version + ' 版 · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '');
                 if (r.status === 'rejected') return '没通过校验，保留旧版本';
@@ -2571,6 +2643,248 @@ function rebuildProfile() {
                 });
         }
 
+        // ============ 通用：一组设置（数字项）============
+        function renderGroupSettings(elId, spec, group, statusId, reload) {
+            var items = (spec.items || []).filter(function(it) { return it.type !== 'bool'; });
+            var el = document.getElementById(elId);
+            if (!items.length) { el.innerHTML = '<div style="color:#888;font-size:12px;">没有可以调的</div>'; return; }
+            el.innerHTML = items.map(function(it) {
+                return '<div style="margin-bottom:8px;"><label>' + escapeHtml(it.label) + ' <input type="number" data-key="' + it.key + '" value="' + it.value + '" min="' + it.min + '" max="' + it.max + '" step="' + it.step
+                    + '" style="width:80px;padding:3px 5px;border:1px solid #ddd;border-radius:6px;"></label>'
+                    + '<div style="font-size:12px;color:#888;">' + escapeHtml(it.help) + '（默认 ' + it.default + '）</div></div>';
+            }).join('') + '<button class="btn" style="padding:3px 12px;font-size:12px;">保存设置</button>';
+            el.querySelector('button').onclick = function() {
+                var values = {};
+                el.querySelectorAll('input[data-key]').forEach(function(i) { values[i.getAttribute('data-key')] = i.value; });
+                saveGroupSettings(group, values, statusId, reload);
+            };
+        }
+
+        function saveGroupSettings(group, values, statusId, reload) {
+            fetch(API + '/' + group + '/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); return; }
+                    if ('enabled' in values) document.getElementById(statusId).textContent = values.enabled ? '已开启' : '已关闭（还可以手动点按钮）';
+                    else if (reload) reload();
+                });
+        }
+
+        function apiCall(method, path, body) {
+            return fetch(API + path, { method: method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d && d.status === 'error') alert(d.message); return d; });
+        }
+
+        // ============ 关系状态 ============
+        var stPolicyNames = {};
+
+        function loadState() {
+            fetch(API + '/state').then(function(r) { return r.json(); }).then(function(d) {
+                stPolicyNames = d.policy_names || {};
+                document.getElementById('st-enabled').checked = !!d.enabled;
+                var cur = d.current;
+                document.getElementById('st-status').textContent = cur ? '第 ' + cur.version + ' 版 · ' + formatTime(cur.created_at) + (d.stale ? ' · 材料有变化，稍后会重写' : '') : '还没有';
+                document.getElementById('st-card').textContent = d.card || '（还没有，整理好片段和日摘以后会自动写）';
+                document.getElementById('st-lines').innerHTML = cur ? (cur.lines || []).map(function(l) {
+                    var srcs = (l.refs || []).map(function(n) { var s = (cur.sources || [])[n - 1]; return s ? '[' + n + '] ' + escapeHtml(s.title) : ''; }).filter(Boolean).join('　');
+                    return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:13px;line-height:1.7;">'
+                        + '<b>' + escapeHtml((d.line_names || {})[l.key] || l.key) + '</b>：' + escapeHtml(l.with_refs || l.text)
+                        + (srcs ? '<div style="font-size:12px;color:#888;margin-top:2px;">出处：' + srcs + '</div>' : '<div style="font-size:12px;color:#888;margin-top:2px;">根据聊天的节奏统计</div>') + '</div>';
+                }).join('') + ((cur.issues || []).length ? '<details style="font-size:12px;color:#888;"><summary>校验时去掉的（' + cur.issues.length + '）</summary>' + cur.issues.map(escapeHtml).join('<br>') + '</details>' : '') : '';
+                renderTopics(d.policies || []);
+                renderSignals(d.signals || {});
+                document.getElementById('st-hist-title').textContent = '历史版本（' + (d.history || []).length + '）';
+                document.getElementById('st-history').innerHTML = (d.history || []).map(function(h) {
+                    return '<div>第 ' + h.version + ' 版 · ' + formatTime(h.created_at) + ' · ' + ({ active: '现在用的', superseded: '旧的', rejected: '没通过校验' }[h.status] || h.status)
+                        + ' <a href="javascript:void(0)" onclick="showStateVersion(' + h.id + ', this)">看看</a></div>';
+                }).join('') || '没有';
+            }).catch(function(e) { document.getElementById('st-status').textContent = '读取失败：' + e; });
+        }
+
+        function showStateVersion(id, a) {
+            fetch(API + '/state/' + id).then(function(r) { return r.json(); }).then(function(v) {
+                var div = document.createElement('div');
+                div.style.cssText = 'background:#f8f9fa;border-radius:6px;padding:6px 10px;margin:4px 0 8px;line-height:1.7;';
+                div.innerHTML = (v.lines || []).map(function(l) { return '· ' + escapeHtml(l.text); }).join('<br>') || ('（没有内容）' + (v.issues || []).map(escapeHtml).join('<br>'));
+                a.parentNode.appendChild(div);
+                a.remove();
+            });
+        }
+
+        function renderTopics(list) {
+            document.getElementById('st-topics').innerHTML = list.length ? list.map(function(p) {
+                return '<div style="font-size:13px;padding:4px 0;"><b>' + escapeHtml(p.topic) + '</b> <span style="font-size:11px;background:#f0f0f5;border-radius:8px;padding:1px 7px;">'
+                    + escapeHtml(stPolicyNames[p.policy] || p.policy) + '</span>' + ((p.keywords || []).length ? ' <span style="color:#888;font-size:12px;">关键词：' + p.keywords.map(escapeHtml).join('、') + '</span>' : '')
+                    + ' <a href="javascript:void(0)" style="font-size:12px;" onclick="editTopic(' + p.id + ', ' + escapeHtml(JSON.stringify(JSON.stringify(p))) + ')">修改</a>'
+                    + ' <a href="javascript:void(0)" style="font-size:12px;color:#c0392b;" onclick="deleteTopic(' + p.id + ')">删掉</a></div>';
+            }).join('') : '<div style="color:#888;font-size:12px;">还没有</div>';
+        }
+
+        function addTopic() {
+            var kw = document.getElementById('st-t-kw').value.split(/[、,，\s]+/).filter(function(x) { return x.trim(); });
+            apiCall('POST', '/topics', { topic: document.getElementById('st-t-topic').value.trim(), keywords: kw, policy: document.getElementById('st-t-policy').value })
+                .then(function(d) { if (d.status === 'ok') { document.getElementById('st-t-topic').value = ''; document.getElementById('st-t-kw').value = ''; loadState(); } });
+        }
+
+        function editTopic(id, raw) {
+            var p = JSON.parse(raw);
+            var kw = prompt('「' + p.topic + '」的关键词（用顿号分开）：', (p.keywords || []).join('、'));
+            if (kw === null) return;
+            var pol = prompt('边界：输入 1 = 你提起时才提，2 = 不主动提起，3 = 正常', { explicit_only: '1', excluded: '2', normal: '3' }[p.policy]);
+            if (pol === null) return;
+            var policy = { '1': 'explicit_only', '2': 'excluded', '3': 'normal' }[pol.trim()];
+            if (!policy) { alert('只能输入 1、2 或 3'); return; }
+            apiCall('PUT', '/topics/' + id, { keywords: kw.split(/[、,，\s]+/).filter(function(x) { return x.trim(); }), policy: policy }).then(loadState);
+        }
+
+        function deleteTopic(id) {
+            if (!confirm('删掉这个话题边界？')) return;
+            apiCall('DELETE', '/topics/' + id).then(loadState);
+        }
+
+        function renderSignals(sig) {
+            var a = sig.this_week || {}, b = sig.last_week || {};
+            var rows = (sig.days || []).slice().reverse().map(function(x) {
+                var v = x.valence == null ? '' : (x.valence > 0 ? '🙂 ' : x.valence < 0 ? '🙁 ' : '😐 ') + x.valence;
+                return '<tr><td>' + x.day.slice(5) + '</td><td>' + x.user + ' / ' + x.ai + '</td><td>' + x.sessions + '</td><td>' + x.minutes + ' 分钟</td><td>' + v + '</td></tr>';
+            }).join('');
+            document.getElementById('st-signals').innerHTML = '<div style="margin-bottom:6px;">最近七天：' + (a.days_chatted || 0) + ' 天聊过、' + (a.sessions || 0) + ' 次、' + (a.messages || 0) + ' 条消息；再往前七天：'
+                + (b.days_chatted || 0) + ' 天、' + (b.sessions || 0) + ' 次、' + (b.messages || 0) + ' 条。' + (sig.night_share != null ? '你的消息有 ' + Math.round(sig.night_share * 100) + '% 在深夜（23 点到凌晨 4 点）。' : '') + '</div>'
+                + '<table style="border-collapse:collapse;font-size:12px;"><tr style="color:#888;"><td style="padding-right:14px;">日子</td><td style="padding-right:14px;">你 / 我（条）</td><td style="padding-right:14px;">聊了几次</td><td style="padding-right:14px;">大约多久</td><td>那天记忆的心情</td></tr>' + rows + '</table>';
+        }
+
+        function refreshState() {
+            apiCall('POST', '/state/refresh').then(function(d) { document.getElementById('st-status').textContent = d.queued ? '已开始重写，稍后点「刷新」' : '已经在排队了，稍后点「刷新」'; });
+        }
+
+        // ============ 章节 ============
+        var chData = null;
+
+        function loadChapters() {
+            fetch(API + '/chapters').then(function(r) { return r.json(); }).then(function(d) {
+                chData = d;
+                document.getElementById('ch-enabled').checked = !!d.enabled;
+                var cs = d.chapters || [];
+                var unwritten = cs.reduce(function(s, c) { return s + (c.unwritten || 0); }, 0);
+                document.getElementById('ch-status').textContent = cs.length + ' 章' + (unwritten ? ' · 还有 ' + unwritten + ' 个片段没写进去' : '') + (d.waiting ? ' · ' + d.waiting : '');
+                document.getElementById('ch-index').textContent = d.index || '（还没有，整理好片段以后会自动写）';
+                renderProposals(d.proposals || []);
+                document.getElementById('ch-list').innerHTML = cs.slice().reverse().map(chapterCard).join('');
+                if (d.current) showChapterSections(d.current.id, d.current);
+                document.getElementById('ch-legacy').textContent = d.legacy ? d.legacy.content : '（旧版共同经历叙事现在是空的）';
+                renderGroupSettings('ch-settings', d.settings_spec || {}, 'chapters', 'ch-status', loadChapters);
+            }).catch(function(e) { document.getElementById('ch-status').textContent = '读取失败：' + e; });
+        }
+
+        function chapterCard(c) {
+            var cur = c.status === 'current';
+            var cs = chData.chapters || [];
+            var lastSealed = cs.filter(function(x) { return x.status === 'sealed'; }).pop();
+            var canUnseal = lastSealed && lastSealed.id === c.id && cs.some(function(x) { return x.status === 'current' && x.n === c.n + 1; });
+            return '<div style="background:#fff;border:1px solid ' + (cur ? '#b9a6e0' : '#e5e5e5') + ';border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+                + '<div><b style="font-size:15px;">第 ' + c.n + ' 章' + (c.title ? '「' + escapeHtml(c.title) + '」' : '') + '</b> <span style="font-size:11px;background:' + (cur ? '#efe8fb' : '#f0f0f5') + ';border-radius:8px;padding:1px 7px;">'
+                + escapeHtml((chData.status_cn || {})[c.status] || c.status) + '</span> <span style="font-size:12px;color:#888;">' + escapeHtml(c.range) + '</span></div>'
+                + '<div style="font-size:14px;line-height:1.7;margin-top:4px;">' + escapeHtml(cur ? (c.summary || '（还没写）') : (c.abstract || '（摘要还没写）')) + '</div>'
+                + '<div style="font-size:12px;color:#888;margin-top:4px;">' + c.days + ' 天 · ' + c.episodes + ' 个片段 · 写进 ' + c.written + ' 个' + (c.skipped ? '（' + c.skipped + ' 个没通过校验）' : '')
+                + (c.unwritten ? ' · 还有 ' + c.unwritten + ' 个没写' : '') + ' · ' + c.sections + ' 个小节 ' + c.chars + ' 字' + (c.needs_rebuild ? ' · 要整章重写' : '') + '</div>'
+                + '<div style="margin-top:6px;font-size:12px;display:flex;flex-wrap:wrap;gap:10px;">'
+                + '<a href="javascript:void(0)" onclick="showChapterSections(' + c.id + ')">正文</a>'
+                + '<a href="javascript:void(0)" onclick="renameChapter(' + c.id + ')">改标题</a>'
+                + (cur ? '<a href="javascript:void(0)" style="color:#6f42c1;" onclick="sealChapter(' + c.id + ')">这一章到这里</a>' : '')
+                + (canUnseal ? '<a href="javascript:void(0)" style="color:#888;" onclick="unsealChapter(' + c.id + ')">撤销封存</a>' : '')
+                + '<a href="javascript:void(0)" style="color:#888;" onclick="rebuildChapter(' + c.id + ')">整章重写</a></div>'
+                + '<div id="ch-sec-' + c.id + '" style="display:none;margin-top:8px;"></div></div>';
+        }
+
+        function showChapterSections(id, data) {
+            var el = document.getElementById('ch-sec-' + id);
+            if (!el) return;
+            if (!data && el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            var render = function(c) {
+                el.innerHTML = (c.sections || []).map(function(s) {
+                    var srcs = (s.sources || []).map(function(x) { return '[' + x.n + '] ' + escapeHtml(x.title || ('片段 #' + x.id)) + (x.day ? '（' + x.day + '）' : '') + (x.status && x.status !== 'active' ? '（已作废）' : ''); }).join('　');
+                    return '<div style="margin-bottom:10px;"><div style="font-weight:600;font-size:13px;">' + escapeHtml(s.title) + '</div>'
+                        + '<div style="font-size:14px;line-height:1.8;white-space:pre-wrap;">' + escapeHtml(s.body) + '</div>'
+                        + (srcs ? '<details style="font-size:12px;color:#888;"><summary>出处</summary><div style="line-height:1.7;">' + escapeHtml(s.body_with_refs || '') + '</div><div>' + srcs + '</div></details>' : '') + '</div>';
+                }).join('') || '<div style="color:#888;font-size:13px;">还没有正文</div>';
+            };
+            if (data) { render(data); return; }
+            el.textContent = '读取中…';
+            fetch(API + '/chapters/' + id).then(function(r) { return r.json(); }).then(render);
+        }
+
+        function renderProposals(list) {
+            var pend = list.filter(function(p) { return p.status === 'pending'; })[0];
+            var el = document.getElementById('ch-proposals');
+            if (!pend) {
+                var last = list[0];
+                el.innerHTML = last ? '<div style="font-size:12px;color:#888;margin-bottom:10px;">最近一次分章提议：' + formatTime(last.created_at) + ' · '
+                    + ({ applied: '已确认', dismissed: '没采用', nochange: '看不出要分章', rejected: '模型给的分法不合格' }[last.status] || last.status) + '</div>' : '';
+                return;
+            }
+            var inp = 'style="padding:3px 5px;border:1px solid #ddd;border-radius:6px;font-size:12px;"';
+            el.innerHTML = '<div style="background:#fffbea;border:1px solid #f0e2a0;border-radius:8px;padding:10px 14px;margin-bottom:12px;">'
+                + '<div style="font-size:13px;margin-bottom:6px;"><b>分章提议</b>（' + formatTime(pend.created_at) + '）：可以改标题和日期，确认后才生效</div>'
+                + pend.chapters.map(function(c, k) {
+                    return '<div style="margin-bottom:6px;font-size:12px;">第 ' + (k + 1) + ' 章 <input id="chp-t-' + k + '" ' + inp + ' value="' + escapeHtml(c.title) + '" style="width:160px;"> '
+                        + '<input id="chp-s-' + k + '" ' + inp + ' value="' + c.start + '" style="width:100px;"> 到 '
+                        + (c.end ? '<input id="chp-e-' + k + '" ' + inp + ' value="' + c.end + '" style="width:100px;">' : '现在（进行中）')
+                        + '<div style="color:#888;margin-left:42px;">' + escapeHtml(c.why || '') + '</div></div>';
+                }).join('')
+                + '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="applyProposal(' + pend.id + ', ' + pend.chapters.length + ')">确认分章</button> '
+                + '<button class="btn" style="padding:3px 12px;font-size:12px;background:#6c757d;" onclick="dismissProposal(' + pend.id + ')">不用了</button></div>';
+        }
+
+        function applyProposal(id, count) {
+            var chapters = [];
+            for (var k = 0; k < count; k++) {
+                var e = document.getElementById('chp-e-' + k);
+                chapters.push({ title: document.getElementById('chp-t-' + k).value.trim(), start: document.getElementById('chp-s-' + k).value.trim(), end: e ? e.value.trim() : null });
+            }
+            if (!confirm('按这个分法分成 ' + count + ' 章？前面的章会封存并重新写。')) return;
+            apiCall('POST', '/chapters/proposals/' + id + '/apply', { chapters: chapters }).then(loadChapters);
+        }
+
+        function dismissProposal(id) { apiCall('POST', '/chapters/proposals/' + id + '/dismiss').then(loadChapters); }
+
+        function sealChapter(id) {
+            var c = (chData.chapters || []).filter(function(x) { return x.id === id; })[0];
+            var end = prompt('这一章到哪一天结束？（默认是最后一次聊天的那天）', c.last_day || '');
+            if (end === null) return;
+            var title = prompt('给这一章起个标题吧（可以不填，会自动起一个）：', c.title || '');
+            if (title === null) return;
+            apiCall('POST', '/chapters/' + id + '/seal', { end_day: end.trim() || null, title: title.trim() || null }).then(loadChapters);
+        }
+
+        function unsealChapter(id) {
+            if (!confirm('撤销封存？后面进行中的那一章会并回这一章。')) return;
+            apiCall('POST', '/chapters/' + id + '/unseal').then(loadChapters);
+        }
+
+        function renameChapter(id) {
+            var c = (chData.chapters || []).filter(function(x) { return x.id === id; })[0];
+            var t = prompt('这一章的标题：', c.title || '');
+            if (t === null) return;
+            apiCall('PUT', '/chapters/' + id, { title: t.trim() || null }).then(loadChapters);
+        }
+
+        function rebuildChapter(id) {
+            if (!confirm('整章重写？会从这一章的第一天重新写。')) return;
+            apiCall('POST', '/chapters/' + id + '/rebuild').then(loadChapters);
+        }
+
+        function scheduleChapters() {
+            apiCall('POST', '/chapters/schedule').then(function(d) {
+                document.getElementById('ch-status').textContent = (d.queued || []).length ? '已开始写，稍后点「刷新」' : '没有要写的';
+            });
+        }
+
+        function proposeChapters() {
+            apiCall('POST', '/chapters/propose').then(function(d) {
+                document.getElementById('ch-status').textContent = d.queued ? '已经请模型提议了，稍后点「刷新」' : '已经在提议了';
+            });
+        }
+
         // ============ 日摘、周摘、近七天摘要（新版）============
         function digestBlock(d, title) {
             var h = '<div style="font-size:12px;color:#888;margin-bottom:4px;">' + title + (d.version ? ' · 第 ' + d.version + ' 版' : '') + ' · ' + formatTime(d.created_at) + '</div>'
@@ -2865,6 +3179,8 @@ function rebuildProfile() {
                     {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'lexicon', label: '共同语汇', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'loops', label: '未完的事', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'state', label: '关系状态', hint: '不设置时用「日摘·周摘」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
+                    {key: 'chapter', label: '章节', hint: '不设置时用「叙事卷（写卷）」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
                     {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',
