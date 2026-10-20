@@ -145,6 +145,7 @@
             <button class="tab" onclick="showPanel('narrative')">共同经历</button>
             <button class="tab" onclick="showPanel('episodes')">每日片段</button>
             <button class="tab" onclick="showPanel('arcs')">叙事卷</button>
+            <button class="tab" onclick="showPanel('lexicon')">共同语汇</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -467,6 +468,33 @@
                 <div id="arc-rejected" style="margin-top:8px;"></div></details>
         </div>
 
+        <!-- 共同语汇（Phase 4 第四步）-->
+        <div id="lexicon" class="panel">
+            <h3>共同语汇</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                只有我们之间才懂的称呼、小梗、固定说法、口头禅、歌……每天整理完对话以后自动找；每个词都必须在原文里一字不差地出现过，
+                次数、天数、谁先说的都按原文直接数。在两天以上的对话里出现过的自动收下，只出现过一天的放在候选里等你看。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后聊天时提到这些词，会附上一行它的来处。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="lx-enabled" onchange="setLexEnabled(this.checked)"> 自动找</label>
+                <button class="btn" onclick="scanLex()">现在扫描</button>
+                <button class="btn" onclick="addLex()" style="background:#28a745;">自己加一个词</button>
+                <button class="btn" onclick="loadLexicon()" style="background:#6c757d;">刷新</button>
+                <span id="lx-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div style="background:#f8f9fa;border-radius:8px;padding:10px 12px;margin-bottom:14px;">
+                <div style="font-size:13px;margin-bottom:6px;"><b>试一试</b>：输入一句话，看看以后聊天时会想起哪些词、附上哪一行</div>
+                <div style="display:flex;gap:8px;"><input id="lx-try" style="flex:1;padding:6px 8px;border:1px solid #ddd;border-radius:6px;" placeholder="比如：晚安，梦里见"
+                    onkeydown="if(event.key==='Enter')tryLex()"><button class="btn" onclick="tryLex()">试一试</button></div>
+                <div id="lx-try-out" style="font-size:13px;line-height:1.8;margin-top:6px;"></div>
+            </div>
+            <div id="lx-candidate"></div>
+            <div id="lx-active"></div>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="lx-rej-title">不要的</summary>
+                <div id="lx-rejected" style="margin-top:8px;"></div></details>
+        </div>
+
         <!-- Summary 页面 -->
         <div id="summary" class="panel">
             <h3>近七天摘要（新版）</h3>
@@ -754,6 +782,7 @@
             if (name === 'narrative') loadNarrative();
             if (name === 'episodes') loadEpisodes();
             if (name === 'arcs') loadArcs();
+            if (name === 'lexicon') loadLexicon();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -1358,7 +1387,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1382,6 +1411,8 @@ function rebuildProfile() {
             if (j.kind === 'digest_day' && r.status === 'ok') return r.cleared ? r.day + '：没有片段了，日摘作废' : r.day + '：' + (r.lines || 0) + ' 行';
             if ((j.kind === 'digest_week' || j.kind === 'digest_recent') && r.status === 'ok') return r.empty ? '这段时间没有聊天' : '用了 ' + (r.days || 0) + ' 天的日摘';
             if (j.kind.indexOf('digest_') === 0 && r.status === 'rejected') return '没通过校验，没有发布';
+            if (j.kind === 'lexicon_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
+                + ((r.new || []).length ? ' · 新词：' + r.new.join('、') : '') + ((r.activated || []).length ? ' · 自动收下：' + r.activated.join('、') : '');
             if (j.kind === 'narrate_arc') {
                 if (r.status === 'ok') return '《' + (r.title || '') + '》第 ' + r.version + ' 版 · 写进 ' + (r.written || 0) + ' 个片段' + (r.skipped ? '（' + r.skipped + ' 个没通过校验）' : '');
                 if (r.status === 'rejected') return '没通过校验，保留旧版本';
@@ -2211,6 +2242,135 @@ function rebuildProfile() {
         // ============ Summary 相关函数 ============
         var currentSummaryId = null;
 
+        // ============ 共同语汇 ============
+        var lexCache = {}, lexKinds = {};
+
+        function loadLexicon() {
+            fetch(API + '/lexicon').then(function(r) { return r.json(); }).then(function(d) {
+                lexKinds = d.kinds || {};
+                document.getElementById('lx-enabled').checked = !!d.enabled;
+                document.getElementById('lx-status').textContent = '收下 ' + d.active.length + ' 个 · 候选 ' + d.candidate.length + ' 个 · 扫过 '
+                    + d.scanned_chunks + ' 段对话' + (d.pending_chunks ? ' · 还有 ' + d.pending_chunks + ' 段没扫' : '');
+                lexCache = {};
+                [].concat(d.active, d.candidate, d.rejected).forEach(function(x) { lexCache[x.id] = x; });
+                document.getElementById('lx-candidate').innerHTML = d.candidate.length
+                    ? '<h4 style="margin:6px 0 8px;">候选（只在一天里出现过，等你看）</h4>' + d.candidate.map(lexCard).join('') : '';
+                document.getElementById('lx-active').innerHTML = '<h4 style="margin:14px 0 8px;">收下的</h4>'
+                    + (d.active.map(lexCard).join('') || '<div style="color:#888;font-size:13px;">还没有</div>');
+                document.getElementById('lx-rej-title').textContent = '不要的（' + d.rejected.length + '）';
+                document.getElementById('lx-rejected').innerHTML = d.rejected.map(function(x) {
+                    return '<div style="font-size:13px;padding:4px 0;">' + escapeHtml(x.term) + ' <a href="javascript:void(0)" onclick="lexPost(' + x.id + ', \'restore\')">撤销</a></div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">没有</div>';
+            }).catch(function(e) { document.getElementById('lx-status').textContent = '读取失败：' + e; });
+        }
+
+        function lexMeta(x) {
+            var who = { user: '你', ai: '我' }[x.coined_by] || '';
+            var parts = [];
+            if (who && x.origin_ts) parts.push(who + '在 ' + formatTime(x.origin_ts).substring(0, 10) + ' 第一次说');
+            parts.push('用了 ' + (x.use_count || 0) + ' 次 · ' + (x.days_seen || 0) + ' 天');
+            if (x.last_used) parts.push('最近 ' + formatTime(x.last_used).substring(0, 10));
+            return parts.join(' · ');
+        }
+
+        function lexCard(x) {
+            var cand = x.status === 'candidate';
+            return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+                + '<div><b style="font-size:15px;">' + escapeHtml(x.term) + '</b> <span style="font-size:11px;background:#f0f0f5;border-radius:8px;padding:1px 7px;">'
+                + escapeHtml(lexKinds[x.kind] || x.kind || '') + '</span>'
+                + ((x.aliases || []).length ? ' <span style="font-size:12px;color:#888;">也叫：' + x.aliases.map(escapeHtml).join('、') + '</span>' : '') + '</div>'
+                + (x.meaning ? '<div style="font-size:14px;line-height:1.7;margin-top:4px;">' + escapeHtml(x.meaning) + (x.edited ? ' <span style="font-size:11px;color:#aaa;">（你改过）</span>' : '') + '</div>' : '')
+                + '<div style="font-size:12px;color:#888;margin-top:4px;">' + lexMeta(x) + '</div>'
+                + '<div style="margin-top:6px;font-size:12px;">'
+                + (cand ? '<a href="javascript:void(0)" onclick="lexPost(' + x.id + ', \'confirm\')">收下</a> · ' : '')
+                + '<a href="javascript:void(0)" onclick="toggleLex(' + x.id + ')">详情和修改</a>'
+                + ' · <a href="javascript:void(0)" style="color:#c0392b;" onclick="rejectLex(' + x.id + ')">不要</a></div>'
+                + '<div id="lx-detail-' + x.id + '" style="display:none;margin-top:8px;"></div></div>';
+        }
+
+        function toggleLex(id) {
+            var el = document.getElementById('lx-detail-' + id);
+            if (el.style.display !== 'none') { el.style.display = 'none'; return; }
+            el.style.display = 'block';
+            el.textContent = '读取中…';
+            fetch(API + '/lexicon/' + id).then(function(r) { return r.json(); }).then(function(x) {
+                var kinds = Object.keys(lexKinds).map(function(k) { return '<option value="' + k + '"' + (k === x.kind ? ' selected' : '') + '>' + lexKinds[k] + '</option>'; }).join('');
+                var others = Object.keys(lexCache).filter(function(k) { return +k !== id && lexCache[k].status !== 'rejected'; })
+                    .map(function(k) { return '<option value="' + k + '">' + escapeHtml(lexCache[k].term) + '</option>'; }).join('');
+                var inp = 'style="width:100%;padding:5px 7px;border:1px solid #ddd;border-radius:6px;margin-bottom:6px;"';
+                el.innerHTML = '<div style="font-size:12px;color:#666;margin-bottom:4px;">以后聊天时附上的一行：</div>'
+                    + '<div style="font-size:13px;background:#f8f9fa;border-radius:6px;padding:6px 10px;margin-bottom:8px;">' + escapeHtml(x.origin_line || '') + '</div>'
+                    + '<div style="font-size:12px;color:#666;margin-bottom:4px;">用到它的消息（共 ' + x.occurrence_total + ' 条）：</div>'
+                    + (x.occurrences || []).map(function(o) {
+                        return '<div style="font-size:12px;line-height:1.6;"><span style="color:#888;">' + formatTime(o.ts) + ' ' + (o.role === 'user' ? '你' : '我') + '：</span>' + escapeHtml(o.snippet) + '</div>';
+                    }).join('')
+                    + '<div style="margin-top:10px;font-size:12px;color:#666;">修改：</div>'
+                    + '<input id="lx-e-term-' + id + '" ' + inp + ' value="' + escapeHtml(x.term) + '" placeholder="词">'
+                    + '<input id="lx-e-alias-' + id + '" ' + inp + ' value="' + escapeHtml((x.aliases || []).join('、')) + '" placeholder="别的叫法，用顿号分开">'
+                    + '<select id="lx-e-kind-' + id + '" ' + inp + '>' + kinds + '</select>'
+                    + '<textarea id="lx-e-meaning-' + id + '" ' + inp + ' rows="2" placeholder="在我们之间是什么意思、怎么来的">' + escapeHtml(x.meaning || '') + '</textarea>'
+                    + '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="saveLex(' + id + ')">保存</button>'
+                    + (others ? ' <span style="font-size:12px;margin-left:10px;">并入：</span><select id="lx-merge-' + id + '" style="padding:3px;">' + others + '</select>'
+                        + ' <button class="btn" style="padding:3px 12px;font-size:12px;background:#6f42c1;" onclick="mergeLex(' + id + ')">并入</button>' : '');
+            }).catch(function(e) { el.textContent = '读取失败：' + e; });
+        }
+
+        function lexPost(id, action, body, method) {
+            return fetch(API + '/lexicon/' + id + (action ? '/' + action : ''), { method: method || 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}) }).then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') alert(d.message);
+                    loadLexicon();
+                    return d;
+                });
+        }
+
+        function saveLex(id) {
+            var aliases = document.getElementById('lx-e-alias-' + id).value.split(/[、,，\s]+/).filter(function(a) { return a.trim(); });
+            lexPost(id, '', { term: document.getElementById('lx-e-term-' + id).value.trim(), aliases: aliases,
+                kind: document.getElementById('lx-e-kind-' + id).value, meaning: document.getElementById('lx-e-meaning-' + id).value.trim() }, 'PUT');
+        }
+
+        function mergeLex(id) {
+            var into = +document.getElementById('lx-merge-' + id).value;
+            if (!confirm('把「' + lexCache[id].term + '」并进「' + lexCache[into].term + '」？它会变成那个词的别名。')) return;
+            lexPost(id, 'merge', { into: into });
+        }
+
+        function rejectLex(id) {
+            if (!confirm('不要「' + lexCache[id].term + '」了吗？以后扫到也不会再提（可以在「不要的」里撤销）。')) return;
+            lexPost(id, 'reject');
+        }
+
+        function addLex() {
+            var t = prompt('要加的词（原文里怎么说就怎么写）：');
+            if (!t || !t.trim()) return;
+            var m = prompt('它在我们之间是什么意思、怎么来的（可以不填）：') || '';
+            fetch(API + '/lexicon', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ term: t.trim(), meaning: m.trim() }) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') alert(d.message); loadLexicon(); });
+        }
+
+        function tryLex() {
+            var t = document.getElementById('lx-try').value;
+            fetch(API + '/lexicon/match?text=' + encodeURIComponent(t)).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('lx-try-out').innerHTML = (d.hits || []).length ? d.hits.map(function(h) {
+                    return '<div>· ' + escapeHtml(h.line) + (h.matched !== h.term ? ' <span style="color:#888;font-size:12px;">（命中别名「' + escapeHtml(h.matched) + '」）</span>' : '') + '</div>';
+                }).join('') : '<span style="color:#888;">没有提到收下的词</span>';
+            });
+        }
+
+        function scanLex() {
+            fetch(API + '/lexicon/scan', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('lx-status').textContent = d.queued ? '已开始扫描，稍后点「刷新」' : '扫描已经在进行中了';
+            });
+        }
+
+        function setLexEnabled(on) {
+            fetch(API + '/lexicon/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: on }) })
+                .then(function(r) { return r.json(); }).then(function() {
+                    document.getElementById('lx-status').textContent = on ? '已开启自动找' : '已关闭（还可以手动点「现在扫描」）';
+                });
+        }
+
         // ============ 日摘、周摘、近七天摘要（新版）============
         function digestBlock(d, title) {
             var h = '<div style="font-size:12px;color:#888;margin-bottom:4px;">' + title + (d.version ? ' · 第 ' + d.version + ' 版' : '') + ' · ' + formatTime(d.created_at) + '</div>'
@@ -2503,6 +2663,7 @@ function rebuildProfile() {
                     {key: 'summary', label: '近期摘要'},
                     {key: 'episode', label: '每日片段', hint: '不设置时用「共同经历叙事」的模型（那个也没设置就用「近期摘要」的）。要选写中文细腻、肯照原文引用的模型。'},
                     {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'lexicon', label: '共同语汇', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',

@@ -80,6 +80,12 @@ SPECS = {
         _item("enabled", bool, True, None, None, None, "摘要", "自动写日摘、周摘和近七天摘要",
               "每日片段整理好以后自动写那天的日摘，一周结束写周摘，近七天摘要跟着更新（会调用模型，花一点点钱）。"),
     ],
+    "lexicon": [
+        _item("enabled", bool, True, None, None, None, "语汇", "自动找共同语汇",
+              "每日片段整理好以后，扫一遍那天的对话找新的称呼、小梗、固定说法（会调用模型，花一点点钱）。"),
+        _item("auto_activate_days", int, 2, 1, 10, 1, "语汇", "出现几天就自动收下",
+              "候选的词在这么多天的对话里都出现过，就自动收下（1 = 找到就收下）。没到的留在候选里等你看。"),
+    ],
 }
 
 TYPE_NAMES = {float: "float", int: "int", bool: "bool", str: "str"}

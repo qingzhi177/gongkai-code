@@ -41,6 +41,7 @@ from app import branches as conv_branches   # 分支会话：和原会话重合�
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
+from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇（现在只生成、不注入）
 
 load_dotenv()
 
@@ -2521,6 +2522,13 @@ async def enqueue_auto_jobs():
                 queued += digest_pipeline.enqueue_stale()
         except Exception as e:
             logger.error(f"摘要投递失败：{e}", exc_info=True)
+        # 共同语汇：还有没扫过的对话块就投递（平时由每日片段整理完顺手投递，这里兜底）
+        try:
+            if lexicon_pipeline.cfg().get("enabled") and lexicon_pipeline.pending_chunks():
+                if lexicon_pipeline.enqueue_scan():
+                    queued.append("lexicon_scan")
+        except Exception as e:
+            logger.error(f"共同语汇投递失败：{e}", exc_info=True)
         config = read_auto_config()
         if not config or config["enabled"] != 1:
             return queued
@@ -2580,7 +2588,7 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    names.update(route_arcs="归卷", digest_recent="近七天摘要")
+    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇")
     prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 "}
     label = lambda k: next((p + k.split(":", 1)[1] for pre, p in prefixes.items() if k.startswith(pre)), names.get(k, k))
     msg = "检查已执行，" + ("已投递：" + "、".join(label(k) for k in queued) if queued else "没有需要新投递的任务")
@@ -3037,6 +3045,79 @@ async def digest_detail(digest_id: int):
     d = digest_pipeline.get_digest(digest_id)
     return d if d else JSONResponse({"error": "not found"}, status_code=404)
 
+# ============ 共同语汇（Phase 4 第四步；现在只生成、只在 Dashboard 上看，见 app/pipeline/lexicon.py）============
+
+class LexiconEdit(BaseModel):
+    term: Optional[str] = None
+    aliases: Optional[List[str]] = None
+    kind: Optional[str] = None
+    meaning: Optional[str] = None
+
+class LexiconMerge(BaseModel):
+    into: int
+
+class LexiconSettings(BaseModel):
+    enabled: bool
+
+def _lex_op(fn, *args):
+    try:
+        out = fn(*args)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", "result": out}
+
+@app.get("/lexicon")
+async def lexicon_overview():
+    """收下的、候选、不要的、合并过的词；扫了多少对话块、还有多少没扫"""
+    return lexicon_pipeline.overview()
+
+@app.get("/lexicon/match")
+async def lexicon_match(text: str = ""):
+    """试一试：这句话里提到了哪些收下的词，以后聊天时会注入哪一行"""
+    return {"hits": lexicon_pipeline.match(text[:2000])}
+
+@app.post("/lexicon/scan")
+async def lexicon_scan_now():
+    return {"status": "ok", "queued": lexicon_pipeline.enqueue_scan(source="dashboard")}
+
+@app.post("/lexicon")
+async def lexicon_add(req: LexiconEdit):
+    """你自己加一个词（直接收下）"""
+    return _lex_op(lexicon_pipeline.add, req.term, req.kind or "other", req.meaning or "", req.aliases or [])
+
+@app.put("/lexicon/settings")
+async def lexicon_settings(req: LexiconSettings):
+    app_settings.update("lexicon", {"enabled": req.enabled})
+    return {"status": "ok", "enabled": req.enabled}
+
+@app.get("/lexicon/{lid}")
+async def lexicon_detail(lid: int):
+    try:
+        return lexicon_pipeline.detail(lid)
+    except ValueError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+@app.post("/lexicon/{lid}/confirm")
+async def lexicon_confirm(lid: int):
+    return _lex_op(lexicon_pipeline.confirm, lid)
+
+@app.post("/lexicon/{lid}/reject")
+async def lexicon_reject(lid: int):
+    return _lex_op(lexicon_pipeline.reject, lid)
+
+@app.post("/lexicon/{lid}/restore")
+async def lexicon_restore(lid: int):
+    return _lex_op(lexicon_pipeline.restore, lid)
+
+@app.put("/lexicon/{lid}")
+async def lexicon_edit(lid: int, req: LexiconEdit):
+    return _lex_op(lexicon_pipeline.edit, lid, req.term, req.aliases, req.kind, req.meaning)
+
+@app.post("/lexicon/{lid}/merge")
+async def lexicon_merge(lid: int, req: LexiconMerge):
+    """并进另一个词（这个词和它的别名都变成那个词的别名）"""
+    return _lex_op(lexicon_pipeline.merge, lid, req.into)
+
 # ============ Pipeline Status API ============
 
 @app.get("/pipeline/status")
@@ -3080,7 +3161,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():

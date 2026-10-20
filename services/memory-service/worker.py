@@ -210,6 +210,7 @@ def build_handlers():
     from app.pipeline import arcs as arc_pipeline
     from app.pipeline import digests as digest_pipeline
     from app.pipeline import episodes as episode_pipeline
+    from app.pipeline import lexicon as lexicon_pipeline
     from app.pipeline import narrative as narrative_pipeline
     from app.pipeline import profile as profile_pipeline
     from app.pipeline import summary as summary_pipeline
@@ -239,6 +240,11 @@ def build_handlers():
                 digest_pipeline.enqueue_day(payload["day"])
         except Exception as e:
             logger.error(f"[JOB] 投递日摘失败：{e}")
+        try:                                  # → 找共同语汇
+            if lexicon_pipeline.cfg().get("enabled"):
+                lexicon_pipeline.enqueue_scan()
+        except Exception as e:
+            logger.error(f"[JOB] 投递共同语汇失败：{e}")
         return result
 
     async def route_arcs(payload, job):
@@ -256,9 +262,13 @@ def build_handlers():
     async def digest_recent(payload, job):
         return await digest_pipeline.digest_recent()
 
+    async def lexicon_scan(payload, job):
+        return await lexicon_pipeline.scan()
+
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
             "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc,
-            "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent}
+            "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent,
+            "lexicon_scan": lexicon_scan}
 
 
 def main():
