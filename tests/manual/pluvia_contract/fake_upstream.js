@@ -5,8 +5,20 @@ const fs = require('fs');
 const LOG = (process.env.GWTEST_DIR || '/tmp/gwtest') + '/upstream.jsonl';
 
 function sse(res, ev, data) { res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); }
+// [U] 场景：中文、少见的颜文字符号（4 字节）、组合附加符号、表情
+const KAO = '\u{169B9}\u200E\u0847\u{169B9}\u200E ^_ \u00A0 \u032B _ \u0325\u4E36 暗色里，晚安\u{1F319}';
+const sleepMs = ms => new Promise(r => setTimeout(r, ms));
+// 把一段 SSE 分成好几块发，每一块都在某个字的中间断开（模拟网络把一个字切在两块数据里）
+async function splitWrite(res, str) {
+  const b = Buffer.from(str, 'utf8');
+  const cuts = [];
+  for (let i = 1; i < b.length && cuts.length < 8; i++) if ((b[i] & 0xC0) === 0x80 && (b[i - 1] & 0xC0) !== 0x80) cuts.push(i);
+  let prev = 0;
+  for (const c of cuts) { res.write(b.subarray(prev, c)); prev = c; await sleepMs(25); }
+  res.write(b.subarray(prev));
+}
 function scenario(body) {
-  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N)\]/g);
+  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N|U)\]/g);
   return m ? m[m.length - 1][1] : 'A';
 }
 function resultIds(msgs) {
@@ -35,6 +47,31 @@ http.createServer((req, res) => {
       res.statusCode = 503;
       res.setHeader('content-type', 'application/json');
       return res.end(JSON.stringify({ error: { message: 'No available accounts: no available accounts' } }));
+    }
+    if (scen === 'U' && body.stream) {   // 回复里的字被切在两块数据中间：网关要能拼回去
+      res.setHeader('content-type', 'text/event-stream');
+      if (target === 'oa') {
+        await splitWrite(res, 'data: ' + JSON.stringify({ id: 'chatcmpl-u', object: 'chat.completion.chunk', model: body.model,
+          choices: [{ index: 0, delta: { content: KAO }, finish_reason: null }] }) + '\n\n');
+        res.write('data: ' + JSON.stringify({ id: 'chatcmpl-u', object: 'chat.completion.chunk', model: body.model,
+          choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+        res.write('data: [DONE]\n\n');
+        return res.end();
+      }
+      sse(res, 'message_start', { type: 'message_start', message: { id: 'msg_u', type: 'message', role: 'assistant', content: [],
+        usage: { input_tokens: 10, output_tokens: 0 } } });
+      sse(res, 'content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } });
+      await splitWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 0,
+        delta: { type: 'thinking_delta', thinking: KAO } })}\n\n`);
+      sse(res, 'content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'signature_delta', signature: 'SIGU' } });
+      sse(res, 'content_block_stop', { type: 'content_block_stop', index: 0 });
+      sse(res, 'content_block_start', { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } });
+      await splitWrite(res, `event: content_block_delta\ndata: ${JSON.stringify({ type: 'content_block_delta', index: 1,
+        delta: { type: 'text_delta', text: KAO } })}\n\n`);
+      sse(res, 'content_block_stop', { type: 'content_block_stop', index: 1 });
+      sse(res, 'message_delta', { type: 'message_delta', delta: { stop_reason: 'end_turn' }, usage: { output_tokens: 20 } });
+      sse(res, 'message_stop', { type: 'message_stop' });
+      return res.end();
     }
     if (target === 'oa') {   // OpenAI 格式：先来一段推理（不该转发），再分两段给正文
       const usage = { prompt_tokens: 30, completion_tokens: 7, total_tokens: 37 };

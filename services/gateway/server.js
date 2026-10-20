@@ -2,6 +2,7 @@ const express = require('express');
 const crypto = require('crypto');
 const axios = require('axios');
 const { PassThrough } = require('stream');
+const { StringDecoder } = require('string_decoder');
 const cors = require('cors');
 require('dotenv').config();
 
@@ -1717,6 +1718,9 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
     let stopReason = null;
     let msgId = null;
     let buffer = '';
+    // 网络传来的一块数据可能在一个字的中间断开（中文 3 字节、少见的颜文字符号 4 字节），
+    // 每块单独解码会把这个字变成「�」。StringDecoder 会把不完整的字留到下一块再拼起来。
+    const decoder = new StringDecoder('utf8');
     let ended = false;
     // 功能4：捕获上游 usage。input/cache 在 message_start，output 在 message_delta。
     let usage = { input_tokens: 0, output_tokens: 0 };
@@ -1771,7 +1775,7 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
     }
 
     upstream.data.on('data', chunk => {
-      buffer += chunk.toString('utf8');
+      buffer += typeof chunk === 'string' ? chunk : decoder.write(chunk);
       let idx;
       while ((idx = buffer.indexOf('\n\n')) !== -1) {
         const raw = buffer.slice(0, idx);
@@ -1838,7 +1842,8 @@ async function readErrorBody(e) {
   return await new Promise(resolve => {
     let buf = '';
     const t = setTimeout(() => { resolve(buf); try { d.destroy(); } catch (_) {} }, 3000);
-    d.on('data', c => { if (buf.length < 4096) buf += c.toString('utf8'); });
+    const dec = new StringDecoder('utf8');
+    d.on('data', c => { if (buf.length < 4096) buf += typeof c === 'string' ? c : dec.write(c); });
     d.on('end', () => { clearTimeout(t); resolve(buf); });
     d.on('error', () => { clearTimeout(t); resolve(buf); });
   });
@@ -1951,6 +1956,7 @@ async function postOpenAIAsAnthropic(c, body, stream, signal) {
   const src = resp.data;
   const send = (type, data) => out.write(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`);
   let buf = '', started = false, textOpen = false, finish = null, usage = null, done = false, srcEnded = false;
+  const decoder = new StringDecoder('utf8');   // 同上：一个字被切在两块中间时，留到下一块再拼
   const start = (id, model) => {
     if (started) return;
     started = true;
@@ -1968,7 +1974,7 @@ async function postOpenAIAsAnthropic(c, body, stream, signal) {
     out.end();
   };
   src.on('data', chunk => {
-    buf += chunk.toString('utf8');
+    buf += typeof chunk === 'string' ? chunk : decoder.write(chunk);
     let idx;
     while ((idx = buf.indexOf('\n')) !== -1) {
       const line = buf.slice(0, idx).trim();

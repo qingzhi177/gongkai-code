@@ -581,6 +581,36 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(r.sv.length === 1 && !('branch_of' in r.sv[0].b), 'T27 普通会话不带', r.sv[0] && r.sv[0].b.branch_of);
   }
 
+  console.log('T28 一个字被切在两块数据中间（中文、颜文字）：网关拼回去，不出现「�」');
+  {
+    const KAO = '\u{169B9}\u200E\u0847\u{169B9}\u200E ^_ \u00A0 \u032B _ \u0325\u4E36 暗色里，晚安\u{1F319}';
+    const bad = x => JSON.stringify(x).includes('\uFFFD');
+    let m = mark();
+    const s1 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-u',
+      pluvia: { v: '0.2', turn: { id: 'tu1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '颜文字 [U]' }] })));
+    await sleep(300);
+    let sv = saves(since(m));
+    ok(s1.text === KAO && (!s1.reasoning || s1.reasoning === KAO) && !bad(s1), 'T28 OpenAI 格式前端：正文（和思维链）完好', s1);
+    ok(sv.length === 1 && sv[0].b.messages.slice(-1)[0].content === KAO, 'T28 存进记忆库的回复完好', sv.map(x => x.b.messages.slice(-1)));
+    const H = { 'x-api-key': 'x', 'anthropic-version': '2023-06-01' };
+    m = mark();
+    const s2 = anSummary(await sseCollect(await post('/v1/messages', { model: 'fake-model', stream: true, max_tokens: 2000, conversation_id: 'conv-u2',
+      pluvia: { v: '0.2', turn: { id: 'tu2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '颜文字 [U]' }] }, H)));
+    await sleep(300);
+    const th = s2.content.find(b => b.type === 'thinking'), tx = s2.content.find(b => b.type === 'text');
+    ok(th && th.thinking === KAO && tx && tx.text === KAO && !bad(s2), 'T28 Anthropic 格式前端：思维链和正文完好', s2.content);
+    const setAux = async t => {
+      await fetch('http://127.0.0.1:3998/_test/aux', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(t || {}) });
+      return (await fetch(GW + '/reload-config', { method: 'POST' })).json();
+    };
+    await setAux({ name: 'ds', base_url: 'http://127.0.0.1:3997/oa/v1/', api_key: 'kd', model: 'cheap-model', api_format: 'openai' });
+    const s3 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, memory_skip: true,
+      pluvia: { v: '0.2', client: 'pluvia', aux: 'translate', system: 'append' },
+      messages: [{ role: 'system', content: '翻译成中文' }, { role: 'user', content: '颜文字 [U]' }] })));
+    await setAux({});
+    ok(s3.text === KAO && !bad(s3), 'T28 OpenAI 格式的上游（翻译思维链这类辅助请求）：完好', s3);
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });
