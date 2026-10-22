@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile
+from fastapi import FastAPI, UploadFile, Request
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -39,6 +39,7 @@ from app.recall import golden as recall_golden   # 黄金集标注和门槛校�
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
+from app import uploads   # 大文件分块上传、后台导入任务（Dashboard「备份管理」）
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
@@ -1168,13 +1169,70 @@ class ImportRequest(BaseModel):
     conv_date: Optional[str] = None
 
 class KelivoBackupImportReq(BaseModel):
-    path: str                   # VPS 上备份 zip 的路径
+    path: str                   # VPS 上备份 zip（或从里面取出来的 kelivo.db）的路径
     mode: Optional[str] = "skip"   # skip | append
     convs: Optional[List[str]] = None   # 指定导入的 conv_id；None=全部
+    background: Optional[bool] = False  # True：放到后台跑，马上返回任务编号（GET /import/tasks/{id} 查进度）
 
 class MemoryImportReq(BaseModel):
     path: str
     mode: Optional[str] = "merge"   # merge | replace
+    background: Optional[bool] = False
+
+class UploadStartReq(BaseModel):
+    name: str
+    size: int
+
+
+def _do_import_memory(path, mode):
+    from memory_export import import_memory_zip, EXPORT_TABLES
+    data = open(path, "rb").read()
+    if mode == "replace":
+        for t in EXPORT_TABLES:
+            conn = get_conn()
+            conn.execute(f"DELETE FROM {t}")
+            conn.commit(); conn.close()
+    return import_memory_zip(data, str(SQLITE_PATH), str(Path(SQLITE_PATH).parent.parent / "profile"), mode=mode)
+
+
+def _do_import_kelivo(path, mode, convs):
+    from kelivo_backup_importer import import_kelivo_backup
+    return import_kelivo_backup(path, mode=mode, memory_db_path=str(SQLITE_PATH), convs=convs)
+
+
+# ---------- 大文件分块上传（app/uploads.py）：Cloudflare 对单个请求有大小和时间上限，大文件切成小块传 ----------
+
+@app.post("/import/upload/start")
+async def upload_start(req: UploadStartReq):
+    try:
+        return {"status": "ok", **uploads.start(req.name, req.size)}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
+
+
+@app.put("/import/upload/{uid}/{index}")
+async def upload_chunk(uid: str, index: int, request: Request):
+    data = await request.body()
+    try:
+        return {"status": "ok", **(await asyncio.to_thread(uploads.put_chunk, uid, index, data))}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
+
+
+@app.post("/import/upload/{uid}/finish")
+async def upload_finish(uid: str):
+    try:
+        return {"status": "ok", **uploads.finish(uid)}
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
+
+
+@app.get("/import/tasks/{tid}")
+async def import_task_status(tid: str):
+    t = uploads.task(tid)
+    if not t:
+        return JSONResponse(status_code=404, content={"status": "error", "detail": "没有这个任务（服务可能重启过，导入进度丢了；库里已经导入的不受影响）"})
+    return {"status": "ok", "task": t}
 
 class MemoryUploadReq(BaseModel):
     mode: Optional[str] = "merge"
@@ -1233,17 +1291,12 @@ async def export_full_api():
 
 @app.post("/import/memory")
 async def import_memory_api(req: MemoryImportReq):
-    """记忆库整体导入（zip）。mode: merge(按主键去重) | replace(先清空相关表)"""
+    """记忆库整体导入（zip）。mode: merge(按主键去重) | replace(先清空相关表)。
+    在线程里跑，不卡住别的请求；background=True 时放到后台，马上返回任务编号。"""
+    if req.background:
+        return {"status": "ok", "task_id": uploads.run_task("import_memory", _do_import_memory, req.path, req.mode)}
     try:
-        from memory_export import import_memory_zip, EXPORT_TABLES
-        data = open(req.path, "rb").read()
-        if req.mode == "replace":
-            for t in EXPORT_TABLES:
-                conn = get_conn()
-                conn.execute(f"DELETE FROM {t}")
-                conn.commit(); conn.close()
-        stats = import_memory_zip(data, str(SQLITE_PATH),
-                                  str(Path(SQLITE_PATH).parent.parent / "profile"), mode=req.mode)
+        stats = await asyncio.to_thread(_do_import_memory, req.path, req.mode)
         return {"status": "ok", "stats": stats}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -1381,23 +1434,22 @@ async def upload_kelivo_backup(file: UploadFile):
 
 @app.post("/import/kelivo-backup/preview")
 async def preview_kelivo_backup_api(req: KelivoBackupImportReq):
-    """预览备份中的会话列表（选择导入前查看）"""
+    """预览备份中的会话列表（选择导入前查看）。path 可以是备份 zip，也可以是从里面取出来的 kelivo.db"""
     try:
         from kelivo_backup_importer import preview_kelivo_backup
-        convs = preview_kelivo_backup(req.path)
+        convs = await asyncio.to_thread(preview_kelivo_backup, req.path)
         return {"status": "ok", "conversations": convs}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
 
 @app.post("/import/kelivo-backup")
 async def import_kelivo_backup_api(req: KelivoBackupImportReq):
-    """导入 kelivo-backup v2 (zip+sqlite) → L0 / thinking_records（版本折叠：用户选择版本优先）。
-    旧版 JSON 导入保留。convs 为空=全部会话。"""
+    """导入 kelivo-backup v2 (zip+sqlite，或者单独的 kelivo.db) → L0 / thinking_records（版本折叠：用户选择版本优先）。
+    旧版 JSON 导入保留。convs 为空=全部会话。在线程里跑；background=True 时放到后台，马上返回任务编号。"""
+    if req.background:
+        return {"status": "ok", "task_id": uploads.run_task("import_kelivo", _do_import_kelivo, req.path, req.mode, req.convs)}
     try:
-        from kelivo_backup_importer import import_kelivo_backup
-        stats = import_kelivo_backup(req.path, mode=req.mode,
-                                     memory_db_path=str(SQLITE_PATH),
-                                     convs=req.convs)
+        stats = await asyncio.to_thread(_do_import_kelivo, req.path, req.mode, req.convs)
         return {"status": "ok", "stats": stats}
     except Exception as e:
         return {"status": "error", "detail": str(e)}

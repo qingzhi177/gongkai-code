@@ -3561,47 +3561,164 @@ function rebuildProfile() {
             });
         }
         var bkPath = '';
+        // ============ 大文件导入：分块上传、从 zip 里只取要用的文件、后台导入任务 ============
+        // 网站前面的 Cloudflare 对单个请求有大小（免费版 100 MB）和时间上限，以前整个文件一个请求传，太大就一直「上传中」。
+        // 现在切成小块一块一块传（失败的块自动重传，能看到进度）；导入放到后台跑，隔几秒问一次进度。
+        function readJson(r) {
+            return r.text().then(function(t) {
+                var d;
+                try { d = JSON.parse(t); } catch (e) {
+                    throw new Error('服务器返回 ' + r.status + (r.status === 413 ? '（文件太大）' : r.status === 524 || r.status === 504 ? '（等太久了）' : ''));
+                }
+                if (!r.ok || d.status === 'error') throw new Error(d.detail || ('HTTP ' + r.status));
+                return d;
+            });
+        }
+        function fmtMB(n) { return (n / 1048576).toFixed(n >= 100 * 1048576 ? 0 : 1) + ' MB'; }
+        function postJson(url, body) {
+            return fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}) }).then(readJson);
+        }
+        function sendChunk(uid, i, blob, tries) {
+            return fetch('/import/upload/' + uid + '/' + i, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: blob })
+                .then(readJson)
+                .catch(function(e) {
+                    if (tries >= 4) throw new Error('第 ' + (i + 1) + ' 块传了 5 次都没成功：' + e.message);
+                    return new Promise(function(res) { setTimeout(res, 1500 * (tries + 1)); }).then(function() { return sendChunk(uid, i, blob, tries + 1); });
+                });
+        }
+        // 分块上传：onProgress(已传字节, 总字节)；成功后得到 {path, name, size}
+        function chunkedUpload(file, name, onProgress) {
+            return postJson('/import/upload/start', { name: name, size: file.size }).then(function(d) {
+                var uid = d.upload_id, ch = d.chunk_size, n = d.chunks, i = 0;
+                function next() {
+                    if (onProgress) onProgress(Math.min(i * ch, file.size), file.size);
+                    if (i >= n) return postJson('/import/upload/' + uid + '/finish');
+                    return sendChunk(uid, i, file.slice(i * ch, Math.min(file.size, (i + 1) * ch)), 0).then(function() { i++; return next(); });
+                }
+                return next();
+            });
+        }
+        // 在浏览器里从 zip 里取出一个文件（只读 zip 的目录和那一个文件，不把整个 zip 读进内存）；取不出来返回 null。
+        // 支持普通 zip 和 ZIP64，压缩方式支持「不压缩」和 deflate（用浏览器自带的 DecompressionStream）。
+        function zipEntry(file, match) {
+            if (typeof DecompressionStream === 'undefined' || typeof DataView.prototype.getBigUint64 !== 'function') return Promise.resolve(null);
+            var u64 = function(dv, o) { return Number(dv.getBigUint64(o, true)); };
+            var tail = Math.min(file.size, 65557 + 20);
+            return file.slice(file.size - tail).arrayBuffer().then(function(buf) {
+                var dv = new DataView(buf), eocd = -1;
+                for (var k = buf.byteLength - 22; k >= 0; k--) { if (dv.getUint32(k, true) === 0x06054b50) { eocd = k; break; } }
+                if (eocd < 0) return null;
+                var count = dv.getUint16(eocd + 10, true), size = dv.getUint32(eocd + 12, true), off = dv.getUint32(eocd + 16, true);
+                if (count !== 0xFFFF && size !== 0xFFFFFFFF && off !== 0xFFFFFFFF) return { size: size, off: off };
+                var loc = eocd - 20;
+                if (loc < 0 || dv.getUint32(loc, true) !== 0x07064b50) return null;
+                var z64 = u64(dv, loc + 8);
+                return file.slice(z64, z64 + 56).arrayBuffer().then(function(b) {
+                    var d = new DataView(b);
+                    return d.getUint32(0, true) === 0x06064b50 ? { size: u64(d, 40), off: u64(d, 48) } : null;
+                });
+            }).then(function(cd) {
+                if (!cd) return null;
+                return file.slice(cd.off, cd.off + cd.size).arrayBuffer().then(function(b) {
+                    var d = new DataView(b), k = 0, dec = new TextDecoder('utf-8');
+                    while (k + 46 <= b.byteLength && d.getUint32(k, true) === 0x02014b50) {
+                        var flags = d.getUint16(k + 8, true), method = d.getUint16(k + 10, true);
+                        var comp = d.getUint32(k + 20, true), unc = d.getUint32(k + 24, true), lho = d.getUint32(k + 42, true);
+                        var nlen = d.getUint16(k + 28, true), xlen = d.getUint16(k + 30, true), clen = d.getUint16(k + 32, true);
+                        var name = dec.decode(new Uint8Array(b, k + 46, nlen)).replace(/\\/g, '/');
+                        if (comp === 0xFFFFFFFF || unc === 0xFFFFFFFF || lho === 0xFFFFFFFF) {
+                            for (var x = k + 46 + nlen, end = x + xlen; x + 4 <= end; ) {
+                                var id = d.getUint16(x, true), sz = d.getUint16(x + 2, true), q = x + 4;
+                                if (id === 1) {
+                                    if (unc === 0xFFFFFFFF) { unc = u64(d, q); q += 8; }
+                                    if (comp === 0xFFFFFFFF) { comp = u64(d, q); q += 8; }
+                                    if (lho === 0xFFFFFFFF) { lho = u64(d, q); q += 8; }
+                                }
+                                x += 4 + sz;
+                            }
+                        }
+                        if (match(name)) return (flags & 1) ? null : { method: method, comp: comp, unc: unc, lho: lho };
+                        k += 46 + nlen + xlen + clen;
+                    }
+                    return null;
+                });
+            }).then(function(e) {
+                if (!e || (e.method !== 0 && e.method !== 8)) return null;
+                return file.slice(e.lho, e.lho + 30).arrayBuffer().then(function(b) {
+                    var d = new DataView(b);
+                    if (d.getUint32(0, true) !== 0x04034b50) return null;
+                    var start = e.lho + 30 + d.getUint16(26, true) + d.getUint16(28, true);
+                    var data = file.slice(start, start + e.comp);
+                    return e.method === 0 ? data : new Response(data.stream().pipeThrough(new DecompressionStream('deflate-raw'))).blob();
+                }).then(function(blob) { return blob && blob.size === e.unc ? blob : null; });
+            }).catch(function() { return null; });
+        }
+        // 等后台导入任务做完：onTick(秒数)；成功得到结果，出错抛出原因
+        function waitTask(tid, onTick) {
+            var t0 = Date.now();
+            return new Promise(function(resolve, reject) {
+                (function poll() {
+                    fetch('/import/tasks/' + tid).then(readJson).then(function(d) {
+                        var t = d.task;
+                        if (t.state === 'done') return resolve(t.result);
+                        if (t.state === 'error') return reject(new Error(t.error));
+                        if (onTick) onTick(Math.round((Date.now() - t0) / 1000));
+                        setTimeout(poll, 2000);
+                    }).catch(function(e) { (Date.now() - t0 > 6 * 3600 * 1000) ? reject(e) : setTimeout(poll, 4000); });
+                })();
+            });
+        }
         function uploadBk() {
             var f = document.getElementById('bk-file').files[0];
             if (!f) { alert('请选择备份 zip'); return; }
-            var fd = new FormData(); fd.append('file', f);
-            document.getElementById('bk-status').textContent = '上传中...';
-            fetch('/import/kelivo-backup/upload', { method: 'POST', body: fd })
-                .then(function(r) { return r.json(); })
-                .then(function(d) {
-                    if (d.status !== 'ok') { document.getElementById('bk-status').textContent = '失败: ' + d.detail; return; }
-                    bkPath = d.path;
-                    var box = document.getElementById('bk-list'); box.innerHTML = '';
+            var st = document.getElementById('bk-status'), box = document.getElementById('bk-list');
+            bkPath = ''; box.innerHTML = '';
+            st.textContent = '正在从备份里取出聊天记录…';
+            zipEntry(f, function(n) { return /kelivo\.db$/.test(n); }).then(function(db) {
+                var file = db || f, name = db ? 'kelivo.db' : f.name;
+                var note = db ? '（只传聊天记录 ' + fmtMB(db.size) + '，图片和附件用不上，不用传）' : '（' + fmtMB(f.size) + '）';
+                return chunkedUpload(file, name, function(done, total) {
+                    st.textContent = '上传中 ' + Math.floor(done * 100 / total) + '%' + note;
+                });
+            }).then(function(up) {
+                st.textContent = '读取会话列表…';
+                return postJson('/import/kelivo-backup/preview', { path: up.path }).then(function(d) {
+                    bkPath = up.path;
                     (d.conversations || []).forEach(function(c) {
                         var div = document.createElement('div');
-                        div.innerHTML = '<label><input type="checkbox" value="' + c.conv_id + '" checked> ' +
-                            ((c.title || c.conv_id).substring(0, 26)) + '（' + (c.msg_count || 0) + '条 / ' + (c.last_ts || '') + '）</label>';
+                        div.innerHTML = '<label><input type="checkbox" value="' + escapeHtml(c.conv_id) + '" checked> ' +
+                            escapeHtml((c.title || c.conv_id).substring(0, 26)) + '（' + (c.msg_count || 0) + '条 / ' + escapeHtml(c.last_ts || '') + '）</label>';
                         box.appendChild(div);
                     });
-                    document.getElementById('bk-status').textContent = '共 ' + (d.conversations || []).length + ' 个会话';
-                }).catch(function(e) { document.getElementById('bk-status').textContent = '上传失败: ' + e; });
+                    st.textContent = '共 ' + (d.conversations || []).length + ' 个会话，选好以后点「导入选中」';
+                });
+            }).catch(function(e) { st.textContent = '上传失败：' + e.message; });
         }
         function doImportBk() {
             if (!bkPath) { alert('请先上传预览'); return; }
             var convs = [];
             document.querySelectorAll('#bk-list input:checked').forEach(function(c) { convs.push(c.value); });
-            var body = { path: bkPath, mode: document.getElementById('bk-mode').value, convs: convs };
-            document.getElementById('bk-status').textContent = '导入中...';
-            fetch('/import/kelivo-backup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-                .then(function(r) { return r.json(); })
-                .then(function(d) { document.getElementById('bk-status').textContent = JSON.stringify(d.stats || d); })
-                .catch(function(e) { document.getElementById('bk-status').textContent = '导入失败: ' + e; });
+            var st = document.getElementById('bk-status');
+            st.textContent = '导入中…';
+            postJson('/import/kelivo-backup', { path: bkPath, mode: document.getElementById('bk-mode').value, convs: convs, background: true })
+                .then(function(d) { return waitTask(d.task_id, function(s) { st.textContent = '导入中…（' + s + ' 秒）'; }); })
+                .then(function(r) {
+                    st.textContent = '导入完成：' + (r.convs || 0) + ' 个会话、' + (r.messages || 0) + ' 条消息、' + (r.thinkings || 0) + ' 条思考记录'
+                        + (r.skipped_convs ? '（跳过已有的 ' + r.skipped_convs + ' 个会话）' : '');
+                })
+                .catch(function(e) { st.textContent = '导入失败：' + e.message; });
         }
         function doImportMem() {
             var f = document.getElementById('mem-file').files[0];
             if (!f) { alert('请选择 zip'); return; }
-            var fd = new FormData(); fd.append('file', f);
-            fd.append('mode', document.getElementById('mem-mode').value);
-            document.getElementById('mem-status').textContent = '导入中...';
-            fetch('/import/memory/upload', { method: 'POST', body: fd })
-                .then(function(r) { return r.json(); })
-                .then(function(d) { document.getElementById('mem-status').textContent = JSON.stringify(d.stats || d); })
-                .catch(function(e) { document.getElementById('mem-status').textContent = '失败: ' + e; });
+            var mode = document.getElementById('mem-mode').value;
+            if (mode === 'replace' && !confirm('替换导入会先清空现在的对话原文、记忆、思考记录、叙事这些表，再导入。确定吗？')) return;
+            var st = document.getElementById('mem-status');
+            chunkedUpload(f, f.name, function(done, total) { st.textContent = '上传中 ' + Math.floor(done * 100 / total) + '%（' + fmtMB(total) + '）'; })
+                .then(function(up) { st.textContent = '导入中…'; return postJson('/import/memory', { path: up.path, mode: mode, background: true }); })
+                .then(function(d) { return waitTask(d.task_id, function(s) { st.textContent = '导入中…（' + s + ' 秒）'; }); })
+                .then(function(r) { st.textContent = '导入完成：' + JSON.stringify(r); })
+                .catch(function(e) { st.textContent = '失败：' + e.message; });
         }
         function doImportFeel() {
             var f = document.getElementById('feel-file').files[0];

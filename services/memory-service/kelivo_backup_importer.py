@@ -15,6 +15,7 @@
 import json
 import sqlite3
 import db
+import shutil
 import tempfile
 import zipfile
 from datetime import datetime
@@ -29,17 +30,38 @@ def _iso_ts(micro) -> str:
         return None
 
 
+SQLITE_HEADER = b'SQLite format 3\x00'
+
+
 def _open_backup_db(zip_path: str):
-    with zipfile.ZipFile(zip_path) as z:
-        names = [n.replace('\\', '/') for n in z.namelist()]
-        dbname = next((n for n in names if n.endswith('kelivo.db')), None)
-        if not dbname:
-            raise ValueError('backup: kelivo.db not found in zip')
-        blob = z.read(dbname)
+    """打开备份里的 kelivo.db（复制一份到临时文件再打开，不动原文件）。
+    zip_path 可以是 Kelivo 的备份 zip，也可以直接是 kelivo.db：Dashboard 会先在浏览器里从 zip 里取出 kelivo.db，
+    只上传这一个文件（图片和附件用不上，不用传）。"""
+    with open(zip_path, 'rb') as f:
+        is_db = f.read(16) == SQLITE_HEADER
     tmp = tempfile.NamedTemporaryFile(suffix='.db', delete=False)
-    tmp.write(blob)
+    if is_db:
+        with open(zip_path, 'rb') as f:
+            shutil.copyfileobj(f, tmp)
+    else:
+        with zipfile.ZipFile(zip_path) as z:
+            dbname = next((n for n in z.namelist() if n.replace('\\', '/').endswith('kelivo.db')), None)
+            if not dbname:
+                tmp.close()
+                Path(tmp.name).unlink()
+                raise ValueError('backup: kelivo.db not found in zip')
+            with z.open(dbname) as src:
+                shutil.copyfileobj(src, tmp)
     tmp.close()
-    return sqlite3.connect(tmp.name), tmp.name
+    conn = sqlite3.connect(tmp.name)
+    # 临时副本上补几个索引：按会话、按消息查的时候不用每次扫整张表（大备份能快很多）
+    for sql in ("CREATE INDEX IF NOT EXISTS _imp_msg_conv ON message_rows (conversation_id, message_order)",
+                "CREATE INDEX IF NOT EXISTS _imp_part ON message_part_rows (conversation_id, revision_id, ordinal)"):
+        try:
+            conn.execute(sql)
+        except sqlite3.Error:
+            pass
+    return conn, tmp.name
 
 
 def preview_kelivo_backup(zip_path: str) -> list:
