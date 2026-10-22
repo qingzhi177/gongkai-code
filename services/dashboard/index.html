@@ -1282,7 +1282,7 @@ function rebuildProfile() {
             if (!m || !box) return;
             if (box.dataset.mode === 'edit') { box.innerHTML = ''; box.dataset.mode = ''; return; }
             box.dataset.mode = 'edit';
-            box.innerHTML = '<textarea id="l0e-text-' + id + '" class="l0-text" style="width:100%;min-height:90px;margin-top:6px;font-size:13px;line-height:1.6;padding:6px;border:1px solid #ccc;border-radius:6px;"></textarea>'
+            box.innerHTML = '<textarea id="l0e-text-' + id + '" class="l0-text" style="width:100%;min-height:90px;margin-top:6px;font-size:13px;font-family:inherit;line-height:1.6;padding:6px;border:1px solid #ccc;border-radius:6px;"></textarea>'
                 + '<div style="font-size:12px;margin:4px 0;line-height:1.8;">'
                 + '<label><input type="radio" name="l0e-mode-' + id + '" value="fix" checked> 只改字（错字、标点、颜文字这类，意思不变）：别处一字不差引用过这一段的一起改，不调用模型</label><br>'
                 + '<label><input type="radio" name="l0e-mode-' + id + '" value="reextract"> 意思改了：这条消息所在那一批的记忆重新提取，那一天的每日片段重新整理（会调用模型）</label></div>'
