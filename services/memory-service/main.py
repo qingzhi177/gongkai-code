@@ -40,6 +40,7 @@ from app import settings as app_settings   # Dashboard 上可调的参数（召�
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import uploads   # 大文件分块上传、后台导入任务（Dashboard「备份管理」）
+from app import purge as purge_data   # 清空所有数据：除了配置、设置、召回对比，别的表都清空
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
@@ -2766,59 +2767,30 @@ async def get_auto_logs(lines: int = 100):
 @app.post("/admin/purge_all")
 async def purge_all_data(confirmation: dict):
     """
-    硬清除所有数据（L0/L1/向量/Narrative/Summary/Profile）
+    硬清除所有记忆数据：原文、记忆、思考记录、向量、每日片段、叙事卷、章节、关系状态、共同语汇、未完的事、摘要、叙事、画像、任务记录……
+    留下：模型和供应商配置、各项设置、召回对比（用到的记忆内容先定格）。见 app/purge.py。
     警告：此操作不可逆！需要前端传递 {"confirmation": "CONFIRM DELETE"}
     """
     if confirmation.get("confirmation") != "CONFIRM DELETE":
         return {"status": "error", "message": "确认文本不正确"}
 
+    conn = None
     try:
         logger.warning("开始硬清除所有数据...")
 
-        # 1. 清空 SQLite
+        # 1. 清空 SQLite（一个事务：先定格召回对比，再清空；自增编号不重置）
         conn = get_conn()
-        c = conn.cursor()
-        c.execute("DELETE FROM l0_messages")
+        conn.execute("BEGIN IMMEDIATE")
         try:
-            c.execute("DELETE FROM l0_deleted_marks")
+            res = purge_data.purge(conn)
+            conn.commit()
         except Exception:
-            pass
-        c.execute("DELETE FROM l1_memories")
-        c.execute("DELETE FROM shared_narrative")
-        c.execute("DELETE FROM recent_summary")
-        try:
-            c.execute("DELETE FROM user_profile")
-        except Exception:
-            pass
-        try:
-            c.execute("DELETE FROM ai_profile")
-        except Exception:
-            pass
-        c.execute("DELETE FROM thinking_records")
-        # 修复：清空后自增 id 会从 1 重新开始，叙事增量水位线也必须归零，
-        # 否则新记忆的 id 要超过旧水位线（比如 247）之前都不会进入叙事
-        try:
-            c.execute("DELETE FROM narrative_state")
-        except Exception:
-            pass
-        try:
-            c.execute("DELETE FROM custom_prompts")
-        except Exception:
-            pass
-        try:
-            c.execute("DELETE FROM conv_settings")
-        except Exception:
-            pass
-        # 重置自增计数器（id 从 1 重新开始，仅影响未来生成）
-        try:
-            c.execute("DELETE FROM sqlite_sequence")
-        except Exception:
-            pass
-        conn.commit()  # 先提交删除（释放事务）
-        c.execute("VACUUM")  # VACUUM 必须在事务外
-        conn.commit()
+            conn.rollback()
+            raise
+        conn.execute("VACUUM")  # VACUUM 必须在事务外
         conn.close()
-        logger.info("SQLite 数据库已清空")
+        cleared = {t: n for t, n in res["cleared"].items() if n}
+        logger.info(f"SQLite 数据库已清空：{cleared}；召回对比定格 {res['frozen']} 轮")
 
         # 2. 清空向量与关键词索引（Phase 1：向量已改存 SQLite vectors 表）
         try:
@@ -2828,26 +2800,25 @@ async def purge_all_data(confirmation: dict):
         except Exception as e:
             logger.warning(f"清空向量/关键词索引失败: {e}")
 
-        # 3. 清空本地面像文件（data/profile/*.md）
-        import os as _os
-        import glob as _glob
+        # 3. 清空本地面像文件（data/profile/*.md；和其余代码一样用 DATA_DIR，以前这里读 MEMORY_DATA_DIR）
         try:
-            _pdir = _os.path.join(_os.environ.get('MEMORY_DATA_DIR', str(Path.home() / 'memory-system' / 'data')), 'profile')
-            if _os.path.isdir(_pdir):
-                for _f in _glob.glob(_os.path.join(_pdir, '*.md')):
+            _pdir = DATA_DIR / "profile"
+            if _pdir.is_dir():
+                for _f in _pdir.glob("*.md"):
                     try:
-                        _os.remove(_f)
+                        _f.unlink()
                     except Exception:
                         pass
                 logger.info(f"Profile 文件已清空: {_pdir}")
         except Exception as e:
             logger.warning(f"清除 profile 文件失败: {e}")
         logger.warning("所有数据已硬清除完成")
-        return {"status": "ok", "message": "所有数据已清空，可以重新导入对话"}
+        return {"status": "ok", "message": "所有数据已清空，可以重新导入对话", "cleared": cleared, "frozen": res["frozen"]}
 
     except Exception as e:
         try:
-            conn.close()
+            if conn:
+                conn.close()
         except Exception:
             pass
         logger.error(f"硬清除失败: {e}", exc_info=True)

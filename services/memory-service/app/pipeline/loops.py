@@ -7,6 +7,7 @@
   新的事和还没了结的事太像，就当成「又提起」；只给模型看这段对话之前就有的事（以后导入旧聊天时，旧的对话不会去了结后来的事）。
 - 状态：open（进行中）/ done（有结果了）/ dropped（不用再管了）/ expired（自动过期：软期限过了 N 天、之后没再提；
   或者没有期限、很久没再提）。过期和了结的都可以在 Dashboard 上重新打开。
+  导入旧聊天、后面还有没扫到的对话时，过期按已经扫到的最后一天算，不按今天算（见 clock()）。
 - 跟进方式 follow_up_policy：when_relevant（相关时可以提，默认）/ when_due（到期时才提）/ never_push（不主动提，只有你自己提起时才接）。
 - pack()：以后开窗时列出的几件（不含「不主动提」的）：先列已经到期和快到期的，再按最近提起的时间。
   每轮按话题相关注入、每个会话最多主动提一次，等新召回正式启用以后再接（现在只在 Dashboard 上预览）。
@@ -344,17 +345,31 @@ def today(now=None):
     return E.day_of(timeutil.parse_ts(now) if now else timeutil.utc_now())
 
 
+def clock(conn, now=None):
+    """自动过期按哪一天算。平时就是今天；后面还有没扫到的对话时（比如导入了旧聊天、正一天一天往后补），
+    按已经扫到的最后一天算——不然五月记下的事会因为「现在已经十月了」马上过期，后面六月的对话就看不到它，
+    没法再了结它、提起它。今天的对话还没整理时，也按扫到的最后一天算（晚一天过期，没关系）。"""
+    d0 = today(now)
+    r = conn.execute("SELECT MAX(day) FROM loops_scans").fetchone()
+    if not r or not r[0]:
+        return d0
+    frontier = E.to_day(r[0])
+    last = conn.execute("SELECT MAX(ts) FROM l0_messages WHERE status='active'").fetchone()[0]
+    last_day = E.day_of(last) if last else None
+    return min(d0, frontier) if last_day and last_day > frontier else d0
+
+
 def expire(now=None):
     """自动过期（不调用模型，定时检查和每次扫描后都会跑）：
     - 有软期限的：期限过了 expire_after_days 天、期限之后没再提；
     - 没有期限的：stale_days 天没再提。
-    返回过期的 id。"""
+    「今天」按 clock() 算。返回过期的 id。"""
     c = cfg()
-    d0 = today(now)
     out = []
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
+        d0 = clock(conn, now)
         for x in _open(conn):
             last = E.day_of(_last_seen(x))
             if x["due_at"]:

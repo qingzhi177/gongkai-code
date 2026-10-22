@@ -321,6 +321,36 @@ def main():
         c0 = L.cfg()
         check("设置有默认值", c0["enabled"] is True and c0["expire_after_days"] == 14 and c0["stale_days"] == 45 and c0["pack_size"] == 5, c0)
         check("「不主动提」的事也在（只是不列进开窗预览）", loop(c)["status"] == "open")
+
+        print("\n[7] 导入旧聊天：后面还有没扫到的对话时，过期按已经扫到的最后一天算")
+        for t in ("loops_scans", "l0_messages", "settle_days"):
+            run(f"DELETE FROM {t}")
+        run("UPDATE open_loops SET status='done' WHERE status='open'")          # 前面留下的事先放一边
+        day_chat("2026-05-24", "H", [("user", "下个月我想学游泳" + FILL), ("assistant", "好呀，学会了告诉我" + FILL),
+                                     ("user", "嗯" + FILL), ("assistant", "加油" + FILL)])
+        day_chat("2026-06-30", "H", [("user", "游泳学会啦" + FILL), ("assistant", "真厉害" + FILL),
+                                     ("user", "嘿嘿" + FILL), ("assistant", "晚安" + FILL)])
+        conn = config.get_conn()
+        try:
+            check("还一块都没扫：按今天算", L.clock(conn, now=NOW) == E.to_day("2026-10-20"))
+        finally:
+            conn.close()
+        lx = add_loop("plan", "你想下个月学游泳", seen="2026-05-24 13:00:00")
+        ly = add_loop("unfinished_topic", "一个后来再没提过的话题", seen="2026-05-24 13:01:00")
+        r = asyncio.run(L.scan(llm_fn=FakeLLM([]), now=NOW, limit=1))
+        conn = config.get_conn()
+        try:
+            ck = L.clock(conn, now=NOW)
+        finally:
+            conn.close()
+        check("扫到 5 月 24 日、后面 6 月 30 日还没扫：按 5 月 24 日算，五月的事不会因为「现在是十月」过期",
+              ck == E.to_day("2026-05-24") and r["expired"] == [] and loop(lx)["status"] == "open", (ck, r["expired"]))
+        llm = FakeLLM([{"new": [], "mentioned": [],
+                        "closed": [{"loop": f"L{lx}", "status": "done", "result": "你学会游泳了", "lines": [1], "quote": "游泳学会啦"}]}])
+        r = asyncio.run(L.scan(llm_fn=llm, now=NOW))
+        check("6 月 30 日的对话看得到五月的事，能了结它", f"[L{lx}]" in llm.prompts[0] and loop(lx)["status"] == "done"
+              and loop(lx)["closed_text"] == "你学会游泳了", (llm.prompts[0][:300], loop(lx)))
+        check("都扫完了：按今天算，很久没提的照常过期", ly in r["expired"] and loop(ly)["status"] == "expired", r["expired"])
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

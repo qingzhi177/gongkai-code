@@ -668,9 +668,10 @@
             <!-- 危险操作区域 -->
             <div style="margin-top:40px;padding:20px;background:#fff3cd;border:2px solid #ffc107;border-radius:8px;">
                 <h4 style="color:#856404;margin-top:0;">⚠️ 危险操作</h4>
-                <p style="font-size:13px;color:#856404;margin-bottom:15px;">
-                    以下操作不可逆，将永久删除所有数据（L0原文、L1记忆、向量库、Narrative、Summary、Profile）。<br>
-                    清空后需要重新导入对话数据。
+                <p style="font-size:13px;color:#856404;margin-bottom:15px;line-height:1.7;">
+                    以下操作不可逆，将永久删除所有记忆数据：对话原文、记忆、思考记录、向量和关键词索引、每日片段和日摘、叙事卷、章节、关系状态、共同语汇、未完的事、近期摘要、共同经历叙事、画像、后台任务记录。<br>
+                    会留下：模型和供应商配置、各项设置、召回对比（每一轮用到的记忆内容会先定格保存，以后看的还是当时的记忆）。<br>
+                    清空前建议先在「备份管理」下载一份完整备份；清空后需要重新导入对话数据。
                 </p>
                 <button class="btn" onclick="confirmPurgeAll()" style="background:#dc3545;color:white;font-weight:bold;">
                     🗑️ 清空所有数据
@@ -1724,7 +1725,8 @@ function rebuildProfile() {
                 (d.traces || []).forEach(function(t) {
                     html += '<tr style="cursor:pointer;" onclick="showRecallTrace(' + t.id + ')">'
                         + '<td style="white-space:nowrap;">' + formatTime(t.created_at) + '</td>'
-                        + '<td style="max-width:220px;word-break:break-all;">' + escapeHtml(t.user_text) + (t.labeled ? ' <span style="color:#5b6abf;font-size:11px;white-space:nowrap;">✓已标</span>' : '') + '</td>'
+                        + '<td style="max-width:220px;word-break:break-all;">' + escapeHtml(t.user_text) + (t.labeled ? ' <span style="color:#5b6abf;font-size:11px;white-space:nowrap;">✓已标</span>' : '')
+                        + (t.frozen ? ' <span style="color:#999;font-size:11px;white-space:nowrap;" title="清空记忆库之前的一轮，显示的是当时定格下来的记忆">清空前</span>' : '') + '</td>'
                         + '<td>' + (RC_INTENT[t.intent] || t.intent || '') + '</td>'
                         + '<td style="max-width:260px;">' + rcLegacyCell(t.legacy) + '</td>'
                         + '<td style="max-width:300px;">' + rcNewCell(t) + (t.basis === 'vec_sim' && t.intent !== 'greeting' ? '<div style="color:#c77;font-size:11px;">精排不可用，用了向量相似度</div>' : '') + '</td>'
@@ -1901,6 +1903,7 @@ function rebuildProfile() {
                 var name = function(i) { var s = sn[String(i)]; return s ? escapeHtml(s.content) : ('#' + i); };
                 var html = '<div style="display:flex;justify-content:space-between;"><b>第 ' + t.id + ' 轮的详细过程</b>'
                     + '<a href="javascript:void(0)" onclick="document.getElementById(\'rc-detail\').style.display=\'none\'">收起</a></div>';
+                if (t.frozen_at) html += '<div style="color:#888;font-size:12px;">这一轮是清空记忆库之前的，下面的记忆是清空时定格下来的内容（编号是当时的编号）。</div>';
                 html += '<div>检索用的文本：' + escapeHtml(t.query || '') + '</div>';
                 html += '<div>意图：' + (RC_INTENT[(t.intent || {}).type] || '') + ((t.intent || {}).matched ? '（命中「' + escapeHtml(t.intent.matched) + '」）' : '') + '</div>';
                 html += '<div>精排：' + (rr.skipped ? escapeHtml(rr.skipped) : (rr.ok ? (escapeHtml(rr.model || '') + '，' + rr.ms + 'ms') : ('失败：' + escapeHtml(rr.error || '') + '，改用向量相似度'))) + '</div>';
@@ -3458,16 +3461,10 @@ function rebuildProfile() {
         // ============ Admin 危险操作 ============
         function confirmPurgeAll() {
             var confirmation = prompt(
-                '⚠️ 警告：此操作将永久删除所有数据！\n\n' +
-                '包括：\n' +
-                '- L0 原文对话\n' +
-                '- L1 提取记忆\n' +
-                '- ChromaDB 向量库\n' +
-                '- Shared Narrative 共同经历叙事\n' +
-                '- Recent Summary 近期摘要\n' +
-                '- User Profile 用户画像\n' +
-                '- AI Profile AI画像\n\n' +
-                '此操作不可逆！\n\n' +
+                '⚠️ 警告：此操作将永久删除所有记忆数据！\n\n' +
+                '包括：对话原文、记忆、思考记录、向量和关键词索引、每日片段和日摘、叙事卷、章节、关系状态、共同语汇、未完的事、近期摘要、共同经历叙事、画像、后台任务记录。\n\n' +
+                '会留下：模型和供应商配置、各项设置、召回对比（用到的记忆内容先定格）。\n\n' +
+                '此操作不可逆！建议先在「备份管理」下载完整备份。\n\n' +
                 '如果确认清空，请输入：CONFIRM DELETE'
             );
 
@@ -3492,7 +3489,7 @@ function rebuildProfile() {
             .then(function(r) { return r.json(); })
             .then(function(d) {
                 if (d.status === 'ok') {
-                    status.textContent = '✅ 所有数据已清空！页面将在 3 秒后刷新...';
+                    status.textContent = '✅ 所有数据已清空' + (d.frozen ? '（召回对比 ' + d.frozen + ' 轮已定格）' : '') + '！页面将在 3 秒后刷新...';
                     status.style.color = '#28a745';
                     setTimeout(function() {
                         location.reload();

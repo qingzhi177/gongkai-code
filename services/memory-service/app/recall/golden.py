@@ -192,12 +192,19 @@ def export():
     conn = get_conn()
     try:
         rows = conn.execute(
-            "SELECT l.trace_id, l.item_id, l.label, l.query, l.user_text, l.created_at, m.content FROM recall_labels l "
-            "LEFT JOIN l1_memories m ON m.id = l.item_id AND l.item_id != 0 ORDER BY l.trace_id, l.item_id").fetchall()
+            "SELECT l.trace_id, l.item_id, l.label, l.query, l.user_text, l.created_at, m.content, t.frozen FROM recall_labels l "
+            "LEFT JOIN recall_traces t ON t.id = l.trace_id "
+            "LEFT JOIN l1_memories m ON m.id = l.item_id AND l.item_id != 0 AND t.frozen IS NULL "
+            "ORDER BY l.trace_id, l.item_id").fetchall()
     finally:
         conn.close()
     items = {}
-    for tid, iid, label, query, user_text, created_at, content in rows:
+    for tid, iid, label, query, user_text, created_at, content, frozen in rows:
+        if frozen:          # 清空记忆库之前的一轮：用当时定格下来的记忆内容
+            try:
+                content = ((json.loads(frozen).get("items") or {}).get(str(iid)) or {}).get("content")
+            except ValueError:
+                content = None
         it = items.setdefault(tid, {"trace_id": tid, "user_text": user_text, "query": query, "nothing": False,
                                     "should": [], "should_not": [], "labeled_at": created_at})
         if label == "none":

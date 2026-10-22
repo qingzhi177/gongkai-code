@@ -1,4 +1,8 @@
-"""召回轨迹的查询（Dashboard「召回对比」页用）。"""
+"""召回轨迹的查询（Dashboard「召回对比」页用）。
+
+每一轮只记了候选记忆的编号，看的时候按编号去记忆表里取内容（_snippets）。
+清空记忆库之前先 freeze()：把每一轮用到的记忆内容存进 frozen，以后看这一轮就用存下来的，
+不会因为记忆没了、或者编号指到了新记忆上而显示错。"""
 import json
 from datetime import timedelta
 
@@ -7,8 +11,9 @@ from app.config import get_conn
 from app.recall import golden
 
 COLS = ("id", "turn_key", "backend", "session_id", "client", "mode", "query", "user_text", "intent", "channels",
-        "rerank", "decision", "card", "legacy", "injected_chars", "latency", "created_at")
-JSON_COLS = ("intent", "channels", "rerank", "decision", "legacy", "latency")
+        "rerank", "decision", "card", "legacy", "injected_chars", "latency", "created_at", "frozen")
+JSON_COLS = ("intent", "channels", "rerank", "decision", "legacy", "latency", "frozen")
+FROZEN_CHARS = 200
 
 
 def _row(r):
@@ -31,6 +36,50 @@ def _snippets(conn, ids, n=60):
     return {r[0]: {"content": (r[1] or "")[:n], "ts": r[2], "event_type": r[3], "author": r[4]} for r in rows}
 
 
+def _frozen_snippets(t, ids, n=60):
+    items = (t.get("frozen") or {}).get("items") or {}
+    out = {}
+    for i in ids:
+        s = items.get(str(i))
+        if s:
+            out[int(i)] = {**s, "content": (s.get("content") or "")[:n]}
+    return out
+
+
+def _snips(conn, t, ids, n):
+    """这一轮的记忆片段：定格过的用存下来的，没定格的去记忆表里取"""
+    return _frozen_snippets(t, ids, n) if t.get("frozen") else _snippets(conn, ids, n)
+
+
+def trace_ids(t, labels=None):
+    """这一轮详情里会用到的记忆编号：候选、选中、两路检索的前 10、旧版选中和候选、标注过的"""
+    dec = t.get("decision") or {}
+    ids = {c["id"] for c in dec.get("candidates", [])} | {p["id"] for p in dec.get("picks", [])}
+    ch = t.get("channels") or {}
+    ids |= {x[0] for x in ch.get("vector", [])[:10]} | {x[0] for x in ch.get("fts", [])[:10]}
+    lg = t.get("legacy") or {}
+    ids |= {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
+    ids |= {int(c[0]) for c in lg.get("candidates", []) if isinstance(c, list) and str(c[0]).isdigit()}
+    ids |= {int(i) for i in (labels or {}) if i}
+    return ids
+
+
+def freeze(conn, source=None):
+    """把还没定格的每一轮用到的记忆内容存进 frozen（清空记忆库之前调用）。
+    source：去哪个库取记忆内容（默认就是 conn；记忆已经清掉了的时候可以给一个备份库）。
+    事务由调用方管。返回定格了几轮。"""
+    source = source or conn
+    now = timeutil.utc_now_str()
+    n = 0
+    for r in conn.execute(f"SELECT {', '.join(COLS)} FROM recall_traces WHERE frozen IS NULL").fetchall():
+        t = _row(r)
+        snip = _snippets(source, trace_ids(t, golden.labels_for(conn, t["id"])), n=FROZEN_CHARS)
+        conn.execute("UPDATE recall_traces SET frozen=? WHERE id=?",
+                     (json.dumps({"at": now, "items": {str(k): v for k, v in snip.items()}}, ensure_ascii=False), t["id"]))
+        n += 1
+    return n
+
+
 def list_traces(limit=50, session_id=None):
     sql = f"SELECT {', '.join(COLS)} FROM recall_traces"
     args = []
@@ -42,12 +91,12 @@ def list_traces(limit=50, session_id=None):
     conn = get_conn()
     try:
         items = [_row(r) for r in conn.execute(sql, args).fetchall()]
-        ids = set()
+        shown = {}
         for t in items:
-            ids |= {p["id"] for p in (t.get("decision") or {}).get("picks", [])}
+            ids = {p["id"] for p in (t.get("decision") or {}).get("picks", [])}
             lg = t.get("legacy") or {}
-            ids |= {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
-        snip = _snippets(conn, ids, n=40)
+            shown[t["id"]] = ids | {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
+        live = _snippets(conn, set().union(*[shown[t["id"]] for t in items if not t.get("frozen")]), n=40)
         labeled = golden.label_counts(conn, [t["id"] for t in items])
     finally:
         conn.close()
@@ -55,6 +104,7 @@ def list_traces(limit=50, session_id=None):
     for t in items:
         dec = t.get("decision") or {}
         lg = t.get("legacy") or {}
+        snip = _frozen_snippets(t, shown[t["id"]], n=40) if t.get("frozen") else live
         out.append({
             "id": t["id"], "created_at": t["created_at"], "session_id": t["session_id"], "client": t["client"],
             "mode": t["mode"], "user_text": (t["user_text"] or "")[:80],
@@ -67,6 +117,7 @@ def list_traces(limit=50, session_id=None):
             "rerank_ok": bool((t.get("rerank") or {}).get("ok")),
             "latency": (t.get("latency") or {}).get("total"),
             "labeled": labeled.get(t["id"], 0),
+            "frozen": bool(t.get("frozen")),
         })
     return out
 
@@ -78,17 +129,11 @@ def get_trace(trace_id):
         if not r:
             return None
         t = _row(r)
-        dec = t.get("decision") or {}
-        ids = {c["id"] for c in dec.get("candidates", [])} | {p["id"] for p in dec.get("picks", [])}
-        ch = t.get("channels") or {}
-        ids |= {x[0] for x in ch.get("vector", [])[:10]} | {x[0] for x in ch.get("fts", [])[:10]}
-        lg = t.get("legacy") or {}
-        ids |= {int(x) for x in lg.get("picked", []) if str(x).isdigit()}
-        ids |= {int(c[0]) for c in lg.get("candidates", []) if isinstance(c, list) and str(c[0]).isdigit()}
         labels = golden.labels_for(conn, trace_id)
-        ids |= {i for i in labels if i}
         t["labels"] = {str(k): v for k, v in labels.items()}
-        t["snippets"] = {str(k): v for k, v in _snippets(conn, ids, n=120).items()}
+        t["snippets"] = {str(k): v for k, v in _snips(conn, t, trace_ids(t, labels), 120).items()}
+        fz = t.pop("frozen", None)
+        t["frozen_at"] = fz.get("at") if isinstance(fz, dict) else None
         return t
     finally:
         conn.close()
