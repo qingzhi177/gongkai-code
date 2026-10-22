@@ -6,7 +6,20 @@
     <title>Memory Dashboard</title>
     <style>
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: -apple-system, sans-serif; background: #f5f5f7; color: #333; padding: 20px; }
+        /* 颜文字里少见文字的后备字体（fonts/README.md）：系统字体里没有这些字时才下载，平时不加载 */
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+A6A0-A6FF, U+16800-16A38;
+            src: url("/admin/fonts/noto-sans-bamum.woff2") format("woff2"), url("fonts/noto-sans-bamum.woff2") format("woff2"); }
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+0840-085F;
+            src: url("/admin/fonts/noto-sans-mandaic.woff2") format("woff2"), url("fonts/noto-sans-mandaic.woff2") format("woff2"); }
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+A000-A48C, U+A490-A4C6;
+            src: url("/admin/fonts/noto-sans-yi.woff2") format("woff2"), url("fonts/noto-sans-yi.woff2") format("woff2"); }
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+0530-058F, U+FB13-FB17;
+            src: url("/admin/fonts/noto-sans-armenian.woff2") format("woff2"), url("fonts/noto-sans-armenian.woff2") format("woff2"); }
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+0700-074F, U+0860-086A;
+            src: url("/admin/fonts/noto-sans-syriac.woff2") format("woff2"), url("fonts/noto-sans-syriac.woff2") format("woff2"); }
+        @font-face { font-family: "KaomojiFallback"; font-display: swap; unicode-range: U+1400-167F, U+18B0-18F5, U+11AB0-11ABF;
+            src: url("/admin/fonts/noto-sans-canadian-aboriginal.woff2") format("woff2"), url("fonts/noto-sans-canadian-aboriginal.woff2") format("woff2"); }
+        body { font-family: -apple-system, sans-serif, "KaomojiFallback"; background: #f5f5f7; color: #333; padding: 20px; }
         .container { max-width: 1000px; margin: 0 auto; }
         h1 { text-align: center; margin: 20px 0; }
         .tabs { display: flex; gap: 6px; margin-bottom: 20px; flex-wrap: wrap; }
@@ -35,6 +48,8 @@
         .conv-item { padding: 10px; background: #f9f9f9; border-radius: 6px; margin-bottom: 8px; cursor: pointer; }
         .conv-item:hover { background: #e8e8e8; }
         .msg { padding: 8px; margin-bottom: 6px; border-radius: 6px; font-size: 13px; }
+        /* 原文照原样显示：连续的空格、换行都保留（颜文字里常有几个空格加一个组合符号，空格被合并就变形了） */
+        .l0-text, .item-content, .item-quote { white-space: pre-wrap; word-break: break-word; }
         .msg-user { background: #e3f2fd; }
         .msg-ai { background: #f1f8e9; }
         .modal-mask { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.4); z-index: 1000; align-items: center; justify-content: center; }
@@ -699,7 +714,16 @@
             </div>
         </div>
         <div id="bak" class="panel">
-            <h3>备份管理（Kelivo 备份导入 / 记忆库导出导入 / feel）</h3>
+            <h3>备份管理（完整备份 / Kelivo 备份导入 / 记忆库导出导入 / feel）</h3>
+            <div class="config-section" style="background:#f3fbf7;border:1px solid #c7e9d8;border-radius:8px;padding:10px 14px;">
+                <h4>完整备份（推荐，什么都留下）</h4>
+                <div style="font-size:13px;color:#555;line-height:1.7;margin-bottom:8px;">
+                    一个 zip 里放下所有记忆数据：对话原文（含被换下来的旧版本）、记忆、思考记录、每日片段和日摘、叙事卷、章节、关系状态、共同语汇、未完的事、召回对比，每样都有能直接读的版本；
+                    另外有整个库的副本、每张表的 JSON、画像和向量库，以及放在 <code>data/archive</code> 里的旧版记忆库。
+                    不含密钥、模型配置、任务队列和系统日志。打包要几秒钟，打开 zip 先看「说明.md」。
+                </div>
+                <a href="/export/full" download style="padding:5px 14px;background:#10b981;color:#fff;border-radius:4px;text-decoration:none;">下载完整备份(zip)</a>
+            </div>
             <div class="config-section">
                 <h4>Kelivo 备份导入</h4>
                 <div style="margin-bottom:8px;">
@@ -934,12 +958,23 @@
                 if (currentPage > 0) html += ' <button class="btn btn-small" onclick="currentPage--;renderL0Page()">上一页</button>';
                 if (end < messages.length) html += ' <button class="btn btn-small" onclick="currentPage++;renderL0Page()">下一页</button>';
                 html += '</div>';
+                l0Cache = {};
                 page.forEach(function(m) {
+                    l0Cache[m.id] = m;
                     var cls = m.role === 'user' ? 'msg-user' : 'msg-ai';
                     var prefix = m.role === 'user' ? '👤' : '🤖';
-                html += '<div class="msg ' + cls + '"><span style="font-size:10px;color:#999;cursor:pointer;text-decoration:underline;" onclick="editTimestamp(' + m.id + ',\'' + (m.ts || '') + '\')">' + formatTime(m.ts) + '</span> <span style="font-size:10px;color:#ff3b30;cursor:pointer;" onclick="deleteMsg(' + m.id + ')">删除</span><br>' + prefix + ' ' + m.content + '</div>';
+                    html += '<div class="msg ' + cls + '"><span style="font-size:10px;color:#999;cursor:pointer;text-decoration:underline;" onclick="editTimestamp(' + m.id + ',\'' + (m.ts || '') + '\')">' + formatTime(m.ts) + '</span>'
+                        + ' <span style="font-size:10px;color:#6f42c1;cursor:pointer;" onclick="editL0(' + m.id + ')">修改</span>'
+                        + (m.edits ? ' <span style="font-size:10px;color:#888;cursor:pointer;text-decoration:underline;" onclick="showL0Edits(' + m.id + ')">改过 ' + m.edits + ' 次</span>' : '')
+                        + ' <span style="font-size:10px;color:#ff3b30;cursor:pointer;" onclick="deleteMsg(' + m.id + ')">删除</span>'
+                        + '<div class="l0-text">' + prefix + ' ' + escapeHtml(m.content) + '</div>'
+                        + '<div id="l0e-' + m.id + '"></div></div>';
                 });
                 document.getElementById('l0-messages').innerHTML = html || '<p>无消息</p>';
+                if (l0Notice && document.getElementById('l0e-' + l0Notice.id)) {
+                    document.getElementById('l0e-' + l0Notice.id).innerHTML = '<div style="font-size:12px;color:#28a745;margin-top:4px;">' + escapeHtml(l0Notice.text) + '</div>';
+                }
+                l0Notice = null;
             });
         }
 
@@ -995,8 +1030,8 @@
                 if (m.is_core) html += '<span class="badge badge-core">核心</span>';
                 if (m.event_type === 'feel') html += '<span class="badge badge-feel">感受</span>';
                 else if (m.event_type) html += '<span class="badge badge-type">' + m.event_type + '</span>';
-                html += m.content + '</div>';
-                if (m.quote && m.quote !== m.content) html += '<div class="item-quote">"' + m.quote + '"</div>';
+                html += escapeHtml(m.content) + '</div>';
+                if (m.quote && m.quote !== m.content) html += '<div class="item-quote">"' + escapeHtml(m.quote) + '"</div>';
                 if (m.tags) html += '<div style="font-size:11px;color:#007aff;margin:3px 0;">标签: ' + m.tags + '</div>';
                 html += '<div class="item-meta">' + formatTime(m.ts) + ' | ' + (m.client || 'AI') + ' |翻阅' + (m.access_count||0) + '次';
                 if (m.valence != null) html += ' | v' + m.valence + '/a' + (m.arousal||0);
@@ -1235,6 +1270,81 @@ function rebuildProfile() {
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ts: newTs})
             }).then(function() { renderL0Page(); });
+        }
+
+        // ============ L0 原文的修改 ============
+        var l0Cache = {};
+        var l0Notice = null;
+
+        function editL0(id) {
+            var m = l0Cache[id];
+            var box = document.getElementById('l0e-' + id);
+            if (!m || !box) return;
+            if (box.dataset.mode === 'edit') { box.innerHTML = ''; box.dataset.mode = ''; return; }
+            box.dataset.mode = 'edit';
+            box.innerHTML = '<textarea id="l0e-text-' + id + '" class="l0-text" style="width:100%;min-height:90px;margin-top:6px;font-size:13px;line-height:1.6;padding:6px;border:1px solid #ccc;border-radius:6px;"></textarea>'
+                + '<div style="font-size:12px;margin:4px 0;line-height:1.8;">'
+                + '<label><input type="radio" name="l0e-mode-' + id + '" value="fix" checked> 只改字（错字、标点、颜文字这类，意思不变）：别处一字不差引用过这一段的一起改，不调用模型</label><br>'
+                + '<label><input type="radio" name="l0e-mode-' + id + '" value="reextract"> 意思改了：这条消息所在那一批的记忆重新提取，那一天的每日片段重新整理（会调用模型）</label></div>'
+                + '<button class="btn btn-small" onclick="saveL0Edit(' + id + ')">保存</button> '
+                + '<button class="btn btn-small" style="background:#999;" onclick="editL0(' + id + ')">取消</button>'
+                + '<span id="l0e-status-' + id + '" style="font-size:12px;margin-left:8px;"></span>'
+                + '<div style="font-size:11px;color:#888;margin-top:4px;">改之前的原文会留在修改记录里，随时可以改回去。前端里的聊天记录不会变，下次存记录时也认得这是改过的同一条。</div>';
+            document.getElementById('l0e-text-' + id).value = m.content;
+        }
+
+        function putL0Content(id, content, mode, st) {
+            if (st) { st.textContent = '保存中…'; st.style.color = '#666'; }
+            return fetch(API + '/l0/' + id + '/content', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ content: content, mode: mode }) })
+                .then(function(r) { return r.json().then(function(d) { return { ok: r.ok, d: d }; }); })
+                .then(function(x) {
+                    var d = x.d;
+                    if (!x.ok || d.status !== 'ok') {
+                        if (st) { st.textContent = '没保存：' + (d.detail || '未知错误'); st.style.color = '#dc3545'; }
+                        return;
+                    }
+                    var msg = '已保存';
+                    if (d.mode === 'fix') msg += d.synced_cn ? '，连带改了：' + d.synced_cn : '，别处没有引用这一段';
+                    else msg += ((d.l1_purged || []).length ? '，作废了 ' + d.l1_purged.length + ' 条记忆，会重新提取' : '')
+                        + ((d.resettle || []).length ? '，' + d.resettle.join('、') + ' 的每日片段会重新整理' : '');
+                    if (d.warning) msg += '（' + d.warning + '）';
+                    l0Notice = { id: id, text: msg };
+                    renderL0Page();
+                })
+                .catch(function(e) { if (st) { st.textContent = '没保存：' + e; st.style.color = '#dc3545'; } });
+        }
+
+        function saveL0Edit(id) {
+            var text = document.getElementById('l0e-text-' + id).value;
+            var mode = document.querySelector('input[name="l0e-mode-' + id + '"]:checked').value;
+            if (mode === 'reextract' && !confirm('重新提取会作废这条消息所在那一批的记忆、重新整理那一天的每日片段（会调用模型）。确定吗？')) return;
+            putL0Content(id, text, mode, document.getElementById('l0e-status-' + id));
+        }
+
+        function showL0Edits(id) {
+            var box = document.getElementById('l0e-' + id);
+            if (!box) return;
+            if (box.dataset.mode === 'history') { box.innerHTML = ''; box.dataset.mode = ''; return; }
+            box.dataset.mode = 'history';
+            box.innerHTML = '<div style="font-size:12px;color:#888;">读取中…</div>';
+            fetch(API + '/l0/' + id + '/edits').then(function(r) { return r.json(); }).then(function(d) {
+                window.__l0Edits = window.__l0Edits || {};
+                var html = (d.edits || []).map(function(e) {
+                    window.__l0Edits[e.id] = e;
+                    var synced = Object.keys(e.synced || {}).length ? ' · 连带改了 ' + Object.keys(e.synced).map(function(k) { return e.synced[k]; }).reduce(function(a, b) { return a + b; }, 0) + ' 处' : '';
+                    return '<div style="border-top:1px dashed #ddd;padding:6px 0;font-size:12px;">'
+                        + '<div style="color:#888;">' + formatTime(e.created_at) + ' · ' + escapeHtml(e.mode_cn) + synced
+                        + ' · <a href="javascript:void(0)" onclick="revertL0(' + id + ',' + e.id + ')">改回这一版之前的样子</a></div>'
+                        + '<div class="l0-text" style="color:#555;margin-top:2px;">改之前：' + escapeHtml(e.old_content) + '</div></div>';
+                }).join('');
+                box.innerHTML = html || '<div style="font-size:12px;color:#888;">没有修改记录</div>';
+            });
+        }
+
+        function revertL0(id, editId) {
+            var e = (window.__l0Edits || {})[editId];
+            if (!e || !confirm('把这条消息改回这次修改之前的样子？（按「只改字」处理，引用过的地方也一起改回去）')) return;
+            putL0Content(id, e.old_content, 'fix', null);
         }
 
         function deleteMsg(id) {
@@ -3159,10 +3269,13 @@ function rebuildProfile() {
                     listHtml += '</div>';
                 });
                 document.getElementById('config-provider-list').innerHTML = listHtml || '<p style="color:#888;">暂无供应商</p>';
+                // 模块配置的下拉框要用到供应商列表，所以等供应商读回来以后再画
+                // （以前两个请求同时发，模块配置先回来时供应商下拉框里只有「未配置」，就选不了）
+                loadModelConfigs();
+            }).catch(function(e) {
+                document.getElementById('config-active').textContent = '读取供应商失败：' + e;
+                loadModelConfigs();
             });
-
-            // 新增：加载模块配置
-            loadModelConfigs();
         }
 
         function loadModelConfigs() {
@@ -3239,9 +3352,17 @@ function rebuildProfile() {
                     modelSelect.appendChild(opt);
                 });
             }
-            // 回填已保存的模型
+            // 回填已保存的模型（供应商的模型列表里已经没有它了，也照样显示出来）
             var cfg2 = (window.__modelConfigs || {})[purpose];
-            if (cfg2 && cfg2.model) modelSelect.value = cfg2.model;
+            if (cfg2 && cfg2.model && cfg2.provider_id === providerId) {
+                if (!(provider && (provider.models || []).indexOf(cfg2.model) >= 0)) {
+                    var keep = document.createElement('option');
+                    keep.value = cfg2.model;
+                    keep.textContent = cfg2.model + '（已保存，不在供应商的模型列表里）';
+                    modelSelect.appendChild(keep);
+                }
+                modelSelect.value = cfg2.model;
+            }
         }
 
         function clearModelConfig(purpose, label) {

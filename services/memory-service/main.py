@@ -38,6 +38,7 @@ from app.recall import traces as recall_traces
 from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
+from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
 from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
@@ -854,7 +855,9 @@ def _merge_l0_sequence(c, conv_id, client, messages):
     old_keys = [_cmp_key(r[2], r[3]) for r in rows]
     old_extracted = {r[0]: r[4] for r in rows}
 
-    new_keys = [_cmp_key(m["role"], m["content"]) for m in messages]
+    # 在 Dashboard 上改过的消息：前端带来的还是改之前的原文，换成现在的比较键，认得是同一条（不会把修改冲掉、也不重复存）
+    edited = l0_edit.aliases(c, conv_id)
+    new_keys = [edited.get(k, k) for k in (_cmp_key(m["role"], m["content"]) for m in messages)]
 
     sm = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
     saved = 0
@@ -1207,6 +1210,27 @@ async def export_memory_api():
     return Response(content=data, media_type="application/zip",
                     headers={"Content-Disposition": f"attachment; filename={fname}"})
 
+@app.get("/export/full")
+async def export_full_api():
+    """完整备份（zip）：现在的库（清掉密钥、模型配置和任务队列）+ 每张表的 JSON + 能直接读的 Markdown + 画像、向量库
+    + data/archive/ 里的旧库。见 full_backup.py"""
+    import shutil
+    import tempfile
+    import full_backup
+    from starlette.background import BackgroundTask
+    now = timeutil.to_local(timeutil.utc_now())
+    tmpdir = tempfile.mkdtemp(prefix="fullbackup_zip_")
+    fname = "memory_full_backup_" + now.strftime("%Y%m%d_%H%M") + ".zip"
+    path = os.path.join(tmpdir, fname)
+    try:
+        await asyncio.to_thread(full_backup.build, str(SQLITE_PATH), str(DATA_DIR), path, now)
+    except Exception as e:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        logging.exception("完整备份失败")
+        return JSONResponse(status_code=500, content={"status": "error", "detail": f"完整备份失败：{e}"})
+    return FileResponse(path, media_type="application/zip", filename=fname,
+                        background=BackgroundTask(shutil.rmtree, tmpdir, True))
+
 @app.post("/import/memory")
 async def import_memory_api(req: MemoryImportReq):
     """记忆库整体导入（zip）。mode: merge(按主键去重) | replace(先清空相关表)"""
@@ -1473,13 +1497,14 @@ async def get_l0_messages(conv_id: Optional[str] = None, limit: int = 5000, offs
     rows = c.fetchall()
     c.execute('SELECT COUNT(*) FROM l0_messages WHERE status=?', ('active',))
     total = c.fetchone()[0]
+    edits = l0_edit.counts(conn, [r[0] for r in rows])
     conn.close()
     messages = []
     for row in rows:
         messages.append({
             "id": row[0], "msg_idx": row[1], "conv_id": row[2], "role": row[3],
             "content": row[4], "ts": row[5], "source": row[6],
-            "client": row[7], "status": row[8]
+            "client": row[7], "status": row[8], "edits": edits.get(row[0], 0)
         })
     return {"messages": messages, "total": total}
 
@@ -1835,6 +1860,53 @@ async def reextract_l1(memory_id: int):
 
 class UpdateTimestampRequest(BaseModel):
     ts: str
+
+
+class L0EditRequest(BaseModel):
+    content: str
+    mode: str = "fix"
+
+
+@app.put("/l0/{msg_id}/content")
+async def edit_l0_content(msg_id: int, req: L0EditRequest):
+    """手动修改 L0 原文（见 app/l0_edit.py）。
+    mode=fix：只改字（错字、颜文字这类），引用过这段原话的地方一起改，不调用模型；
+    mode=reextract：意思改了，这条消息所在那一批的记忆作废重提、那一天的每日片段重新整理。"""
+    try:
+        result = l0_edit.edit(msg_id, req.content, req.mode, cascade=_cascade_l1_on_version_switch)
+    except ValueError as e:
+        return JSONResponse(status_code=400, content={"status": "error", "detail": str(e)})
+    warnings = []
+    if result["l1_purged"]:
+        try:
+            l1_collection.delete(ids=[f"l1_{i}" for i in result["l1_purged"]])
+        except Exception as e:
+            warnings.append(f"作废的记忆向量没删掉：{e}")
+    if result["l1_changed"]:      # 记忆的内容也连带改了：重算向量
+        conn = get_conn()
+        try:
+            rows = conn.execute(f"SELECT id, content FROM l1_memories WHERE id IN ({','.join('?' * len(result['l1_changed']))})",
+                                result["l1_changed"]).fetchall()
+        finally:
+            conn.close()
+        for lid, content in rows:
+            emb = await get_embedding(content)
+            try:
+                if emb:
+                    l1_collection.update(ids=[f"l1_{lid}"], embeddings=[emb], documents=[content])
+                else:
+                    warnings.append(f"记忆 #{lid} 的向量没重算（embedding 失败）")
+            except Exception as e:
+                warnings.append(f"记忆 #{lid} 的向量没更新：{e}")
+    if warnings:
+        result["warning"] = "；".join(warnings)
+    return result
+
+
+@app.get("/l0/{msg_id}/edits")
+async def l0_edit_history(msg_id: int):
+    """这条 L0 的修改记录（新的在前）"""
+    return {"status": "ok", "edits": l0_edit.history(msg_id)}
 
 @app.put("/l0/{msg_id}/timestamp")
 async def update_l0_timestamp(msg_id: int, req: UpdateTimestampRequest):

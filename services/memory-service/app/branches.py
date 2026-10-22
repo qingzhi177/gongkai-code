@@ -45,19 +45,27 @@ def get(c, conv_id):
 
 
 def history(c, conv_id):
-    """一个会话的完整历史：[[指纹, 存在哪个会话, 那一行的 id], ...]（分支 = 重合部分 + 自己存的 active 记录）"""
+    """一个会话的完整历史：[[指纹, 存在哪个会话, 那一行的 id(, 改之前的指纹列表)], ...]（分支 = 重合部分 + 自己存的 active 记录）。
+    在 Dashboard 上改过的消息多带一个「改之前的指纹」：前端手里还是改之前的原文，也要认得是同一条。"""
+    from app import l0_edit
     b = get(c, conv_id)
     out = list(b["prefix"]) if b else []
+    olds = l0_edit.old_contents(c, conv_id)
     rows = c.execute("SELECT id, role, content FROM l0_messages WHERE conv_id=? AND status='active' "
                      "ORDER BY msg_idx ASC, id ASC", (conv_id,)).fetchall()
-    out.extend([fingerprint(r[1], r[2]), conv_id, r[0]] for r in rows)
+    for r in rows:
+        e = [fingerprint(r[1], r[2]), conv_id, r[0]]
+        if r[0] in olds:
+            e.append([fingerprint(r[1], o) for o in olds[r[0]]])
+        out.append(e)
     return out
 
 
 def _common(msgs, entries):
     n = 0
     for (role, content), e in zip(msgs, entries):
-        if fingerprint(role, content) != e[0]:
+        fp = fingerprint(role, content)
+        if fp != e[0] and not (len(e) > 3 and fp in (e[3] or [])):
             break
         n += 1
     return n

@@ -1,6 +1,8 @@
 data/sqlite/*.db
 # 迁移前的自动备份（含个人数据，不入库）
 data/sqlite/backups/
+# 旧版记忆库（完整备份会一起打包，含个人数据，不入库）
+data/archive/
 # worker / 提取的单实例锁文件
 data/run/
 data/chroma/
