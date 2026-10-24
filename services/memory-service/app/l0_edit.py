@@ -36,12 +36,14 @@ TARGETS = [
     ("relationship_states", (), ("lines",), "status='active'"),
     ("open_loops", ("text", "created_quote", "closed_quote", "closed_text"), (), None),
     ("loop_events", ("quote", "detail"), (), None),
+    ("facts", ("quote",), (), None),
+    ("fact_events", ("quote",), (), None),
     ("thinking_records", ("full_reply",), (), None),
     ("shared_narrative", ("content",), (), "status='active'"),
     ("recent_summary", ("content",), (), "status='active'"),
 ]
 TARGET_CN = {"l1_memories": "记忆", "episodes": "每日片段", "digests": "日摘", "arcs": "叙事卷", "chapters": "章节",
-             "relationship_states": "关系状态", "open_loops": "未完的事", "loop_events": "未完的事的经过",
+             "relationship_states": "关系状态", "open_loops": "未完的事", "loop_events": "未完的事的经过", "facts": "事实", "fact_events": "事实的经过",
              "thinking_records": "思考记录", "shared_narrative": "旧版共同经历叙事", "recent_summary": "近期摘要"}
 
 

@@ -162,6 +162,7 @@
             <button class="tab" onclick="showPanel('arcs')">叙事卷</button>
             <button class="tab" onclick="showPanel('lexicon')">共同语汇</button>
             <button class="tab" onclick="showPanel('loops')">未完的事</button>
+            <button class="tab" onclick="showPanel('facts')">事实</button>
             <button class="tab" onclick="showPanel('state')">关系状态</button>
             <button class="tab" onclick="showPanel('chapters')">章节</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
@@ -540,6 +541,30 @@
                 <div id="lp-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
+        <div id="facts" class="panel">
+            <h3>事实</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                一段时间内不会变、聊天时我应该知道的事：住在哪、在读什么、家里的猫叫什么、生日、长期的喜好，我说过的关于自己的事，我们之间的称呼……
+                每天整理完对话以后自动找，每一条都附一句原话做证据。说法变了：<b>明确说的</b>（「我搬家了」）会换成新的，旧的留在「以前的」里；
+                <b>随口一提</b>的不换，先标「可能变了」，你点一下确认，或者等以后说清楚了再换。你改过的事实不会被自动换掉。
+                <b>现在只在这里看，还不会放进聊天里</b>——以后会把下面「档案预览」里的几行告诉我（碰到「轻放」话题的不列）。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:13px;"><input type="checkbox" id="ft-enabled" onchange="saveFactSettings({enabled: this.checked})"> 自动找</label>
+                <button class="btn" onclick="scanFacts()">现在扫描</button>
+                <button class="btn" onclick="toggleAddFact()" style="background:#28a745;">自己加一条</button>
+                <button class="btn" onclick="loadFacts()" style="background:#6c757d;">刷新</button>
+                <span id="ft-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="ft-add" style="display:none;background:#f8f9fa;border-radius:8px;padding:10px 12px;margin-bottom:14px;"></div>
+            <div id="ft-disputed"></div>
+            <div id="ft-groups"></div>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">档案预览（以后放进聊天的样子）</summary>
+                <div id="ft-profile" style="margin-top:8px;font-size:13px;line-height:1.9;background:#f6f3fb;border-radius:8px;padding:10px 14px;"></div></details>
+            <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="ft-orphan-title">不对的、没有现在值的</summary>
+                <div id="ft-orphan" style="margin-top:8px;"></div></details>
+        </div>
+
         <div id="state" class="panel">
             <h3>关系状态</h3>
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
@@ -900,6 +925,7 @@
             if (name === 'arcs') loadArcs();
             if (name === 'lexicon') loadLexicon();
             if (name === 'loops') loadLoops();
+            if (name === 'facts') loadFacts();
             if (name === 'state') loadState();
             if (name === 'chapters') loadChapters();
             if (name === 'summary') { loadSummary(); loadDigests(); }
@@ -1592,7 +1618,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事', state_refresh: '关系状态', write_chapter: '写章节', propose_chapters: '分章提议' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事', facts_scan: '事实', state_refresh: '关系状态', write_chapter: '写章节', propose_chapters: '分章提议' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1621,6 +1647,9 @@ function rebuildProfile() {
             if (j.kind === 'loops_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
                 + ((r.new || []).length ? ' · 新的：' + r.new.join('、') : '') + ((r.closed || []).length ? ' · 有了下文：' + r.closed.join('、') : '')
                 + (r.mentioned ? ' · 又提起 ' + r.mentioned + ' 次' : '') + ((r.expired || []).length ? ' · 自动过期 ' + r.expired.length + ' 件' : '');
+            if (j.kind === 'facts_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
+                + ((r.created || []).length ? ' · 新的：' + r.created.join('、') : '') + ((r.superseded || []).length ? ' · 变了：' + r.superseded.join('、') : '')
+                + ((r.disputed || []).length ? ' · 可能变了：' + r.disputed.join('、') : '') + (r.confirmed ? ' · 又说到 ' + r.confirmed + ' 次' : '');
             if (j.kind === 'state_refresh' && r.status === 'ok') return r.empty ? '最近七天没有聊天' : '第 ' + r.version + ' 版 · ' + (r.lines || 0) + ' 行';
             if (j.kind === 'state_refresh' && r.status === 'rejected') return '没通过校验，保留旧的';
             if (j.kind === 'write_chapter' && (r.status === 'ok' || r.status === 'rejected')) return '第 ' + r.n + ' 章' + (r.rebuild ? '（整章重写）' : '')
@@ -2756,6 +2785,144 @@ function rebuildProfile() {
                 });
         }
 
+        // ============ 事实 ============
+        var factMeta = {}, factCache = {};
+
+        function loadFacts() {
+            fetch(API + '/facts').then(function(r) { return r.json(); }).then(function(d) {
+                factMeta = { subjects: d.subjects || {}, status_cn: d.status_cn || {}, certainty_cn: d.certainty_cn || {} };
+                document.getElementById('ft-enabled').checked = !!(d.settings || {}).enabled;
+                var c = d.counts || {};
+                document.getElementById('ft-status').textContent = '现在的 ' + (c.current || 0) + ' 条' + (c.disputed ? ' · 可能变了 ' + c.disputed + ' 条' : '')
+                    + ' · 扫过 ' + d.scanned_chunks + ' 段对话' + (d.pending_chunks ? ' · 还有 ' + d.pending_chunks + ' 段没扫' : '');
+                factCache = {};
+                var html = '';
+                if ((d.disputed || []).length) {
+                    html += '<h4 style="margin:6px 0 8px;">可能变了（等你确认）</h4>';
+                    d.disputed.forEach(function(x) {
+                        factCache[x.id] = x;
+                        html += '<div style="background:#fff8ec;border:1px solid #f3e0bd;border-radius:8px;padding:10px 14px;margin-bottom:8px;">'
+                            + '<div style="font-size:14px;line-height:1.7;"><b>' + escapeHtml(x.label) + '</b>：现在记的是「' + escapeHtml(x.current_value || '（没有）')
+                            + '」，' + formatTime(x.valid_from).substring(0, 10) + ' 好像说成了「' + escapeHtml(x.value) + '」</div>'
+                            + (x.quote ? '<div style="font-size:12px;color:#666;margin-top:3px;">原话：「' + escapeHtml(x.quote) + '」</div>' : '')
+                            + '<div style="margin-top:6px;font-size:12px;display:flex;gap:10px;">'
+                            + '<a href="javascript:void(0)" onclick="factOp(' + x.id + ', \'confirm\')">是，换成新的</a>'
+                            + '<a href="javascript:void(0)" style="color:#888;" onclick="factOp(' + x.id + ', \'reject\')">不是，还是原来的</a></div></div>';
+                    });
+                }
+                document.getElementById('ft-disputed').innerHTML = html;
+                html = '';
+                Object.keys(factMeta.subjects).forEach(function(subj) {
+                    var rows = (d.groups || {})[subj] || [];
+                    if (!rows.length) return;
+                    html += '<h4 style="margin:12px 0 8px;">' + escapeHtml(factMeta.subjects[subj]) + '（' + rows.length + '）</h4>';
+                    rows.forEach(function(x) { factCache[x.id] = x; html += factCard(x); });
+                });
+                document.getElementById('ft-groups').innerHTML = html || '<div style="color:#888;font-size:13px;">还没有。整理好的天会自动扫一遍；也可以点「现在扫描」。</div>';
+                document.getElementById('ft-profile').innerHTML = (d.profile || []).length
+                    ? d.profile.map(function(l) { return '<div>' + escapeHtml(l) + '</div>'; }).join('') : '<span style="color:#888;">（还没有）</span>';
+                var orphan = d.orphan_history || [];
+                document.getElementById('ft-orphan-title').textContent = '不对的、没有现在值的（' + orphan.length + '）';
+                document.getElementById('ft-orphan').innerHTML = orphan.map(function(h) {
+                    factCache[h.id] = h;
+                    return '<div style="font-size:13px;margin-bottom:4px;">' + escapeHtml(h.label) + '：' + escapeHtml(h.value) + ' <span style="color:#888;">（'
+                        + escapeHtml(factMeta.status_cn[h.status] || h.status) + '）</span>'
+                        + (h.status === 'rejected' ? ' <a href="javascript:void(0)" style="font-size:12px;" onclick="factOp(' + h.id + ', \'restore\')">恢复</a>' : '') + '</div>';
+                }).join('') || '<div style="color:#888;font-size:12px;">没有</div>';
+            }).catch(function(e) { document.getElementById('ft-status').textContent = '读取失败：' + e; });
+        }
+
+        function factCard(x) {
+            var hist = (x.history || []).map(function(h) {
+                return '<div>· ' + escapeHtml(factMeta.status_cn[h.status] || h.status) + '：' + escapeHtml(h.value) + '（' + formatTime(h.valid_from).substring(0, 10)
+                    + (h.valid_to ? ' 到 ' + formatTime(h.valid_to).substring(0, 10) : '') + '）'
+                    + (h.status === 'rejected' ? ' <a href="javascript:void(0)" onclick="factOp(' + h.id + ', \'restore\')">恢复</a>' : '') + '</div>';
+            }).join('');
+            return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:9px 14px;margin-bottom:7px;">'
+                + '<div style="font-size:14px;line-height:1.7;"><b>' + escapeHtml(x.label) + '</b>：' + escapeHtml(x.value)
+                + (x.certainty === 'vague' ? ' <span style="font-size:11px;background:#f0f0f5;border-radius:8px;padding:1px 7px;">随口提到</span>' : '')
+                + (x.edited ? ' <span style="font-size:11px;color:#aaa;">（你改过）</span>' : '') + '</div>'
+                + (x.quote ? '<div style="font-size:12px;color:#666;margin-top:2px;">原话：「' + escapeHtml(x.quote) + '」</div>' : '')
+                + '<div style="font-size:12px;color:#888;margin-top:2px;">' + (x.source === 'dashboard' ? '你加的' : formatTime(x.valid_from).substring(0, 10) + ' 起')
+                + (x.confirm_count ? ' · 后来又说到 ' + x.confirm_count + ' 次' : '') + ' · <span style="color:#bbb;">' + escapeHtml(x.fact_key) + '</span></div>'
+                + (hist ? '<div style="font-size:12px;color:#777;margin-top:4px;">' + hist + '</div>' : '')
+                + '<div style="margin-top:5px;font-size:12px;display:flex;gap:10px;">'
+                + '<a href="javascript:void(0)" onclick="editFact(' + x.id + ')">修改</a>'
+                + '<a href="javascript:void(0)" style="color:#888;" onclick="factOp(' + x.id + ', \'reject\')">不对</a>'
+                + '<a href="javascript:void(0)" onclick="showFact(' + x.id + ')">经过</a></div>'
+                + '<div id="ft-detail-' + x.id + '" style="display:none;margin-top:6px;font-size:12px;color:#555;"></div></div>';
+        }
+
+        function factOp(id, op) {
+            var tips = { reject: '这条不对？以后扫到一样的说法也不再记。', confirm: '换成新的说法？原来的会留在「以前的」里。' };
+            if (tips[op] && !confirm(tips[op])) return;
+            fetch(API + '/facts/' + id + '/' + op, { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                if (d.status === 'error') { alert(d.message); return; }
+                loadFacts();
+            });
+        }
+
+        function editFact(id) {
+            var x = factCache[id];
+            if (!x) return;
+            var label = prompt('中文名：', x.label);
+            if (label === null) return;
+            var value = prompt('值：', x.value);
+            if (value === null) return;
+            fetch(API + '/facts/' + id, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ label: label, value: value }) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') { alert(d.message); return; } loadFacts(); });
+        }
+
+        function showFact(id) {
+            var el = document.getElementById('ft-detail-' + id);
+            if (el.style.display === 'block') { el.style.display = 'none'; return; }
+            fetch(API + '/facts/' + id).then(function(r) { return r.json(); }).then(function(x) {
+                var names = { created: '记下', confirmed: '又说到', superseded: '被换掉', disputed: '可能变了', resolved: '确认了', edited: '你改了', rejected: '标成不对', restored: '恢复' };
+                el.innerHTML = (x.events || []).map(function(e) {
+                    return '<div>· ' + formatTime(e.ts || e.created_at).substring(0, 16) + ' ' + (names[e.event] || e.event)
+                        + (e.quote ? '：「' + escapeHtml(e.quote) + '」' : '') + (e.detail ? ' ' + escapeHtml(e.detail) : '') + '</div>';
+                }).join('') || '没有记录';
+                el.style.display = 'block';
+            });
+        }
+
+        function toggleAddFact() {
+            var el = document.getElementById('ft-add');
+            if (el.style.display === 'block') { el.style.display = 'none'; return; }
+            el.innerHTML = '<div style="font-size:13px;display:flex;flex-wrap:wrap;gap:8px;align-items:center;">'
+                + '<select id="ft-new-subject" style="padding:3px 5px;border:1px solid #ddd;border-radius:6px;">'
+                + Object.keys(factMeta.subjects || {}).map(function(k) { return '<option value="' + k + '">' + escapeHtml(factMeta.subjects[k]) + '</option>'; }).join('') + '</select>'
+                + '<input id="ft-new-label" placeholder="中文名，比如「家里猫的名字」" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:200px;">'
+                + '<input id="ft-new-value" placeholder="值" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:160px;">'
+                + '<button class="btn" style="padding:3px 12px;font-size:12px;" onclick="addFact()">加上</button></div>';
+            el.style.display = 'block';
+        }
+
+        function addFact() {
+            var body = { subject: document.getElementById('ft-new-subject').value, label: document.getElementById('ft-new-label').value,
+                         value: document.getElementById('ft-new-value').value };
+            fetch(API + '/facts', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); return; }
+                    document.getElementById('ft-add').style.display = 'none';
+                    loadFacts();
+                });
+        }
+
+        function scanFacts() {
+            fetch(API + '/facts/scan', { method: 'POST' }).then(function(r) { return r.json(); }).then(function(d) {
+                document.getElementById('ft-status').textContent = d.queued ? '已开始扫描，稍后点「刷新」' : '扫描已经在进行中了';
+            });
+        }
+
+        function saveFactSettings(values) {
+            fetch(API + '/facts/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); return; }
+                    document.getElementById('ft-status').textContent = values.enabled ? '已开启自动找' : '已关闭（还可以手动点「现在扫描」）';
+                });
+        }
+
         // ============ 通用：一组设置（数字项）============
         function renderGroupSettings(elId, spec, group, statusId, reload) {
             var items = (spec.items || []).filter(function(it) { return it.type !== 'bool'; });
@@ -3295,6 +3462,7 @@ function rebuildProfile() {
                     {key: 'arc', label: '叙事卷（写卷）', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'lexicon', label: '共同语汇', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'loops', label: '未完的事', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
+                    {key: 'facts', label: '事实', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'state', label: '关系状态', hint: '不设置时用「日摘·周摘」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
                     {key: 'chapter', label: '章节', hint: '不设置时用「叙事卷（写卷）」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
                     {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},

@@ -391,26 +391,63 @@ def md_recall(conn):
     for lb in _rows(conn, "recall_labels"):
         labels.setdefault(lb.get("trace_id"), []).append(lb)
 
-    def name(i):
+    def name(i, frozen):
         try:
             i = int(i)
         except (TypeError, ValueError):
             return str(i)
-        return f"#{i} {str(mem.get(i) or '（这条记忆已经不在了）')[:80]}"
+        # 清空记忆库之前的一轮（frozen 不是 None）：用当时定格下来的记忆内容，不去现在的记忆表里按编号找
+        text = (frozen.get(str(i)) or {}).get("content") if frozen is not None else mem.get(i)
+        return f"#{i} {str(text or '（这条记忆已经不在了）')[:80]}"
 
     out = ["# 召回对比", "", "每一轮聊天时，新的召回和旧的召回各自会想起哪些记忆。", ""]
     for t in traces:
+        fz = _loads(t.get("frozen"), None)
+        fz = (fz.get("items") or {}) if isinstance(fz, dict) else None
         dec = _loads(t.get("decision"), {}) or {}
         leg = _loads(t.get("legacy"), {}) or {}
         out += [f"## {_t(t.get('created_at'))} · {t.get('mode') or ''}", "", "你说：" + str(t.get("user_text") or t.get("query") or "").replace("\n", " ")[:300], ""]
         picks = [p.get("id") if isinstance(p, dict) else p for p in (dec.get("picks") or [])]
-        out.append("- 新的召回：" + ("；".join(name(i) for i in picks) if picks else f"没有想起（{dec.get('gate') or ''}）"))
+        out.append("- 新的召回：" + ("；".join(name(i, fz) for i in picks) if picks else f"没有想起（{dec.get('gate') or ''}）"))
         lp = leg.get("picked") or []
-        out.append("- 旧的召回：" + ("；".join(name(i) for i in lp) if lp else f"没有想起（{leg.get('gate') or ''}）"))
+        out.append("- 旧的召回：" + ("；".join(name(i, fz) for i in lp) if lp else f"没有想起（{leg.get('gate') or ''}）"))
         if t.get("card"):
             out += ["", "放进聊天的那一段：", "", _quote(t["card"])]
         for lb in labels.get(t.get("id"), []):
-            out.append(f"- 你的标注：{name(lb.get('item_id'))} → {lb.get('label')}")
+            out.append(f"- 你的标注：{name(lb.get('item_id'), fz)} → {lb.get('label')}")
+        out.append("")
+    return "\n".join(out)
+
+
+FACT_SUBJECTS = {"user": "关于你", "ai": "关于我", "us": "我们之间"}
+FACT_STATUS = {"current": "现在的", "superseded": "以前的", "disputed": "可能变了", "rejected": "不对"}
+
+
+def md_facts(conn):
+    facts = _rows(conn, "facts", "fact_key, valid_from, id")
+    if not facts:
+        return None
+    out = ["# 事实", "", "一段时间内不会变、聊天时应该知道的事。值变过的，按时间列出以前的值。", ""]
+    for subj, title in FACT_SUBJECTS.items():
+        rows = [x for x in facts if x.get("subject") == subj]
+        if not rows:
+            continue
+        out += [f"## {title}", ""]
+        keys = []
+        for x in rows:
+            if x.get("fact_key") not in keys:
+                keys.append(x.get("fact_key"))
+        for k in keys:
+            vs = [x for x in rows if x.get("fact_key") == k]
+            cur = next((x for x in vs if x.get("status") == "current"), vs[-1])
+            out.append(f"- **{cur.get('label')}**：{cur.get('value')}（{FACT_STATUS.get(cur.get('status'), '')}，{_t(cur.get('valid_from'))} 起）")
+            if cur.get("quote"):
+                out.append(f"  - 原话：{cur['quote']}")
+            for x in vs:
+                if x is cur:
+                    continue
+                out.append(f"  - {FACT_STATUS.get(x.get('status'), x.get('status') or '')}：{x.get('value')}（{_t(x.get('valid_from'))}"
+                           + (f" 到 {_t(x.get('valid_to'))}" if x.get("valid_to") else "") + "）")
         out.append("")
     return "\n".join(out)
 
@@ -418,7 +455,7 @@ def md_recall(conn):
 READABLE = [("01_对话原文.md", md_dialogue), ("02_记忆.md", md_memories), ("03_思考记录.md", md_thinking),
             ("04_共同经历叙事和近期摘要.md", md_narrative), ("05_每日片段和日摘.md", md_days), ("06_叙事卷.md", md_arcs),
             ("07_章节和旧版叙事对比.md", md_chapters), ("08_关系状态.md", md_state), ("09_共同语汇和未完的事.md", md_lexicon_loops),
-            ("10_召回对比.md", md_recall)]
+            ("10_召回对比.md", md_recall), ("11_事实.md", md_facts)]
 
 
 def readable(conn):

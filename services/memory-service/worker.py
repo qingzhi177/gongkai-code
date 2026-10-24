@@ -211,6 +211,7 @@ def build_handlers():
     from app.pipeline import chapters as chapter_pipeline
     from app.pipeline import digests as digest_pipeline
     from app.pipeline import episodes as episode_pipeline
+    from app.pipeline import facts as facts_pipeline
     from app.pipeline import lexicon as lexicon_pipeline
     from app.pipeline import loops as loops_pipeline
     from app.pipeline import narrative as narrative_pipeline
@@ -253,6 +254,11 @@ def build_handlers():
                 loops_pipeline.enqueue_scan()
         except Exception as e:
             logger.error(f"[JOB] 投递未完的事失败：{e}")
+        try:                                  # → 找事实
+            if facts_pipeline.cfg().get("enabled"):
+                facts_pipeline.enqueue_scan()
+        except Exception as e:
+            logger.error(f"[JOB] 投递事实失败：{e}")
         try:                                  # → 写章节（进行中的那章追加新片段）
             if chapter_pipeline.cfg().get("enabled"):
                 chapter_pipeline.schedule()
@@ -292,6 +298,9 @@ def build_handlers():
         _state_soon()
         return result
 
+    async def facts_scan(payload, job):
+        return await facts_pipeline.scan()
+
     async def state_refresh(payload, job):
         return await state_pipeline.refresh(force=bool(payload.get("force")))
 
@@ -311,7 +320,7 @@ def build_handlers():
     return {"extract": extract, "summary": summary, "narrative": narrative, "profile_rebuild": profile_rebuild,
             "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc,
             "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent,
-            "lexicon_scan": lexicon_scan, "loops_scan": loops_scan,
+            "lexicon_scan": lexicon_scan, "loops_scan": loops_scan, "facts_scan": facts_scan,
             "state_refresh": state_refresh, "write_chapter": write_chapter, "propose_chapters": propose_chapters}
 
 

@@ -76,6 +76,12 @@ def seed(path):
     run(conn, "INSERT INTO loop_events (loop_id, event, ts, quote, created_at) VALUES (?, 'mentioned', ?, '还记得看电影吗', ?)", (lid, T, T))
     run(conn, "INSERT INTO recall_traces (turn_key, mode, user_text, decision, legacy, card, created_at) VALUES ('t1', 'shadow', '下雨了', ?, ?, '你喜欢下雨天', ?)",
         (json.dumps({"picks": [{"id": 1, "tier": "strong"}], "gate": "ok"}), json.dumps({"picked": ["2"], "gate": "ok"}), T))
+    run(conn, "INSERT INTO recall_traces (turn_key, mode, user_text, decision, created_at, frozen) VALUES ('t2', 'shadow', '清空前的一轮', ?, ?, ?)",
+        (json.dumps({"picks": [{"id": 1}], "gate": "ok"}), T, json.dumps({"at": T, "items": {"1": {"content": "清空前定格的那条记忆"}}}, ensure_ascii=False)))
+    run(conn, "INSERT INTO facts (fact_key, label, subject, value, status, certainty, valid_from, quote, created_at, updated_at) "
+              "VALUES ('user.city', '住在哪个城市', 'user', '杭州', 'superseded', 'explicit', '2026-05-01 00:00:00', '我在杭州', ?, ?)", (T, T))
+    run(conn, "INSERT INTO facts (fact_key, label, subject, value, status, certainty, valid_from, quote, created_at, updated_at) "
+              "VALUES ('user.city', '住在哪个城市', 'user', '上海', 'current', 'explicit', ?, '我搬到上海了', ?, ?)", (T, T, T))
     conn.execute("CREATE TABLE IF NOT EXISTS vectors (owner_type TEXT, owner_id INTEGER, model TEXT, dim INTEGER, vec BLOB, "
                  "text_hash TEXT, updated_at TEXT)")         # 正式环境里由向量库建
     run(conn, "INSERT INTO vectors (owner_type, owner_id, model, dim, vec, text_hash, updated_at) VALUES ('l1', 1, 'm', 2, ?, 'h', ?)",
@@ -160,6 +166,9 @@ def main():
         check("共同语汇和未完的事（含经过）", "**小雨**" in ll and "称呼" in ll and "一起看电影" in ll and "还记得看电影吗" in ll, ll)
         rc = R("10_召回对比.md")
         check("召回对比：新旧各想起了哪条记忆", "新的召回：#1 你喜欢下雨天" in rc and "旧的召回：#2 今天聊得很开心" in rc, rc)
+        check("召回对比：清空前的一轮用定格的记忆内容", "新的召回：#1 清空前定格的那条记忆" in rc, rc)
+        ft = R("11_事实.md")
+        check("事实：现在的值、原话、以前的值", "**住在哪个城市**：上海" in ft and "我搬到上海了" in ft and "以前的：杭州" in ft, ft)
         check("没有内容的部分不生成文件", "current/可读版/06_叙事卷.md" not in names)
 
         print("\n[4] 旧版")

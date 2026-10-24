@@ -47,6 +47,7 @@ from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在�
 from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
 from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇（现在只生成、不注入）
 from app.pipeline import loops as loops_pipeline       # Phase 4：未完的事（现在只生成、不注入）
+from app.pipeline import facts as facts_pipeline       # Phase 4：事实（现在只生成、不注入）
 from app.pipeline import state as state_pipeline       # Phase 4：关系状态卡（现在只生成、不注入）
 from app.pipeline import chapters as chapter_pipeline  # Phase 4：章节（现在只生成、不注入）
 
@@ -2574,6 +2575,13 @@ async def enqueue_auto_jobs():
                     logger.info(f"未完的事：自动过期 {expired}")
         except Exception as e:
             logger.error(f"未完的事投递失败：{e}", exc_info=True)
+        # 事实：还有没扫过的对话块就投递（平时由每日片段整理完顺手投递，这里兜底）
+        try:
+            if facts_pipeline.cfg().get("enabled") and facts_pipeline.pending_chunks():
+                if facts_pipeline.enqueue_scan():
+                    queued.append("facts_scan")
+        except Exception as e:
+            logger.error(f"事实投递失败：{e}", exc_info=True)
         # 关系状态卡：材料变了就投递（平时由近七天摘要、未完的事写完顺手投递，这里兜底）
         try:
             if state_pipeline.cfg().get("enabled") and state_pipeline.is_stale():
@@ -2646,7 +2654,7 @@ async def trigger_auto_check():
     """立即跑一次定时检查（不绕过阈值判断）：投递需要的任务，由 worker 执行。"""
     queued = await enqueue_auto_jobs()
     names = {"extract": "L1 提取", "summary": "近期摘要", "narrative": "共同经历"}
-    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇", loops_scan="未完的事",
+    names.update(route_arcs="归卷", digest_recent="近七天摘要", lexicon_scan="共同语汇", loops_scan="未完的事", facts_scan="事实",
                  state_refresh="关系状态", propose_chapters="分章提议")
     prefixes = {"settle_day:": "每日片段 ", "digest_day:": "日摘 ", "digest_week:": "周摘 ", "write_chapter:": "写章节 #"}
     label = lambda k: next((p + k.split(":", 1)[1] for pre, p in prefixes.items() if k.startswith(pre)), names.get(k, k))
@@ -3214,6 +3222,65 @@ async def loops_close(lid: int, req: LoopClose):
 async def loops_reopen(lid: int):
     return _loop_op(loops_pipeline.reopen, lid)
 
+# ============ 事实（Phase 4 第八步；现在只生成、只在 Dashboard 上看，见 app/pipeline/facts.py）============
+
+class FactEdit(BaseModel):
+    subject: Optional[str] = None      # 自己加的时候：user / ai / us
+    label: Optional[str] = None
+    value: Optional[str] = None
+
+def _fact_op(fn, *args):
+    try:
+        out = fn(*args)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", "result": out}
+
+@app.get("/facts")
+async def facts_overview():
+    """现在的事实（按关于谁分组，带以前的值）、可能变了的、以后放进聊天的档案预览、扫描进度"""
+    return {**facts_pipeline.overview(), "settings_spec": app_settings.describe("facts")}
+
+@app.post("/facts/scan")
+async def facts_scan_now():
+    return {"status": "ok", "queued": facts_pipeline.enqueue_scan(source="dashboard")}
+
+@app.post("/facts")
+async def facts_add(req: FactEdit):
+    """自己加一条"""
+    return _fact_op(facts_pipeline.add, req.subject or "user", req.label, req.value)
+
+@app.put("/facts/settings")
+async def facts_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("facts", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("facts")}
+
+@app.get("/facts/{fid}")
+async def facts_detail(fid: int):
+    try:
+        return facts_pipeline.detail(fid)
+    except ValueError:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+@app.put("/facts/{fid}")
+async def facts_edit(fid: int, req: FactEdit):
+    return _fact_op(facts_pipeline.edit, fid, req.label, req.value)
+
+@app.post("/facts/{fid}/confirm")
+async def facts_confirm(fid: int):
+    return _fact_op(facts_pipeline.confirm, fid)
+
+@app.post("/facts/{fid}/reject")
+async def facts_reject(fid: int):
+    return _fact_op(facts_pipeline.reject, fid)
+
+@app.post("/facts/{fid}/restore")
+async def facts_restore(fid: int):
+    return _fact_op(facts_pipeline.restore, fid)
+
 # ============ 关系状态卡、话题边界（Phase 4 第六步；现在只生成、只在 Dashboard 上看，见 app/pipeline/state.py）============
 
 class TopicPolicy(BaseModel):
@@ -3370,7 +3437,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "state", "chapter", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "facts", "state", "chapter", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():
