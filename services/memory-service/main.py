@@ -39,6 +39,7 @@ from app.recall import golden as recall_golden   # 黄金集标注和门槛校�
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
+from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
 from app import uploads   # 大文件分块上传、后台导入任务（Dashboard「备份管理」）
 from app import purge as purge_data   # 清空所有数据：除了配置、设置、召回对比，别的表都清空
 from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
@@ -829,93 +830,6 @@ def _cascade_l1_on_version_switch(c, conv_id, superseded_old_ids):
     return l1_ids_to_purge
 
 
-def _cmp_key(role, content):
-    """生成用于序列对齐比较的键，与内容级去重保持一致：忽略换行差异"""
-    return role + "\x00" + re.sub(r'[\r\n]', '', content or '')
-
-def _merge_l0_sequence(c, conv_id, client, messages):
-    """把本轮 Kelivo 窗口消息（已去重、去 group_id 的那部分）与数据库里已有的
-    active 消息做整体序列对齐，而不是按数组下标做一一匹配。
-
-    使用 difflib.SequenceMatcher 识别：
-    - equal: 内容和相对位置都对得上，不做任何操作
-    - delete: 只存在于旧序列，大概率是窗口没带到，原样保留
-    - replace: 同一相对位置内容变了，视为编辑/版本替换
-    - insert: 只存在于新序列，是真正的新消息
-
-    返回 (saved_count, superseded_old_ids)
-    """
-    # 1) 取出数据库里现有的 active、无 group_id 的行，按现有顺序排好
-    rows = c.execute(
-        "SELECT id, msg_idx, role, content, extracted FROM l0_messages "
-        "WHERE conv_id=? AND status='active' AND (group_id IS NULL OR group_id='') "
-        "ORDER BY msg_idx ASC, id ASC",
-        (conv_id,)
-    ).fetchall()
-
-    old_ids = [r[0] for r in rows]
-    old_keys = [_cmp_key(r[2], r[3]) for r in rows]
-    old_extracted = {r[0]: r[4] for r in rows}
-
-    # 在 Dashboard 上改过的消息：前端带来的还是改之前的原文，换成现在的比较键，认得是同一条（不会把修改冲掉、也不重复存）
-    edited = l0_edit.aliases(c, conv_id)
-    new_keys = [edited.get(k, k) for k in (_cmp_key(m["role"], m["content"]) for m in messages)]
-
-    sm = difflib.SequenceMatcher(None, old_keys, new_keys, autojunk=False)
-    saved = 0
-    superseded_old_ids = []
-
-    # 构建合并后的最终顺序（id 列表）
-    final_order = []
-
-    for tag, a1, a2, b1, b2 in sm.get_opcodes():
-        if tag == 'equal':
-            # 内容和相对位置都对得上，保留旧行
-            final_order.extend(old_ids[a1:a2])
-        elif tag == 'delete':
-            # 只存在于旧序列：大概率是这次窗口没带到，不是真的被删，原样保留
-            final_order.extend(old_ids[a1:a2])
-        elif tag == 'replace':
-            # 同一相对位置内容变了：视为编辑/重新生成，旧的作废
-            for oid in old_ids[a1:a2]:
-                c.execute("UPDATE l0_messages SET status='superseded' WHERE id=?", (oid,))
-                if old_extracted.get(oid) == 1:
-                    superseded_old_ids.append(oid)
-            # 插入新消息
-            for m in messages[b1:b2]:
-                c.execute(
-                    'INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) '
-                    'VALUES (?,?,?,?,?,?,?)',
-                    (conv_id, -1, m["role"], m["content"], client, 'active', 0))
-                final_order.append(c.lastrowid)
-                saved += 1
-        elif tag == 'insert':
-            # 只存在于新序列：真正的新消息（不管它在这次窗口里下标是大是小）
-            for m in messages[b1:b2]:
-                c.execute(
-                    'INSERT INTO l0_messages (conv_id, msg_idx, role, content, client, status, extracted) '
-                    'VALUES (?,?,?,?,?,?,?)',
-                    (conv_id, -1, m["role"], m["content"], client, 'active', 0))
-                final_order.append(c.lastrowid)
-                saved += 1
-
-    # 2) 按 final_order 重排 msg_idx，让它保持连续且反映真实对话顺序
-    # 修复：起始 idx 从「带 group 的导入历史」的最大 msg_idx+1 算起，而不是全部
-    # active 的最大值。否则 final_order 里被保留(equal)的无 group 旧行本身就持有
-    # 当前最大 idx，每轮 max+1 会把整段尾部逐轮向上平移（drift/window 漂移）。
-    # 只以 group 区间为基准，无 group 尾部就稳定地紧接在导入历史之后。
-    max_msg_idx_row = c.execute(
-        "SELECT MAX(msg_idx) FROM l0_messages WHERE conv_id=? AND status='active' "
-        "AND group_id IS NOT NULL AND group_id!=''",
-        (conv_id,)
-    ).fetchone()
-    start_idx = (max_msg_idx_row[0] + 1) if (max_msg_idx_row and max_msg_idx_row[0] is not None) else 0
-
-    for i, row_id in enumerate(final_order):
-        c.execute("UPDATE l0_messages SET msg_idx=? WHERE id=?", (start_idx + i, row_id))
-
-    return saved, superseded_old_ids
-
 @app.post("/save_conversation")
 async def save_conversation(req: SaveRequest):
     conn = get_conn()
@@ -954,23 +868,18 @@ async def save_conversation(req: SaveRequest):
             if ts_val:
                 # 统一成 UTC 的 "YYYY-MM-DD HH:MM:SS"；客户端发来的不带时区的时间按用户时区理解
                 ts_val = timeutil.to_utc_str(ts_val, naive_tz=timeutil.USER_TZ) or ""
-            # 内容级去重：同 conv 同 role 同内容(忽略换行)已有 active → 跳过。
-            # 修复 Kelivo 版本切换/重新生成导致的历史漂移：内容未变的消息不再
-            # 被无谓 superseded 重插（superseded 垃圾由 7011 条降到最低）。
-            # 修复(thrash 根治)：内容级去重只针对「已带 group_id 的导入历史」。
-            # 原来对全部 active 去重，会把实时对话尾部（无 group）的消息在进入
-            # _merge_l0_sequence 序列对齐之前就剔掉，导致对齐器拿到残缺尾部 → 误判
-            # replace 把整段尾部 superseded、下一轮又复活挤回，形成互相顶替的 thrash
-            # （表现：最新消息不进 L0 / active 计数不对 / 连续同角色 / L1 被误删）。
-            # 无 group 的实时消息一律交给 _merge_l0_sequence 用 difflib 对齐处理去重。
-            dup = c.execute(
-                "SELECT id FROM l0_messages WHERE conv_id=? AND role=? AND status='active' AND "
-                "group_id IS NOT NULL AND group_id!='' AND "
-                "REPLACE(REPLACE(content,char(10),''),char(13),'')=REPLACE(REPLACE(?,char(10),''),char(13),'') LIMIT 1",
-                (req.conv_id, role, content)).fetchone()
-            if dup:
-                continue
+            # 内容级去重只用在带 group_id 的消息上（客户端按 group 上报的历史）。
+            # 没有 group_id 的（网关存的窗口）不在这里去重：以前按「整个会话里有没有一样的话」跳过，
+            # 接着导入的旧会话聊天时，和旧聊天里一字不差的话（「晚安」「嗯」）会被当成重复丢掉、
+            # 窗口也变得缺一块对不齐。现在一律交给 l0_merge.merge 按位置对齐。
             if gid:
+                dup = c.execute(
+                    "SELECT id FROM l0_messages WHERE conv_id=? AND role=? AND status='active' AND "
+                    "group_id IS NOT NULL AND group_id!='' AND "
+                    "REPLACE(REPLACE(content,char(10),''),char(13),'')=REPLACE(REPLACE(?,char(10),''),char(13),'') LIMIT 1",
+                    (req.conv_id, role, content)).fetchone()
+                if dup:
+                    continue
                 # 方案C：group 语义（逻辑位置稳定，版本替换）
                 old = c.execute(
                     "SELECT id, version, extracted, group_anchor FROM l0_messages "
@@ -1015,13 +924,11 @@ async def save_conversation(req: SaveRequest):
             # Bug4 修复：没有 group_id 的消息先收集，不再逐条按 idx 匹配
             no_group_messages.append({"role": role, "content": content})
 
-        # Bug4 修复：统一处理没有 group_id 的消息（序列对齐）
+        # 没有 group_id 的消息（网关存的窗口）：和库里这个会话整体对齐（app/l0_merge.py）
         if no_group_messages:
-            merge_saved, merge_superseded = _merge_l0_sequence(
-                c, req.conv_id, req.client, no_group_messages
-            )
-            saved += merge_saved
-            superseded_old_ids.extend(merge_superseded)
+            mr = l0_merge.merge(c, req.conv_id, req.client, no_group_messages, edited=l0_edit.aliases(c, req.conv_id))
+            saved += mr["saved"]
+            superseded_old_ids.extend(mr["superseded"])
 
         # 修复7：L0 版本切换联动 L1（批次级）。
         # source_msg_id 是「该次 cron 提取批次首条消息的 id」，同批多条 L1 共享它，

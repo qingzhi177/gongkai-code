@@ -7,8 +7,13 @@
     manifest.json
 
 关键设计：
-- 版本折叠：message_rows 含全部版本（同 group 多条），conversation.version_selections_json 记录
-  用户当前选择的版本（{groupId: 版本号}）→ 导入取"用户选择版本"；无选择取最高版本。
+- 版本折叠：message_rows 含全部版本，conversation.version_selections_json 记录用户当前选择的版本
+  （{groupId: 版本号}）→ 导入取「用户选择的版本」；没有选择取最高版本。
+  一条消息的第一个版本（version 0）的 group_id 可能是空的，也可能等于它自己的 id；后来的版本 group_id 是第一个版本的 id。
+  所以分组按「group_id，空的话用自己的 id」（以前 group_id 空的第一个版本没和后来的版本分到一组，
+  用户选的是第一个版本时，导进来的却是最高版本）。
+- 一个会话第一次导入时不按内容去重：同一句话（不同天说的「晚安」）每一条都要留着。已经导入过的会话在 skip 模式下整个跳过。
+- 图片：消息里的图片写成「[图片：文件名]」占位放在正文前面（只发了图的消息也会导入），和 Pluvia 历史里的写法对得上。
 - 会话选择：convs 参数可指定导入部分会话；preview 返回会话列表。
 - 保留旧版导入（convert_kelivo.py / import_conversation JSON 路径）不动。
 """
@@ -20,6 +25,7 @@ import tempfile
 import zipfile
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import unquote
 
 
 def _iso_ts(micro) -> str:
@@ -91,6 +97,27 @@ def preview_kelivo_backup(zip_path: str) -> list:
             pass
 
 
+def _image_name(payload):
+    try:
+        uri = json.loads(payload or '{}').get('uri') or ''
+    except (ValueError, AttributeError):
+        return ''
+    return unquote(uri.rsplit('/', 1)[-1]) if uri else ''
+
+
+def _message_text(parts):
+    """一条消息的正文：文字块用换行连起来；有图片的在最前面加一行「[图片：文件名]」（几张图用空格隔开）"""
+    text = '\n'.join(p[1] for p in parts if p[0] == 'text' and p[1]).strip()
+    imgs = []
+    for kind, payload in parts:
+        if kind == 'image':
+            name = _image_name(payload)
+            imgs.append(f'[图片：{name}]' if name else '[图片]')
+    if imgs:
+        return ' '.join(imgs) + ('\n' + text if text else '')
+    return text
+
+
 def _conv_existing(conn, conv_id: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM l0_messages WHERE conv_id=? AND status='active' LIMIT 1",
@@ -98,37 +125,32 @@ def _conv_existing(conn, conv_id: str) -> bool:
 
 
 def _collapse_rows(rows, sel: dict):
-    """按 group 版本折叠：选择版本优先，无选择取最高；无 group 消息按原序保留。
+    """按版本折叠：每一组（group_id，空的话用自己的 id）取用户选的版本，没选取最高；按这一组第一次出现的位置排。
 
     rows: [(mid, role, ts, gid, ver, order)] 已按 message_order 升序
     返回折叠后的行列表（同样元组），顺序=首次出现位置。
     """
     by_group = {}
     group_first_order = {}
-    raw = []
     for r in rows:
         mid, role, ts, gid, ver, order = r
-        if gid:
-            if gid not in by_group:
-                by_group[gid] = []
-                group_first_order[gid] = order
-            by_group[gid].append(r)
-        else:
-            raw.append(r)
+        key = gid or mid            # 第一个版本的 group_id 可能是空的：用它自己的 id，和后来的版本（group_id=它的 id）分到一组
+        if key not in by_group:
+            by_group[key] = []
+            group_first_order[key] = order
+        by_group[key].append(r)
     final = []
-    for gid, group_rows in by_group.items():
-        target = sel.get(gid)
+    for key, group_rows in by_group.items():
+        target = sel.get(key)
         pick = None
         if target is not None:
             for x in group_rows:
-                if x[4] == target:
+                if (x[4] or 0) == target:
                     pick = x
                     break
         if pick is None:
-            pick = max(group_rows, key=lambda x: x[4])  # 最高版本
-        final.append((group_first_order[gid], pick))
-    for r in raw:
-        final.append((r[5], r))
+            pick = max(group_rows, key=lambda x: x[4] or 0)  # 最高版本
+        final.append((group_first_order[key], pick))
     final.sort(key=lambda x: x[0])
     return [x[1] for x in final]
 
@@ -138,13 +160,8 @@ def _import_conv(mem_conn, cid, messages, thinkings, mode):
     for idx, m in enumerate(messages):
         gid = m.get('group_id') or m.get('id')
         ver = int(m.get('version') or 0)
-        if mode == 'skip':
-            dup = mem_conn.execute(
-                "SELECT id FROM l0_messages WHERE conv_id=? AND role=? AND status='active' AND "
-                "REPLACE(REPLACE(content,char(10),''),char(13),'')=REPLACE(REPLACE(?,char(10),''),char(13),'') LIMIT 1",
-                (cid, m['role'], m['content'])).fetchone()
-            if dup:
-                continue
+        # 不按内容去重：skip 模式下已经导入过的会话整个跳过（import_kelivo_backup 里判断），
+        # 第一次导入的会话里一样的话（不同天说的「晚安」）每一条都要留着
         anchor_val = None
         if gid:
             old = mem_conn.execute(
@@ -230,9 +247,7 @@ def import_kelivo_backup(zip_path: str, mode: str = 'skip', memory_db_path: str 
                 parts = db_conn.execute(
                     "SELECT kind, payload FROM message_part_rows WHERE conversation_id=? AND revision_id=? ORDER BY ordinal",
                     (cid, mid)).fetchall()
-                text = '\n'.join(
-                    p[1] for p in parts if p[0] == 'text' and p[1]
-                ).strip()
+                text = _message_text(parts)
                 if not text:
                     continue
                 if role not in ('user', 'assistant'):

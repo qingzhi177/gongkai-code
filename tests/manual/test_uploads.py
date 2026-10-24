@@ -164,6 +164,41 @@ def main():
               and [c for _, c in rows] == ["你好呀 (ᗜ֊ᗜ)", "第二版回复"], (stats, rows))
         stats = K.import_kelivo_backup(str(zpath), mode="skip", memory_db_path=str(config.SQLITE_PATH))
         check("再导入整个 zip：已有的会话跳过，新的导进来", stats["skipped_convs"] == 1 and stats["convs"] == 1, stats)
+
+        print("\n[5] Kelivo 真实的版本结构、重复的话、图片")
+        k2 = TMP / "kelivo2.db"
+        c = sqlite3.connect(k2)
+        c.execute("CREATE TABLE conversation_rows (id TEXT PRIMARY KEY, title TEXT, created_at INTEGER, version_selections_json TEXT)")
+        c.execute("CREATE TABLE message_rows (id TEXT PRIMARY KEY, conversation_id TEXT, role TEXT, timestamp INTEGER, group_id TEXT, "
+                  "version INTEGER, message_order INTEGER, reasoning_segments_json TEXT)")
+        c.execute("CREATE TABLE message_part_rows (conversation_id TEXT, revision_id TEXT, ordinal INTEGER, kind TEXT, payload TEXT)")
+        t = 1_780_000_000_000_000
+        # a1 的第一个版本 group_id 是空的，后来的版本 a1v1、a1v2 指向它；用户选的是第一个版本（0）
+        # b1 的第一个版本 group_id 等于自己的 id；用户选的是版本 1
+        c.execute("INSERT INTO conversation_rows VALUES ('k', '会话', ?, ?)", (t, json.dumps({"a1": 0, "b1": 1})))
+        rows = [("u1", "user", 0, None, 0, 0), ("a1", "assistant", 1, None, 0, 1), ("a1v1", "assistant", 2, "a1", 1, 2),
+                ("a1v2", "assistant", 3, "a1", 2, 3), ("u2", "user", 4, None, 0, 4), ("b1", "assistant", 5, "b1", 0, 5),
+                ("b1v1", "assistant", 6, "b1", 1, 6), ("u3", "user", 7, None, 0, 7), ("c1", "assistant", 8, None, 0, 8),
+                ("u4", "user", 9, None, 0, 9), ("d1", "assistant", 10, None, 0, 10)]
+        c.executemany("INSERT INTO message_rows VALUES (?, 'k', ?, ?, ?, ?, ?, NULL)", [(i, r, t + n * 1000000, g, v, o) for i, r, n, g, v, o in rows])
+        parts = [("u1", "text", "晚安"), ("a1", "text", "晚安，选中的第一个版本"), ("a1v1", "text", "第二个版本"), ("a1v2", "text", "第三个版本"),
+                 ("u2", "image", json.dumps({"uri": "kelivo-file:///upload/sky%201.jpg"})), ("u2", "text", "看看今天的天"),
+                 ("b1", "text", "没选的第一个版本"), ("b1v1", "text", "选中的版本 1"),
+                 ("u3", "text", "晚安"), ("c1", "text", "晚安呀"), ("u4", "image", json.dumps({"uri": "kelivo-file:///upload/cat.png"})),
+                 ("d1", "text", "好可爱")]
+        c.executemany("INSERT INTO message_part_rows VALUES ('k', ?, 0, ?, ?)", parts)
+        c.commit()
+        c.close()
+        stats = K.import_kelivo_backup(str(k2), mode="skip", memory_db_path=str(config.SQLITE_PATH), convs=["k"])
+        got = sqlite3.connect(str(config.SQLITE_PATH)).execute(
+            "SELECT content FROM l0_messages WHERE conv_id='k' AND status='active' ORDER BY msg_idx").fetchall()
+        got = [x[0] for x in got]
+        check("用户选的是第一个版本（group_id 空）：导入第一个版本，不是最高版本", "晚安，选中的第一个版本" in got and "第三个版本" not in got, got)
+        check("第一个版本 group_id 等于自己的 id、选了版本 1：导入版本 1", "选中的版本 1" in got and "没选的第一个版本" not in got, got)
+        check("同一个会话里一样的话（两次「晚安」）都留着", got.count("晚安") == 2, got)
+        check("图片写成占位放在前面；只发了图的消息也导入", "[图片：sky 1.jpg]\n看看今天的天" in got and "[图片：cat.png]" in got, got)
+        check("顺序和备份里一样，没选的版本不导入", got == ["晚安", "晚安，选中的第一个版本", "[图片：sky 1.jpg]\n看看今天的天", "选中的版本 1",
+                                                 "晚安", "晚安呀", "[图片：cat.png]", "好可爱"] and stats["messages"] == 8, (got, stats))
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

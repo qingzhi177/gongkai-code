@@ -46,8 +46,9 @@ TARGET_CN = {"l1_memories": "记忆", "episodes": "每日片段", "digests": "�
 
 
 def cmp_key(role, content):
-    """和序列对齐（main._cmp_key）一样：角色 + 内容，忽略换行差异"""
-    return (role or "") + "\x00" + re.sub(r"[\r\n]", "", content or "")
+    """和序列对齐（app/l0_merge.py）用同一个比较键：角色 + 内容，忽略空白和图片占位"""
+    from app.l0_merge import cmp_key as k
+    return k(role, content)
 
 
 # ---------- 找出改了哪几段 ----------
