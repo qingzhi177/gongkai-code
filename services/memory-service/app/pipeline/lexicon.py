@@ -243,7 +243,8 @@ async def scan(llm_fn=None, now=None, limit=MAX_CHUNKS_PER_JOB):
         stats["chunks"] += 1
     activated = refresh_stats()
     if more:      # 接着扫剩下的。不能用 "lexicon_scan" 去重：这个任务自己正在跑，会被当成重复，新任务投不进去
-        jobs.enqueue(SQLITE_PATH, "lexicon_scan", payload={}, dedupe_key="lexicon_scan:next", source="auto", delay_sec=5)
+        jobs.enqueue(SQLITE_PATH, "lexicon_scan", payload={}, dedupe_key="lexicon_scan:next", source="auto", delay_sec=5,
+                     continuation=True)
     return {"status": "ok", **stats, "activated": activated, "more": more, "notes": stats["notes"][:20]}
 
 

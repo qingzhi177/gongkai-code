@@ -83,6 +83,19 @@ def test_queue(tmp):
     check("完成后记下结果", done["status"] == "done" and done["result"]["segments"] == 2 and done["finished_at"])
     j5, c5 = jobs.enqueue(p, "extract", None, dedupe_key="extract")
     check("完成以后同一个 key 可以再投递", c5 and j5["id"] != j1["id"])
+    pc = fresh_db(tmp, "cont")
+    jn, _ = jobs.enqueue(pc, "scan", None, dedupe_key="scan:next")
+    jobs.claim(pc, "w1", kinds=["scan"])
+    _, c6 = jobs.enqueue(pc, "scan", None, dedupe_key="scan:next")
+    j7, c7 = jobs.enqueue(pc, "scan", None, dedupe_key="scan:next", continuation=True)
+    _, c8 = jobs.enqueue(pc, "scan", None, dedupe_key="scan:next", continuation=True)
+    check("接着做剩下的（continuation）：自己正在跑不算重复，能接着投；已经排着一个就不再投",
+          not c6 and c7 and j7["id"] != jn["id"] and not c8, (c6, c7, c8))
+    jobs.complete(pc, jn["id"], {"status": "ok"})
+    jobs.claim(pc, "w1", kinds=["scan"])
+    j9, c9 = jobs.enqueue(pc, "scan", None, dedupe_key="scan:next", continuation=True)
+    check("接着投的那个跑起来以后还能再接着投（两个 key 轮流用）", c9 and j9["dedupe_key"] == "scan:next"
+          and j7["dedupe_key"] == "scan:next~2", (j7["dedupe_key"], j9["dedupe_key"]))
     s = jobs.stats(p)
     check("统计", s["queued"] == 2 and s["running"] == 1 and s["dead"] == 0 and s["done_24h"] == 1, s)
 

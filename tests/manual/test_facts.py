@@ -223,6 +223,12 @@ def main():
         r, _ = scan([{"facts": [{"key": "user.birthday", "label": "生日", "value": "6 月 12 日", "certainty": "explicit", "lines": [1], "quote": "生日是六月十二号"}]}], limit=1)
         check("一次扫一块、还有剩下的：再投一个任务", r["chunks"] == 1 and r["more"] is True
               and q("SELECT COUNT(*) FROM pipeline_jobs WHERE kind='facts_scan' AND status='queued'")[0][0] == 1, r)
+        day_chat("2026-08-12", "C", [("user", "我在学吉他" + FILL), ("assistant", "好呀" + FILL), ("user", "嗯" + FILL), ("assistant", "加油" + FILL)])
+        run("UPDATE pipeline_jobs SET status='running' WHERE kind='facts_scan' AND status='queued'")   # 这个接着扫的任务正在跑
+        r, _ = scan([{"facts": []}], limit=1)
+        check("接着扫的任务自己在跑、还有剩下的：照样再投一个（以前会被自己挡掉）", r["more"] is True
+              and q("SELECT COUNT(*) FROM pipeline_jobs WHERE kind='facts_scan' AND status='queued'")[0][0] == 1, r)
+        run("UPDATE pipeline_jobs SET status='done' WHERE kind='facts_scan'")
         try:
             asyncio.run(F.scan(llm_fn=FakeLLM([None])))
             check("模型没返回：报错（任务会重试），这块不算扫过", False)

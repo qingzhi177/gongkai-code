@@ -317,7 +317,8 @@ async def route_arcs(llm_fn=None, now=None):
     finally:
         conn.close()
     if more:      # 接着归剩下的。不能用 "route_arcs" 去重：这个任务自己正在跑，会被当成重复，新任务投不进去
-        jobs.enqueue(SQLITE_PATH, "route_arcs", payload={}, dedupe_key="route_arcs:next", source="auto", delay_sec=5)
+        jobs.enqueue(SQLITE_PATH, "route_arcs", payload={}, dedupe_key="route_arcs:next", source="auto", delay_sec=5,
+                     continuation=True)
     narrate = schedule_narrations()
     return {"status": "ok", "batches": batches, "routed": routed, "new_arcs": new_arcs, "proposed": proposed,
             "removed": removed, "narrate": narrate, "more": more, "notes": notes[:20]}

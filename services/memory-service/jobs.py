@@ -64,10 +64,13 @@ def get(db_path, job_id):
 
 
 def enqueue(db_path, kind, payload=None, dedupe_key=None, delay_sec=0, max_attempts=DEFAULT_MAX_ATTEMPTS,
-            source="auto", update_if_queued=False):
+            source="auto", update_if_queued=False, continuation=False):
     """投递任务。返回 (任务, 是否新建)。
 
     dedupe_key 相同、而且已有未完成的任务时不会新建，直接返回那个任务；
+    continuation=True（任务自己投「接着做剩下的」）时，投它的任务自己正在跑不算重复：已经排着一个就不再投，
+    否则在 dedupe_key 和 dedupe_key~2 里挑一个没在跑的用（同一个 key 同时只能有一个未完成的任务，两个轮流用）。
+    以前「:next」任务跑的时候再投「:next」会被自己挡掉，只能接一次，剩下的要等下一次自动检查；
     update_if_queued=True 时，如果那个任务还在排队（没开始执行），用这次的 payload 覆盖它并立即执行
     （例如自动提取排着队时点了「立即提取」，就把它改成 force）。
     """
@@ -78,7 +81,18 @@ def enqueue(db_path, kind, payload=None, dedupe_key=None, delay_sec=0, max_attem
     try:
         conn.execute("BEGIN IMMEDIATE")
         try:
-            if dedupe_key:
+            if dedupe_key and continuation:
+                keys = (dedupe_key, dedupe_key + "~2")
+                active = [_row(r) for r in conn.execute(
+                    f"SELECT {COLUMNS} FROM pipeline_jobs WHERE dedupe_key IN (?, ?) AND status IN ('queued','running') ORDER BY id",
+                    keys)]
+                queued = [j for j in active if j["status"] == "queued"]
+                free = [k for k in keys if k not in {j["dedupe_key"] for j in active}]
+                if queued or not free:
+                    conn.execute("COMMIT")
+                    return (queued or active)[0], False
+                dedupe_key = free[0]
+            elif dedupe_key:
                 r = conn.execute(f"SELECT {COLUMNS} FROM pipeline_jobs WHERE dedupe_key=? AND status IN ('queued','running')",
                                  (dedupe_key,)).fetchone()
                 if r:

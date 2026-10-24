@@ -308,8 +308,9 @@ async def scan(llm_fn=None, limit=MAX_CHUNKS_PER_JOB):
             stats[k] += r[k]
         stats["confirmed"] += r["confirmed"]
         stats["history"] += r["history"]
-    if more:      # 接着扫剩下的。不能用 "facts_scan" 去重：这个任务自己正在跑，会被当成重复，新任务投不进去
-        jobs.enqueue(SQLITE_PATH, "facts_scan", payload={}, dedupe_key="facts_scan:next", source="auto", delay_sec=5)
+    if more:      # 接着扫剩下的（continuation：自己正在跑不算重复）
+        jobs.enqueue(SQLITE_PATH, "facts_scan", payload={}, dedupe_key="facts_scan:next", source="auto", delay_sec=5,
+                     continuation=True)
     stats["notes"] = stats["notes"][:20]
     return {"status": "ok", **stats, "more": more}
 

@@ -424,7 +424,8 @@ async def write_chapter(chapter_id, llm_fn=None, waited=0):
             return {"status": "skipped", "message": WAITING_CN[why]}
         if _fresh(ch) and waited < MAX_WAITS and _prev_busy(conn, prev):
             jobs.enqueue(SQLITE_PATH, "write_chapter", payload={"chapter_id": ch["id"], "waited": waited + 1},
-                         dedupe_key=f"write_chapter:{ch['id']}:wait", source="auto", delay_sec=WAIT_SEC)
+                         dedupe_key=f"write_chapter:{ch['id']}:wait", source="auto", delay_sec=WAIT_SEC,
+                         continuation=True)
             return {"status": "skipped", "message": f"等第 {prev['n']} 章写完再写（开头要接上上一章）"}
         rebuild = bool(ch["needs_rebuild"])
         if rebuild:
@@ -475,7 +476,7 @@ async def write_chapter(chapter_id, llm_fn=None, waited=0):
     more = len(pending) > len(todo)
     if more:      # 接着写剩下的。不能用 write_chapter:{id} 去重：这个任务自己正在跑，会被当成重复
         jobs.enqueue(SQLITE_PATH, "write_chapter", payload={"chapter_id": ch["id"]}, dedupe_key=f"write_chapter:{ch['id']}:next",
-                     source="auto", delay_sec=5)
+                     source="auto", delay_sec=5, continuation=True)
     conn = get_conn()
     try:
         conn.execute("BEGIN IMMEDIATE")
