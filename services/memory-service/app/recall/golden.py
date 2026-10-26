@@ -6,8 +6,12 @@
 
 校准只用轨迹里已经存下的精排分，不再调接口、不花钱：
 - 命中率：标了「该想起」的记忆里，精排分 ≥ 门槛的比例（越高越好）；
-- 误浮现率：「不该想起」的记忆、以及「什么都不该想起」的那些轮里分数最高的候选，精排分 ≥ 门槛的比例（越低越好）。
-建议：强门槛取误浮现率不超过 10% 的最低值；中门槛取命中率还能保住 80% 的最高值。
+- 误浮现率（按条）：「不该想起」的记忆、以及「什么都不该想起」的那些轮里分数最高的候选，精排分 ≥ 门槛的比例；
+- 整轮误浮现率：不该想起任何事的轮（标了「什么都不该想起」，或者只标了「不该想起」、没有「该想起」的）里，
+  有一条分数 ≥ 门槛的比例——也就是平常聊天里，这一轮会冒出一件不相干的事的概率。每轮有十几个候选，
+  按条算的误浮现率很低时，按轮算可能还很高（2026-10-26：按条 6%，按轮 31%）。
+建议：强门槛取整轮误浮现率不超过 10% 的最低值；中门槛取「命中率还能保住 80%」和「中层概率 × 整轮误浮现率不超过 10%」
+两者中更高的那个（不超过强门槛）。不该想起的轮不够数时，强门槛退回按条算。
 """
 import json
 import sqlite3
@@ -22,6 +26,7 @@ MIN_SHOULD = 8                                            # 至少这么多条�
 MIN_NEGATIVE = 8                                          # 至少这么多条反例才给建议
 TARGET_FP = 0.10                                          # 方案 Phase 2 验收：误浮现率 ≤ 10%
 TARGET_HIT = 0.80
+TARGET_MEDIUM_FP = 0.10                                   # 中层：平常一轮里因为「中」想起不相干的事的概率
 
 
 def labels_for(conn, trace_id):
@@ -115,7 +120,7 @@ def calibration():
         turns = _load_turns(conn)
     finally:
         conn.close()
-    should, should_not, none_max = [], [], []
+    should, should_not, none_max, neg_turn_max = [], [], [], []
     first_ranks = []
     top5 = 0
     skipped = 0
@@ -128,6 +133,9 @@ def calibration():
         labs = t["labels"]
         if labs.get(TURN) == "none":
             none_max.append(max(score.values()) if score else 0.0)
+            neg_turn_max.append(none_max[-1])
+        elif labs and "should" not in labs.values():
+            neg_turn_max.append(max(score.get(i, 0.0) for i, lab in labs.items() if lab == "should_not"))
         first = None
         has_should = False
         for iid, lab in labs.items():
@@ -152,28 +160,40 @@ def calibration():
         sh = sum(s >= g for s in should)
         sn = sum(s >= g for s in should_not)
         nn = sum(s >= g for s in none_max)
+        tn = sum(s >= g for s in neg_turn_max)
         rows.append({"t": g, "should_hits": sh, "should_not_hits": sn, "none_hits": nn,
                      "hit": round(sh / len(should), 3) if should else None,
-                     "fp": round((sn + nn) / neg, 3) if neg else None})
+                     "fp": round((sn + nn) / neg, 3) if neg else None,
+                     "turn_fp": round(tn / len(neg_turn_max), 3) if neg_turn_max else None})
     counts = {"turns": len(turns), "should": len(should), "should_not": len(should_not),
-              "none_turns": len(none_max), "skipped": skipped}
+              "none_turns": len(none_max), "neg_turns": len(neg_turn_max), "skipped": skipped}
     quality = {"recall_at_5": round(top5 / len(should), 3) if should else None,
                "mrr": round(sum(1.0 / r for r in first_ranks if r) / len(first_ranks), 3) if first_ranks else None}
-    return {"counts": counts, "quality": quality, "rows": rows, "suggest": suggest(rows, counts),
-            "targets": {"fp": TARGET_FP, "hit": TARGET_HIT, "min_should": MIN_SHOULD, "min_negative": MIN_NEGATIVE}}
+    try:
+        from app import settings as app_settings
+        medium_prob = float(app_settings.get("recall")["medium_prob"])
+    except Exception:
+        medium_prob = 0.3
+    return {"counts": counts, "quality": quality, "rows": rows, "suggest": suggest(rows, counts, medium_prob),
+            "targets": {"fp": TARGET_FP, "hit": TARGET_HIT, "medium_fp": TARGET_MEDIUM_FP, "medium_prob": medium_prob,
+                        "min_should": MIN_SHOULD, "min_negative": MIN_NEGATIVE}}
 
 
-def suggest(rows, counts):
+def suggest(rows, counts, medium_prob=0.3):
     neg = counts["should_not"] + counts["none_turns"]
     if counts["should"] < MIN_SHOULD or neg < MIN_NEGATIVE:
         return {"ok": False, "reason": f"再多标一些才给建议：至少 {MIN_SHOULD} 条「该想起」和 {MIN_NEGATIVE} 条反例"
                                        f"（「不该想起」或「这一轮什么都不该想起」），现在分别是 {counts['should']} 和 {neg}。"}
     notes = []
-    t_high = next((r["t"] for r in rows if r["fp"] is not None and r["fp"] <= TARGET_FP), None)
+    by_turn = counts.get("neg_turns", 0) >= MIN_NEGATIVE
+    key = "turn_fp" if by_turn else "fp"
+    t_high = next((r["t"] for r in rows if r.get(key) is not None and r[key] <= TARGET_FP), None)
     if t_high is None:
         t_high = rows[-1]["t"]
         notes.append(f"门槛调到 {t_high} 误浮现率也超过 {int(TARGET_FP * 100)}%：精排分对这些反例偏高，"
                      "可能要换精排模型，或者检查这些反例标得对不对。")
+    if not by_turn:
+        notes.append(f"不该想起任何事的轮还不到 {MIN_NEGATIVE} 轮，强门槛先按一条条记忆算；按轮算通常要更高。")
     ok_low = [r["t"] for r in rows if r["hit"] is not None and r["hit"] >= TARGET_HIT]
     if ok_low:
         t_low = max(ok_low)
@@ -181,10 +201,18 @@ def suggest(rows, counts):
         t_low = rows[0]["t"]
         notes.append(f"门槛降到 {t_low}，「该想起」的也不到 {int(TARGET_HIT * 100)}% 能想起："
                      "很多该想起的根本没进候选，问题在检索，不在门槛。")
+    if by_turn and medium_prob > 0:
+        quiet = next((r["t"] for r in rows if r.get("turn_fp") is not None and medium_prob * r["turn_fp"] <= TARGET_MEDIUM_FP), None)
+        if quiet is not None and quiet > t_low:
+            hit = next((r["hit"] for r in rows if r["t"] == quiet), None)
+            notes.append(f"中门槛取 {quiet}：再低的话，平常聊天里因为「中」冒出不相干的事的概率会超过 {int(TARGET_MEDIUM_FP * 100)}%"
+                         f"（中层概率 {medium_prob} × 整轮误浮现率）；这时该想起的命中率是 {int(round((hit or 0) * 100))}%。"
+                         "问「还记得吗」时用的是单独的回忆门槛，不受影响。")
+            t_low = quiet
     if t_low > t_high:
         t_low = t_high
         notes.append("精排分把「该想起」和「不该想起」分得很开，中间几乎没有模糊地带，所以中门槛和强门槛取一样。")
-    return {"ok": True, "t_high": t_high, "t_low": t_low, "notes": notes}
+    return {"ok": True, "t_high": t_high, "t_low": t_low, "by_turn": by_turn, "notes": notes}
 
 
 def export():

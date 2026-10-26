@@ -29,9 +29,13 @@ const SHOW_COUNT_WEIGHTS = [
   { value: 2, weight: 0.2 }   // 20% 显示 2 条
 ];
 const SESSION_GAP_THRESHOLD_HOURS = 4;   // 会话间隔感知阈值
-// Phase 2 影子模式：每一轮把用户的话和这里旧逻辑的决定发给记忆服务的 /compose/turn，
-// 让新的召回编排也算一遍（只记录、不注入），在 Dashboard「召回对比」里对比。GATEWAY_COMPOSE_SHADOW=off 可以关掉。
-const COMPOSE_SHADOW = String(process.env.GATEWAY_COMPOSE_SHADOW || 'on').trim().toLowerCase() !== 'off';
+// 召回（2026-10-26 起正式）：每一轮由记忆服务的 /compose/turn 决定想起什么，卡片放进这一轮的附注；
+// 回复正常结束后调 /compose/confirm，才计入冷却。Dashboard 关掉「用新的召回」时它回 mode=shadow，这里改走下面旧的随机浮现。
+// 放进 system 的内容（事实档案、章节、主题线、语汇、关系状态、近七天、最近几天、还没了结的事）来自 /compose/system。
+// GATEWAY_COMPOSE=off：完全不找记忆服务的这两个接口（应急用），回到以前的旧逻辑和旧的叙事 / 近期摘要。
+const COMPOSE_ON = String(process.env.GATEWAY_COMPOSE || 'on').trim().toLowerCase() !== 'off';
+const COMPOSE_TURN_TIMEOUT_MS = 4500;      // 嵌入 + 精排一般 1–3 秒（p90 约 3 秒）；超过就这一轮不放记忆，不让回复等太久
+const COMPOSE_SYSTEM_TTL_MS = 3000;        // 同一条回复的几轮工具调用里不重复取
 
 // bug修复：工具回环短路时不请求上游、没有真实 usage。缓存上一轮真实回答的 usage（按 conv_id），
 // 回环时取出返回，避免 Kelivo 把已显示的 token 数用 0 覆盖（工具场景显示 0 的根因）。
@@ -982,65 +986,87 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
     // 查不到上次时间时静默跳过，不影响主流程
   }
 
-  // 3. 构建头部（时间锚点 + 可选的间隔感知）；两项都不加时头部为空，没有浮现记忆就整段不注入
+  // 3. 头部（时间锚点 + 可选的间隔感知）
   const headerLines = [];
   if (showClock) headerLines.push(`[当前时间：${currentDateStr}（${USER_TZ_LABEL}）]`);
   if (sessionNote) headerLines.push(`[${sessionNote}]`);
-  const header = headerLines.join('\n');
 
-  // 影子对比：记下旧逻辑这一轮的决定，在每个出口发给 /compose/turn（不等结果，不影响这一轮）
-  const legacy = { gate: 'closed', picked: [], candidates: [], passed: [], serendipity: null, trivial: false };
-  const done = (text) => { shadowCompose(userMessage, convId, menuCtx, legacy); return text; };
-
-  // 4. 随机门控：是否开放回忆？
-  if (Math.random() > SURFACE_PROBABILITY) {
-    return done(header + '\n');
+  // 4. 这一轮想起什么：交给记忆服务。标题生成这类不进记忆的请求不找。
+  let card = '';
+  const skip = !userMessage || (menuCtx && menuCtx.skipShadow);
+  const r = (COMPOSE_ON && !skip) ? await composeTurn(userMessage, convId, menuCtx) : null;
+  if (r && r.mode === 'live') {
+    card = r.card || '';
+    // 回复正常结束后确认投递（见 updateDisplayMetrics）：用「compose:轮次」放在 shownIds 里，跟着这一轮走
+    if (card && r.turn_key && menuCtx) menuCtx.shownIds = ['compose:' + r.turn_key];
+  } else if (!skip && (!COMPOSE_ON || (r && r.mode === 'shadow'))) {
+    card = await legacySurfacing(userMessage, convId, menuCtx);
   }
-  legacy.gate = 'open';
+  return frameMemoryNote(headerLines, card);
+}
 
-  // 5. 主通道：相关度驱动
-  let selectedMemories = await relevanceDrivenSurfacing(userMessage, legacy);
+// 每一轮的附注：放在用户消息最前面。写明这是系统加的、不是用户说的，免得模型以为是用户特意翻出来的记忆。
+function frameMemoryNote(headerLines, card) {
+  const body = [...headerLines, card].filter(x => x && String(x).trim()).join('\n');
+  if (!body) return '';
+  return '［记忆系统自动附注｜这一段是系统每轮自动加的，不是用户说的话，用户也看不到］\n' + body
+    + '\n［附注结束｜下面是用户这一轮说的话］';
+}
 
-  // 6. 并行通道：无由来浮现
+async function composeTurn(userMessage, convId, menuCtx) {
+  const ctx = (menuCtx && menuCtx.shadow) || {};
+  try {
+    const r = await axios.post(`${MEMORY_SERVICE_URL}/compose/turn`, {
+      session_id: convId || '', user_text: userMessage,
+      prev_user: ctx.prevUser || '', prev_assistant: ctx.prevAssistant || '',
+      turn_key: ctx.turnKey || undefined, backend: 'api', client: ctx.client || '',
+      window_size: ctx.windowSize || undefined
+    }, { timeout: COMPOSE_TURN_TIMEOUT_MS });
+    const d = r.data || {};
+    if (d.status === 'error' || !d.mode) { console.log('[COMPOSE] compose/turn 出错:', d.message || '没有 mode'); return null; }
+    if (d.mode === 'live') console.log('[COMPOSE] 这一轮', d.intent, '| 想起', (d.picks || []).length, '条',
+      (d.episodes || []).length ? '+ 片段 ' + d.episodes.length : '', '|', (d.latency_ms || {}).total, 'ms');
+    return d;
+  } catch (e) {
+    console.log('[COMPOSE] compose/turn 失败（这一轮不放记忆）:', e.message);
+    return null;
+  }
+}
+
+// 放进 system 的内容（/compose/system），短时间缓存
+let composeSystemCache = { t: 0, v: null };
+async function getComposeSystem() {
+  if (!COMPOSE_ON) return null;
+  if (composeSystemCache.v && Date.now() - composeSystemCache.t < COMPOSE_SYSTEM_TTL_MS) return composeSystemCache.v;
+  try {
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/compose/system`, { timeout: 5000 });
+    const d = r.data || {};
+    if (d.status !== 'ok') { console.log('[COMPOSE] compose/system 出错:', d.message || ''); return null; }
+    composeSystemCache = { t: Date.now(), v: d };
+    return d;
+  } catch (e) {
+    console.log('[COMPOSE] compose/system 失败（用旧的叙事和近期摘要）:', e.message);
+    return null;
+  }
+}
+
+// 旧的随机浮现（Dashboard 关掉「用新的召回」或 GATEWAY_COMPOSE=off 时用）
+async function legacySurfacing(userMessage, convId, menuCtx) {
+  if (Math.random() > SURFACE_PROBABILITY) return '';
+  let selectedMemories = await relevanceDrivenSurfacing(userMessage);
   if (Math.random() < SERENDIPITY_PROBABILITY) {
     const serendipityMemory = await serendipitousSurfacing(convId);
-    if (serendipityMemory) {
-      legacy.serendipity = serendipityMemory.id;
-      // 无由来浮现优先，但总数不超过 2 条
-      selectedMemories = [serendipityMemory, ...selectedMemories].slice(0, 2);
-    }
+    if (serendipityMemory) selectedMemories = [serendipityMemory, ...selectedMemories].slice(0, 2);
   }
-
-  legacy.picked = selectedMemories.map(m => m.id);
-  if (selectedMemories.length === 0) return done(header + '\n');
-
-  // 7. 格式化为自然语言念头
-  const formattedMemories = formatMemoriesAsThoughts(selectedMemories);
-
-  // 8. 展示指标：不在这里立即更新（以前组装菜单时就计数，请求失败/重新生成也会算"展示过"并进入冷却）。
-  //    把 id 交给调用方，等回复正常结束后再更新（见 chatCompletionsMain 里的 updateDisplayMetrics 调用）。
+  if (selectedMemories.length === 0) return '';
+  // 展示指标等回复正常结束后再更新（见 updateDisplayMetrics 的调用处）
   const shownIds = selectedMemories.map(m => m.id);
   if (menuCtx) menuCtx.shownIds = shownIds;
   else await updateDisplayMetrics(shownIds);
-
-  return done(header + formattedMemories);
+  return formatMemoriesAsThoughts(selectedMemories);
 }
 
-// Phase 2 影子模式：把这一轮也交给记忆服务的召回编排算一遍（只记录轨迹、不注入），不等结果
-function shadowCompose(userMessage, convId, menuCtx, legacy) {
-  if (!COMPOSE_SHADOW || !userMessage || (menuCtx && menuCtx.skipShadow)) return;
-  const ctx = (menuCtx && menuCtx.shadow) || {};
-  const norm = id => String(id).replace(/^l1_/, '');
-  axios.post(`${MEMORY_SERVICE_URL}/compose/turn`, {
-    session_id: convId || '', user_text: userMessage,
-    prev_user: ctx.prevUser || '', prev_assistant: ctx.prevAssistant || '',
-    turn_key: ctx.turnKey || undefined, backend: 'api', client: ctx.client || '', shadow: true,
-    legacy: { ...legacy, picked: legacy.picked.map(norm), passed: legacy.passed.map(norm),
-      serendipity: legacy.serendipity == null ? null : norm(legacy.serendipity) },
-  }, { timeout: 15000 }).catch(e => console.log('[SHADOW] compose/turn 失败:', e.message));
-}
-
-// 影子对比用的上文：上一条用户消息、AI 上一条回复（「然后呢」这类短消息要靠它们检索）
+// 召回用的上文：上一条用户消息、AI 上一条回复（「然后呢」这类短消息要靠它们检索）
 function shadowContext(req, lastUserIdx, pv, convId) {
   const msgs = memoryMessages(req);
   let prevUser = '', prevAssistant = '';
@@ -1052,7 +1078,9 @@ function shadowContext(req, lastUserIdx, pv, convId) {
     if (prevUser && prevAssistant) break;
   }
   const turnId = pv && pv.turn && pv.turn.id;
-  return { prevUser, prevAssistant, turnKey: turnId ? `${convId}:${turnId}` : null,
+  // 这一轮发给模型的对话条数（不算 system 和工具结果）：还在窗口里的那些消息提取出来的记忆，记忆服务不再浮现
+  const windowSize = msgs.filter(m => m && (m.role === 'user' || m.role === 'assistant') && !isToolResultMsg(m)).length;
+  return { prevUser, prevAssistant, turnKey: turnId ? `${convId}:${turnId}` : null, windowSize,
     client: String(req.headers['x-client-name'] || (pv ? 'pluvia' : 'kelivo')) };
 }
 
@@ -1172,20 +1200,36 @@ function weightedSample(items, n) {
   return sampled;
 }
 
-// 格式化为自然语言念头
+// 格式化为自然语言念头（和记忆服务 app/recall/cards.py 的写法一致：时间写在冒号前面，不会被当成称呼）
 function formatMemoriesAsThoughts(memories) {
   if (memories.length === 0) return '';
-
   const thoughts = memories.map(m => {
     const meta = m.metadata || {};
-    const timePhrase = toFuzzyTime(meta.ts);
-    const coreMarker = meta.is_core ? '⭐ ' : '';
-    const summary = m.l1_summary || '';
-
-    return `（${coreMarker}${timePhrase}，${summary}）`;
+    return `· ${meta.is_core ? '⭐ ' : ''}${whenLabel(meta.ts)}：${m.l1_summary || ''}`;
   });
+  return ['〈自动浮现的记忆〉', ...thoughts, '（只是自然浮现的念头，合适才提，不用逐条回应。）'].join('\n');
+}
 
-  return '\n' + thoughts.join('\n\n') + '\n';
+// 记忆发生的大概时间：昨天 / 一个多星期前 / 大约一个月前（今年初秋）
+function whenLabel(ts) {
+  const d = ts ? parseStoredTs(ts) : null;
+  if (!d) return ts ? '很久以前' : '不记得是什么时候';
+  const now = new Date();
+  const days = localDayNumber(now) - localDayNumber(d);
+  if (days <= 0) return '今天早些时候';
+  if (days === 1) return '昨天';
+  if (days === 2) return '前天';
+  if (days < 7) return '几天前';
+  if (days < 14) return '一个多星期前';
+  if (days < 30) return '两三个星期前';
+  const seasons = ['冬天', '冬末', '早春', '春天', '晚春', '初夏', '夏天', '盛夏', '初秋', '秋天', '深秋', '初冬'];
+  const cn = ['', '一', '两', '三', '四', '五', '六', '七', '八', '九', '十', '十一'];
+  const y = +localParts(d).year, ny = +localParts(now).year;
+  const which = y === ny ? '今年' : (ny - y === 1 ? '去年' : `${y} 年`);
+  const season = seasons[+localParts(d).month - 1];
+  if (days < 365) { const n = Math.max(1, Math.round(days / 30)); return `大约${cn[n] || n}个月前（${which}${season}）`; }
+  const n = Math.max(1, Math.round(days / 365));
+  return `大约${cn[n] || n}年前（${which}${season}）`;
 }
 
 // 模糊化时间（精确日期 → 自然语言时间描述）
@@ -1229,6 +1273,12 @@ function toFuzzyTime(isoTimestamp) {
 
 // 更新展示指标（display_count + last_shown_at）
 async function updateDisplayMetrics(memoryIds) {
+  const keys = (memoryIds || []).filter(id => String(id).startsWith('compose:'));
+  memoryIds = (memoryIds || []).filter(id => !String(id).startsWith('compose:'));
+  for (const k of keys) {
+    axios.post(`${MEMORY_SERVICE_URL}/compose/confirm`, { turn_key: String(k).slice('compose:'.length) }, { timeout: 5000 })
+      .catch(e => console.log('[COMPOSE] confirm 失败:', e.message));
+  }
   if (memoryIds.length === 0) return;
 
   try {
@@ -2475,14 +2525,17 @@ async function chatCompletionsMain(req, res) {
     // shownIds：本轮浮现的记忆 id，回复成功后再计入展示指标；shadow：影子对比用的上文（Phase 2）
     const menuCtx = { shownIds: [], skipShadow: isTitleGenerationRequest(req),
       shadow: shadowContext(req, lastUserIdx, pv, convIdForMenu) };
-    const [profile, memoryMenu, sharedNarrative, recentSummary, customPrompt] = await Promise.all([
+    // 放进 system 的新内容（/compose/system）拿得到就用它；拿不到（记忆服务出错、GATEWAY_COMPOSE=off）用旧的叙事和近期摘要
+    const [profile, memoryMenu, composed, customPrompt] = await Promise.all([
       getProfile(),
       pvContinuing ? Promise.resolve('')
         : getMemoryMenu(memUserText, convIdForMenu, menuCtx, clientClockFlags(req, toPlainText(userContent))),
-      getSharedNarrative(),
-      getRecentSummary(),
+      getComposeSystem(),
       getCustomPrompt()
     ]);
+    const [sharedNarrative, recentSummary] = composed ? [null, null]
+      : await Promise.all([getSharedNarrative(), getRecentSummary()]);
+    const profileFacts = composed && composed.profile_extra ? `\n\n${composed.profile_extra}` : '';
     // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
     // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
     let systemPrefix = `你拥有一个持续维护的记忆系统。
@@ -2504,7 +2557,7 @@ about_user（关于用户的理解）、about_ai（关于自身交流方式和�
 这些内容不是固定人格设定，也不是必须遵守的规则。它们代表过去形成的认识，可以帮助理解当前交流。随着新的交流，这些理解也可以变化。
 
 [人格画像]
-${profile}
+${profile}${profileFacts}
 
 你可以使用以下工具：
 - recall: 需要更多细节时搜索记忆库（semantic=语义联想 / exact=逐字搜索完整原始对话记录，不受是否已被提炼进记忆摘要影响）
@@ -2518,9 +2571,9 @@ ${profile}
 
 记忆系统偶尔会浮现一些过去的片段——这些不是你必须处理的信息，而是偶然想起的痕迹。
 
-这是我们曾经共同经历过的一点痕迹。它们可能与当前话题有关，也可能无关。
+用户的消息最前面有时会有一段「［记忆系统自动附注］……［附注结束］」：里面是现在的时间、距上次聊天多久，以及记忆系统按这句话自动找出来的几条记忆。这一段是系统每一轮自动加的，不是用户写的，用户也看不到；用户并没有特意翻出这些记忆，也没有在提它们。每条记忆冒号前面是它发生的大概时间（比如「大约一个月前（今年初秋）」），不是称呼。附注之后才是用户这一轮真正说的话。
 
-不要刻意复述它们，也不要让它们限制你对当下的理解。只有在它们真的相关、真的有助于理解当前交流时，才自然地用上。
+这些是我们曾经共同经历过的一点痕迹，可能与当前话题有关，也可能无关。不要刻意复述它们，不用逐条回应，也不要说「系统告诉我」「附注里写着」；只有在它们真的相关、真的有助于理解当前交流时，才自然地用上。
 
 记忆片段只是部分提醒，不代表所有相关记忆都已列出。如果你觉得某个话题以前聊过但没看到相关片段，可以用 recall 去找（exact 模式能搜到原始对话）。`;
 
@@ -2534,7 +2587,14 @@ ${profile}
       { type: 'text', text: systemPrefix, cache_control: { type: 'ephemeral', ttl: '1h' } }
     ];
 
-    // 按需添加 cache② Shared Narrative
+    // 新内容：半静态块（章节、主题线、共同语汇）和日更块（关系状态、近七天、最近几天、还没了结的事），各一个缓存断点
+    if (composed) {
+      for (const text of [composed.semi, composed.daily]) {
+        if (text && text.trim()) systemBlocks.push({ type: 'text', text, cache_control: { type: 'ephemeral', ttl: '1h' } });
+      }
+    }
+
+    // 旧的：cache② Shared Narrative（拿不到新内容时）
     if (sharedNarrative) {
       systemBlocks.push({
         type: 'text',

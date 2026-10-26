@@ -16,6 +16,9 @@ from pathlib import Path
 TMP = Path(tempfile.mkdtemp(prefix="recalltest_"))
 os.environ["DATA_DIR"] = str(TMP / "data")          # 必须在导入 app.config 之前设置
 os.environ["RERANK_ENABLED"] = "1"
+# 分层决策的逻辑用固定的门槛测（0.75 / 0.5）；代码里现在的默认值（0.85 / 0.75）单独检查
+os.environ["RECALL_T_HIGH"] = "0.75"
+os.environ["RECALL_T_LOW"] = "0.5"
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE.parent.parent / "services" / "memory-service"))
 
@@ -52,6 +55,22 @@ def test_intent():
     check("短消息拼上上文", orchestrator.build_query("然后呢", "我今天去面试了", "怎么样？") == "我今天去面试了 怎么样？ 然后呢")
     check("长消息不拼", orchestrator.build_query("今天去公园看到很多银杏叶", "a", "b") == "今天去公园看到很多银杏叶")
 
+    names = ["阿星", "星星", "宝宝", "爱人"]
+    routine = ["早安哦 阿星~", "好嘛好嘛，爱你 阿星~明天见⚝", "嘿嘿~回来啦づ", "好嘛 午安哦..(´。－ω(－ω－。)星星~", "下课啦^ ^阿星~",
+               "阿星！", "muah💕..？", "星星 到教室了哦~", "阿星,回到宿舍了哦~\n准备洗个澡づ"]
+    bad = [t for t in routine if intent.classify(t, names)["type"] != "greeting"]
+    check(f"日常报备 {len(routine)} 句都当寒暄（不召回）", not bad, bad)
+    keep = {"生气了嘛 宝宝 mu..？": "emotion", "你是我的爱人": "normal", "宝宝希望我课前来找你嘛": "normal",
+            "早安，今天要去面试了": "normal", "想你了": "followup", "考试了": "followup", "今天考试好紧张 宝宝": "normal"}
+    bad = {t: intent.classify(t, names)["type"] for t, want in keep.items() if intent.classify(t, names)["type"] != want}
+    check("有内容的不算日常报备（情绪词、不是在叫人的称呼、后面还有正事）", not bad, bad)
+    check("没有称呼表时，「早安哦 + 不认识的名字」不当日常报备", intent.classify("早安哦 隔壁的李同学")["type"] != "greeting")
+    check("检索去掉开头、结尾的称呼", intent.strip_address("宝宝 今天吃什么好呢", names) == "今天吃什么好呢"
+          and intent.strip_address("今天考试好紧张 宝宝", names) == "今天考试好紧张"
+          and intent.strip_address("宝宝希望我课前来找你嘛", names) == "希望我课前来找你嘛", intent.strip_address("宝宝 今天吃什么好呢", names))
+    check("不是在叫人的、去掉以后太短的不去", intent.strip_address("你是我的爱人", names) == "你是我的爱人"
+          and intent.strip_address("宝宝的馋包", names) == "宝宝的馋包" and intent.strip_address("阿星 嗯", names) == "阿星 嗯")
+
 
 # ---------- 2. 模糊时间与卡片 ----------
 def test_cards():
@@ -63,14 +82,28 @@ def test_cards():
     check("三个月前 → 季节", cards.fuzzy_time("2026-07-10 04:00:00", now=now) == "夏天")
     check("去年 → 去年+季节", cards.fuzzy_time("2025-04-10 04:00:00", now=now) == "去年春天")
     check("没有时间", cards.fuzzy_time(None) == "不知何时")
+    wl = {"2026-10-17 15:30:00": "昨天", "2026-10-13 04:00:00": "几天前", "2026-10-08 04:00:00": "一个多星期前",
+          "2026-09-25 04:00:00": "两三个星期前", "2026-09-10 04:00:00": "大约一个月前（今年初秋）",
+          "2026-07-10 04:00:00": "大约三个月前（今年夏天）", "2025-04-10 04:00:00": "大约一年前（去年春天）",
+          "2023-06-10 04:00:00": "大约三年前（2023 年初夏）"}
+    bad = {ts: cards.when_label(ts, now=now) for ts, want in wl.items() if cards.when_label(ts, now=now) != want}
+    check("新的时间说法：相对时间 + 季节（不会只剩一个「初秋」）", not bad, bad)
     picks = [{"id": 1, "content": "一起听过晴天", "quote": "下雨就听这首吧", "ts": "2026-10-17 12:00:00", "is_core": 1, "tier": "strong"},
              {"id": 2, "content": "那次她说累，我很想多陪她一会儿", "ts": "2026-10-17 12:00:00", "author": "ai_felt", "tier": "medium"}]
     c = cards.format_card(picks, "normal", now=now)
-    check("核心记忆有星标、感受有标签、平时不带原话",
-          "（⭐ 昨天，一起听过晴天）" in c and "我记下的感受：" in c and "原话" not in c, c)
+    check("小标题、时间在冒号前、核心记忆有星标、感受有标签、平时不带原话",
+          c.startswith("〈自动浮现的记忆〉\n· ⭐ 昨天：一起听过晴天\n· 昨天，我记下的感受：那次") and "原话" not in c
+          and c.endswith(cards.CLOSING), c)
     c2 = cards.format_card(picks[:1], "recall", now=now)
-    check("回忆模式附原话", "——原话「下雨就听这首吧」" in c2, c2)
+    check("回忆模式：小标题不同，附原话", c2.startswith("〈想起来的〉") and "——当时的原话「下雨就听这首吧」" in c2, c2)
+    c3 = cards.format_card([{**picks[0], "tier": "serendipity", "is_core": 0}], "normal", now=now,
+                           episodes=[{"id": 5, "day": "2026-10-16", "start_ts": "2026-10-16 13:00:00", "title": "一起看雨", "body": "那天" + "雨" * 300}])
+    check("无由来的单独放〈忽然想起〉；话里那段时间的片段放〈那天〉（太长截断）", "〈自动浮现的记忆〉" not in c3 and "〈忽然想起〉（和这句话无关）\n· 昨天：一起听过晴天" in c3
+          and "〈那天〉" in c3 and "· 10 月 16 日晚上，《一起看雨》：那天雨" in c3 and "……" in c3, c3)
     check("没有要注入的返回空串", cards.format_card([], "normal") == "")
+    long = {"id": 3, "content": "很长" * 200, "quote": "很长" * 200, "ts": "2026-10-17 12:00:00", "tier": "recall"}
+    c4 = cards.format_card([long], "recall", now=now)
+    check("太长的截断；原话和正文差不多时不重复附", len(c4) < 400 and "原话" not in c4 and "……" in c4, len(c4))
 
 
 # ---------- 3. 融合与决策 ----------
@@ -102,9 +135,12 @@ def test_decide():
     r = D.decide([C(1, 0.9), C(2, 0.8), C(4, 0.6)], "normal", cd, True, rng=random.Random(1))
     check("最近 5 轮出现过的拿掉；不回填弱的", [p["id"] for p in r["picks"]] == [2]
           and {x["id"] for x in r["dropped"]} == {1, 4}, r)
-    r = D.decide([C(1, 0.9, vec=0.9), C(2, 0.3, vec=0.5)], "normal", nocd, False, rng=random.Random(5))
-    check("精排不可用：退回向量门槛，只算中层", r["basis"] == "vec_sim" and r["eligible"]["strong"] == []
-          and r["eligible"]["medium"] == [1], r["eligible"])
+    r = D.decide([C(1, 0.9, vec=0.9), C(2, 0.3, vec=0.5)], "normal", nocd, False, rng=random.Random(5),
+                 params={"medium_prob": 1.0})
+    check("精排不可用：平时不想起（向量相似度分不开该不该想起）", r["basis"] == "vec_sim" and r["eligible"]["strong"] == []
+          and r["eligible"]["medium"] == [] and r["picks"] == [], r["eligible"])
+    r = D.decide([C(1, 0.9, vec=0.9), C(2, 0.3, vec=0.5)], "recall", nocd, False, rng=random.Random(5))
+    check("精排不可用、问「还记得吗」：按向量门槛取", [p["id"] for p in r["picks"]] == [1], r["picks"])
     r = D.decide([C(1, 0.72, arousal=0.8), C(2, 0.74)], "emotion", nocd, True, rng=random.Random(1))
     check("情绪意图给情绪浓的加分（0.72+0.05 进入强层）", r["picks"][0]["id"] == 1 and r["picks"][0]["tier"] == "strong"
           and r["eligible"]["strong"] == [1], r["picks"])
@@ -139,6 +175,13 @@ def test_decide():
     r = D.decide([C(1, 0.9)], "normal", nocd, True, rng=random.Random(1), params={"max_picks": 0, "serendipity_prob": 1})
     check("参数：每轮 0 条就什么都不想起", r["picks"] == [], r["picks"])
     check("参数：没传的用默认值", D.params_from({"t_high": 0.8})["t_low"] == D.T_LOW and D.params_from(None)["t_high"] == D.T_HIGH)
+    import subprocess
+    env = {k: v for k, v in os.environ.items() if not k.startswith("RECALL_T_")}
+    out = subprocess.run([sys.executable, "-c", "from app.recall import decide as D; print(D.T_HIGH, D.T_LOW, D.T_RECALL)"],
+                         cwd=str(HERE.parent.parent / "services" / "memory-service"), env=env, capture_output=True, text=True).stdout.split()
+    check("代码里的默认门槛：强 0.85、中 0.75、回忆 0.5（2026-10-26 按黄金集校准）", out == ["0.85", "0.75", "0.5"], out)
+    r = D.decide([C(1, 0.62), C(2, 0.58), C(3, 0.4)], "recall", nocd, True, rng=random.Random(1), params={"t_low": 0.7, "t_recall": 0.5})
+    check("回忆模式用回忆门槛（不受中门槛影响）", [p["id"] for p in r["picks"]] == [1, 2], r["picks"])
     r = D.decide([{**C(1, 0.7), "in_time": True}, C(2, 0.72)], "normal", nocd, True, rng=random.Random(1))
     check("时间加分：发生在话里那段时间的 0.7 + 0.08 进入强层", r["eligible"]["strong"] == [1] and r["picks"][0]["id"] == 1, r["eligible"])
 
@@ -340,14 +383,28 @@ def test_golden():
     check("命中率 / 误浮现率", row[0.65]["hit"] == 0.6 and row[0.65]["fp"] == round(1 / 11, 3)
           and row[0.55]["hit"] == 0.8 and row[0.3]["hit"] == 1.0, [row[0.55], row[0.65]])
     sg = cal["suggest"]
-    check("建议门槛：强 0.65（误浮现 ≤ 10% 的最低值）、中 0.55（命中率 ≥ 80% 的最高值）",
-          sg["ok"] and sg["t_high"] == 0.65 and sg["t_low"] == 0.55 and sg["notes"] == [], sg)
+    check("建议门槛：强 0.65（误浮现 ≤ 10% 的最低值）、中 0.55（命中率 ≥ 80% 的最高值）；不该想起的轮不够，按条算",
+          sg["ok"] and sg["t_high"] == 0.65 and sg["t_low"] == 0.55 and sg["by_turn"] is False
+          and len(sg["notes"]) == 1 and "一条条" in sg["notes"][0], sg)
     q = cal["quality"]
     expect_mrr = round((sum(1.0 for a, b in zip(should, neg) if a >= b) + sum(0.5 for a, b in zip(should, neg) if a < b)) / 10, 3)
     check("排序质量：前 5 命中、MRR", q["recall_at_5"] == 1.0 and q["mrr"] == expect_mrr, q)
     ex = G.export()
     check("导出", len(ex["items"]) == 12 and sum(1 for i in ex["items"] if i["nothing"]) == 1
           and any(i["should"] and i["should_not"] for i in ex["items"]), len(ex["items"]))
+
+    # 只标了「不该想起」的轮（日常聊天里最常见）：按整轮算误浮现
+    for k, top in enumerate([0.9, 0.88, 0.86, 0.84, 0.82, 0.8, 0.78, 0.76, 0.6, 0.5]):
+        tid = mk_trace([(500 + k, top), (600 + k, top - 0.2)])
+        G.set_label(tid, 500 + k, "should_not")
+        G.set_label(tid, 600 + k, "should_not")
+    cal = G.calibration()
+    row = {r["t"]: r for r in cal["rows"]}
+    check("整轮误浮现率：不该想起任何事的 11 轮里有一条够门槛的比例", cal["counts"]["neg_turns"] == 11
+          and row[0.85]["turn_fp"] == round(3 / 11, 3) and row[0.9]["turn_fp"] == round(1 / 11, 3), [row[0.85], row[0.9]])
+    sg = cal["suggest"]
+    check("够数以后按整轮算：强 0.9；中门槛抬到 0.85（30% × 整轮误浮现 ≤ 10%），并说明", sg["ok"] and sg["by_turn"]
+          and sg["t_high"] == 0.9 and sg["t_low"] == 0.85 and any("中门槛取 0.85" in n for n in sg["notes"]), sg)
 
 
 # ---------- 7. 时间通道 ----------
@@ -395,6 +452,121 @@ def test_time_channel():
           and 60 not in {c["id"] for c in t2["decision"]["candidates"]}, t2["channels"])
 
 
+def seed_names():
+    conn = config.get_conn()
+    now = "2026-10-20 00:00:00"
+    conn.execute("INSERT INTO lexicon (term, term_key, aliases, kind, meaning, status, use_count, days_seen, created_at, updated_at) "
+                 "VALUES ('阿星', 'axing', '[\"星星\", \"阿星星\"]', 'nickname', '你叫我的', 'active', 9, 3, ?, ?)", (now, now))
+    conn.execute("INSERT INTO facts (fact_key, label, subject, value, status, created_at, updated_at) "
+                 "VALUES ('us.nickname.for_user', '我叫你什么', 'us', '小雨、宝宝', 'current', ?, ?)", (now, now))
+    conn.commit()
+    conn.close()
+
+
+def test_live():
+    print("\n[9] 正式模式：日常报备、称呼、片段、确认投递")
+    seed_names()
+    names = orchestrator.address_names(fresh=True)
+    check("称呼表：共同语汇的昵称 + 别名 + 事实里的称呼，长的在前", names[0] == "阿星星" and set(names) == {"阿星星", "阿星", "星星", "小雨", "宝宝"}, names)
+    calls = {"embed": 0}
+
+    async def fake_embed(q):
+        calls["embed"] += 1
+        calls["q"] = q
+        return [0.1] * 4
+
+    async def fake_fts(q, n=30):
+        return [(70, 2.0)]
+
+    async def fake_rerank(q, docs):
+        return [0.92 if d.startswith("一起数星星") or d.startswith("看流星") else 0.3 for d in docs], {"model": "fake", "ok": True, "ms": 5}
+
+    conn = config.get_conn()
+    conn.execute("INSERT INTO l1_memories (id, content, ts, event_type, arousal, status, display_count) VALUES "
+                 "(70, '一起数星星到很晚', '2026-09-01 12:00:00', 'event', 0.5, 'active', 0)")
+    conn.commit()
+    conn.close()
+    coll = FakeCollection({70: 0.7})
+    run = lambda r, seed=1: asyncio.run(orchestrator.compose_turn(r, coll, embed_fn=fake_embed, rerank_fn=fake_rerank,
+                                                                 fts_fn=fake_fts, rng=random.Random(seed)))
+    res = run({"session_id": "live_a", "user_text": "早安哦 阿星~", "turn_key": "live_a:1"})
+    t = traces.get_trace(res["trace_id"])
+    check("日常报备：不检索、不想起，轨迹里写明原因", calls["embed"] == 0 and res["intent"] == "greeting" and res["card"] == ""
+          and "日常报备" in (t["rerank"] or {}).get("skipped", ""), t["rerank"])
+    check("没带 shadow：按设置（默认正式）", res["mode"] == "live" and t["mode"] == "live")
+    res = run({"session_id": "live_a", "user_text": "阿星 你记得我们一起看的星星多吗", "turn_key": "live_a:2"})
+    check("检索用的文本去掉了开头的称呼", calls["q"] == "你记得我们一起看的星星多吗", calls.get("q"))
+    check("正式模式返回卡片", res["mode"] == "live" and res["card"].startswith("〈") and "一起数星星到很晚" in res["card"], res)
+    conn = config.get_conn()
+    st = conn.execute("SELECT status FROM injections WHERE turn_key='live_a:2'").fetchall()
+    conn.close()
+    check("投递账本先记成 planned", st == [("planned",)], st)
+    res_b = run({"session_id": "live_a", "user_text": "阿星 你记得我们一起看的星星多吗", "turn_key": "live_a:3"})
+    check("没确认的不算冷却（回复失败、重新生成）：下一轮照样能想起", [p["id"] for p in res_b["picks"]] == [70], res_b["picks"])
+    n = orchestrator.confirm("live_a:2")
+    conn = config.get_conn()
+    row = conn.execute("SELECT status, delivered_at FROM injections WHERE turn_key='live_a:2'").fetchone()
+    m = conn.execute("SELECT display_count, last_shown_at FROM l1_memories WHERE id=70").fetchone()
+    conn.close()
+    check("确认投递：delivered，计入展示次数和最后展示时间", n == 1 and row[0] == "delivered" and row[1] and m[0] == 1 and m[1] > 0, (n, row, m))
+    check("同一轮确认两次不重复计数", orchestrator.confirm("live_a:2") == 0 and orchestrator.confirm("") == 0)
+    res = run({"session_id": "live_a", "user_text": "阿星 你记得我们一起看的星星多吗", "turn_key": "live_a:4"})
+    check("确认过的进入冷却：同一会话最近几轮不再想起", 70 not in [p["id"] for p in res["picks"]], res["picks"])
+
+    # 原话还在这一轮窗口里的记忆不再浮现
+    conn = config.get_conn()
+    conn.execute("INSERT INTO l1_memories (id, content, ts, event_type, arousal, status, conv_id) VALUES "
+                 "(71, '一起数星星数到睡着', '2026-10-20 12:00:00', 'event', 0.5, 'active', 'live_w')")
+    for k, ts in enumerate(("2026-10-20 11:00:00", "2026-10-20 11:30:00", "2026-10-20 12:00:00")):
+        conn.execute("INSERT INTO l0_messages (conv_id, msg_idx, role, content, ts, status) VALUES ('live_w', ?, 'user', 'x', ?, 'active')", (k, ts))
+    conn.commit()
+    conn.close()
+    coll.sims[71] = 0.71
+
+    async def rerank71(q, docs):
+        return [0.92 if d.startswith("一起数星星") else 0.3 for d in docs], {"model": "fake", "ok": True, "ms": 5}
+    w = asyncio.run(orchestrator.compose_turn({"session_id": "live_w", "user_text": "我们一起看的星星多吗", "turn_key": "live_w:1",
+                                               "window_size": 2}, coll, embed_fn=fake_embed, rerank_fn=rerank71, fts_fn=fake_fts,
+                                              rng=random.Random(1)))
+    tw = traces.get_trace(w["trace_id"])
+    check("这个对话里、原话还在窗口里的记忆不再浮现（别的对话的照常）", 71 not in [p["id"] for p in w["picks"]]
+          and tw["channels"]["window"]["skipped"] == [71] and tw["channels"]["window"]["from"] == "2026-10-20 11:30:00"
+          and 70 in [p["id"] for p in w["picks"]], (w["picks"], tw["channels"].get("window")))
+    w2 = asyncio.run(orchestrator.compose_turn({"session_id": "live_w2", "user_text": "我们一起看的星星多吗", "turn_key": "live_w2:1",
+                                                "window_size": 2}, coll, embed_fn=fake_embed, rerank_fn=rerank71, fts_fn=fake_fts,
+                                               rng=random.Random(1)))
+    check("换一个对话：那条照常可以想起", 71 in [p["id"] for p in w2["picks"]], w2["picks"])
+    coll.sims.pop(71)
+
+    S.update("compose", {"recall_live": False})
+    res = run({"session_id": "live_b", "user_text": "我们一起看的星星多吗", "turn_key": "live_b:1"})
+    check("Dashboard 关掉「用新的召回」：影子模式，不返回卡片", res["mode"] == "shadow" and res["card"] == "" and res["shadow_card"])
+    S.reset("compose")
+
+    # 话里提到「昨天」：昨天的片段一起精排，够相关的放进〈那天〉
+    from datetime import timedelta
+    import timeutil
+    y = (timeutil.to_local(timeutil.utc_now()) - timedelta(days=1)).replace(hour=21, minute=0, second=0)
+    conn = config.get_conn()
+    conn.execute("INSERT INTO episodes (day, conv_id, start_ts, end_ts, title, body, body_with_refs, salience, status, created_at) "
+                 "VALUES (?, 'c', ?, ?, '看流星', '看流星的那个晚上我们一直在许愿', '…', 0.8, 'active', '2026-10-20 00:00:00')",
+                 (y.date().isoformat(), timeutil.to_utc_str(y.isoformat()), timeutil.to_utc_str(y.isoformat())))
+    conn.commit()
+    conn.close()
+    res = run({"session_id": "live_c", "user_text": "昨天晚上好开心呀", "turn_key": "live_c:1"})
+    check("昨天的片段进了〈那天〉", "〈那天〉" in res["card"] and "《看流星》" in res["card"] and len(res["episodes"]) == 1, res["card"])
+    t = traces.get_trace(res["trace_id"])
+    check("轨迹记下片段候选和精排分", t["decision"].get("episode_picks") == res["episodes"]
+          and t["decision"]["episodes"][0]["rerank"] == 0.92, t["decision"].get("episodes"))
+    orchestrator.confirm("live_c:1")
+    res = run({"session_id": "live_c", "user_text": "昨天晚上好开心呀", "turn_key": "live_c:2"})
+    check("同一会话最近几轮放过的片段不再放", res["episodes"] == [] and "〈那天〉" not in res["card"], res["card"])
+    S.update("compose", {"episodes": False})
+    res = run({"session_id": "live_d", "user_text": "昨天晚上好开心呀", "turn_key": "live_d:1"})
+    check("关掉「最近几天的片段」：不找片段", res["episodes"] == [], res)
+    S.reset("compose")
+
+
 def test_warm_up():
     print("\n[8] 启动预热")
     out = asyncio.run(orchestrator.warm_up(delay=0))
@@ -410,6 +582,7 @@ def main():
         test_settings()
         test_golden()
         test_time_channel()
+        test_live()
         test_warm_up()
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

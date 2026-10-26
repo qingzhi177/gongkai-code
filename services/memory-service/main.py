@@ -33,7 +33,8 @@ from app.llm import get_model_config
 from app.pipeline.summary import get_summary_pending
 from app.pipeline.narrative import NarrativeGenerateRequest, get_narrative_pending
 from app.pipeline import summary as summary_pipeline
-from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回编排（影子模式）
+from app.recall import orchestrator as recall_orchestrator   # Phase 2：召回编排（2026-10-26 起正式注入）
+from app import compose as context_composer   # 放进聊天的三块 system 内容（章节、语汇、关系状态、事实……）
 from app.recall import traces as recall_traces
 from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
@@ -42,14 +43,14 @@ from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
 from app import uploads   # 大文件分块上传、后台导入任务（Dashboard「备份管理」）
 from app import purge as purge_data   # 清空所有数据：除了配置、设置、召回对比，别的表都清空
-from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（现在只生成、不注入）
-from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷（现在只生成、不注入）
-from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要（现在只生成、不注入）
-from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇（现在只生成、不注入）
-from app.pipeline import loops as loops_pipeline       # Phase 4：未完的事（现在只生成、不注入）
-from app.pipeline import facts as facts_pipeline       # Phase 4：事实（现在只生成、不注入）
-from app.pipeline import state as state_pipeline       # Phase 4：关系状态卡（现在只生成、不注入）
-from app.pipeline import chapters as chapter_pipeline  # Phase 4：章节（现在只生成、不注入）
+from app.pipeline import episodes as episode_pipeline   # Phase 4：每日片段（放进聊天见 app/compose.py）
+from app.pipeline import arcs as arc_pipeline   # Phase 4：主题卷
+from app.pipeline import digests as digest_pipeline   # Phase 4：日摘、周摘、近七天摘要
+from app.pipeline import lexicon as lexicon_pipeline   # Phase 4：共同语汇
+from app.pipeline import loops as loops_pipeline       # Phase 4：未完的事
+from app.pipeline import facts as facts_pipeline       # Phase 4：事实
+from app.pipeline import state as state_pipeline       # Phase 4：关系状态卡
+from app.pipeline import chapters as chapter_pipeline  # Phase 4：章节
 
 load_dotenv()
 
@@ -2876,12 +2877,13 @@ class ComposeTurnRequest(BaseModel):
     turn_key: Optional[str] = None
     backend: str = "api"
     client: str = ""
-    shadow: bool = True
+    shadow: Optional[bool] = None    # 不带：看 Dashboard「用新的召回」的设置
+    window_size: Optional[int] = None   # 这一轮发给模型的消息条数：还在窗口里的那些消息提取出的记忆不再浮现
     legacy: Optional[dict] = None
 
 @app.post("/compose/turn")
 async def compose_turn_api(req: ComposeTurnRequest):
-    """每一轮聊天调一次：算出这一轮会想起什么。影子模式下只记录轨迹（recall_traces）、不返回注入内容。"""
+    """每一轮聊天调一次：算出这一轮会想起什么。正式模式返回卡片（网关放进这一轮的附注）；影子模式只记录、不返回卡片。"""
     try:
         return await recall_orchestrator.compose_turn(_model_dict(req), collection=l1_collection)
     except Exception as e:
@@ -2907,6 +2909,48 @@ class SettingsUpdate(BaseModel):
 
 class SettingsReset(BaseModel):
     keys: List[str] = []
+
+class ComposeConfirmRequest(BaseModel):
+    turn_key: str = ""
+
+@app.post("/compose/confirm")
+async def compose_confirm_api(req: ComposeConfirmRequest):
+    """网关在回复正常结束后调：这一轮放进去的记忆记成「投递了」，计入展示次数和冷却"""
+    try:
+        return {"status": "ok", "delivered": recall_orchestrator.confirm(req.turn_key)}
+    except Exception as e:
+        logger.error(f"[RECALL] confirm 出错：{e}", exc_info=True)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.get("/compose/system")
+async def compose_system_api():
+    """放进聊天的 system 内容：事实档案（接在画像后面）、半静态块（章节、主题线、语汇）、日更块（关系状态、近七天、
+    最近几天、还没了结的事），以及「用新的召回」开没开。网关每一轮取一次；Dashboard「聊天里放什么」预览也用它。"""
+    try:
+        return {"status": "ok", **context_composer.system_blocks()}
+    except Exception as e:
+        logger.error(f"[COMPOSE] system_blocks 出错：{e}", exc_info=True)
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+
+@app.get("/compose/settings")
+async def get_compose_settings():
+    return app_settings.describe("compose")
+
+@app.put("/compose/settings")
+async def put_compose_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("compose", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("compose")}
+
+@app.post("/compose/settings/reset")
+async def reset_compose_settings(req: SettingsReset):
+    try:
+        app_settings.reset("compose", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("compose")}
 
 @app.get("/recall/settings")
 async def get_recall_settings():
@@ -2952,7 +2996,7 @@ async def recall_calibration():
     """按黄金集标注算各个门槛的命中率 / 误浮现率、排序质量，够数时给出建议门槛（只用存下的精排分，不花钱）"""
     cal = recall_golden.calibration()
     cur = app_settings.get("recall")
-    cal["current"] = {"t_high": cur["t_high"], "t_low": cur["t_low"], "rerank_model": cur["rerank_model"]}
+    cal["current"] = {"t_high": cur["t_high"], "t_low": cur["t_low"], "t_recall": cur["t_recall"], "rerank_model": cur["rerank_model"]}
     return cal
 
 @app.get("/recall/labels/export")

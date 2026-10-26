@@ -88,6 +88,30 @@ def time_search(ranges, n=30):
         conn.close()
 
 
+def episode_search(ranges, n=6):
+    """时间通道里的每日片段：开始时间落在这些范围里的，重要的排前面。返回 [{id, day, start_ts, title, body}]"""
+    if not ranges:
+        return []
+    conn = get_conn()
+    try:
+        out, seen = [], set()
+        for r in ranges:
+            try:
+                rows = conn.execute(
+                    "SELECT id, day, start_ts, title, body FROM episodes WHERE status='active' "
+                    "AND datetime(start_ts) >= ? AND datetime(start_ts) < ? "
+                    "ORDER BY COALESCE(salience, 0) DESC, start_ts LIMIT ?", (r["start"], r["end"], n)).fetchall()
+            except Exception:            # 还没有片段表（迁移前）
+                return []
+            for eid, day, ts, title, body in rows:
+                if eid not in seen:
+                    seen.add(eid)
+                    out.append({"id": int(eid), "day": day, "start_ts": ts, "title": title or "", "body": body or ""})
+        return out[:n]
+    finally:
+        conn.close()
+
+
 def fts_search(query, n=30):
     """返回 [(l1_id, bm25 分数)]，分数高的在前"""
     try:

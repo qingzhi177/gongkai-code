@@ -456,26 +456,62 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(r1.status === 403 && r2.status === 403 && r3.status === 200 && r4.status === 403, 'T23', [r1.status, r2.status, r3.status, r4.status]);
   }
 
-  console.log('T24 影子对比：每轮把用户的话和旧逻辑的决定发给 /compose/turn（不影响回复）');
+  console.log('T24 召回正式模式：卡片放进附注、system 用新内容、回复结束后确认投递');
   {
+    const setCompose = async b => { await fetch('http://127.0.0.1:3998/_test/compose', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) }); await sleep(3100); };
+    const card = '〈自动浮现的记忆〉\n· 昨天：一起听过晴天\n（只是自然浮现的念头，合适才提，不用逐条回应。）';
+    await setCompose({ mode: 'live', card, system: { profile_extra: '[档案 · 事实]\n关于你：\n- 生日：6 月 12 日',
+      semi: '[我们的章节]\n· 第 1 章「晴天」', daily: '[我们最近]\n· 节奏：常在晚上来' } });
     const tail = '（此刻：10月16日 周五 21:30）';
     const m = mark();
     const r = await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sh',
       pluvia: { v: '0.2', client: 'pluvia', turn: { id: 'tsh1', round: 1 }, tail },
       messages: [{ role: 'user', content: '早 [A]' }, { role: 'assistant', content: '早呀' }, { role: 'user', content: '你好 [A]\n\n' + tail }] });
     const s = oaSummary(await sseCollect(r)); await sleep(400);
-    const comp = since(m).mem.filter(x => x.k === 'compose');
+    const d = since(m);
+    const comp = d.mem.filter(x => x.k === 'compose');
     const c = comp[0] && comp[0].b;
-    ok(s.text === '你好呀' && comp.length === 1, 'T24 回复照常，发了一次 compose', { text: s.text, n: comp.length });
+    ok(s.text === '你好呀' && comp.length === 1, 'T24 回复照常，找了一次 compose/turn', { text: s.text, n: comp.length });
     ok(c && c.user_text === '你好 [A]' && c.prev_user === '早 [A]' && c.prev_assistant === '早呀' && c.session_id === 'conv-sh'
-      && c.turn_key === 'conv-sh:tsh1' && c.shadow === true && c.backend === 'api' && c.client === 'pluvia',
-      'T24 用户的话剥掉了「此刻」，带上文和 turn_key', c);
-    ok(c && c.legacy && ['open', 'closed'].includes(c.legacy.gate) && Array.isArray(c.legacy.picked), 'T24 带着旧逻辑这一轮的决定', c && c.legacy);
+      && c.turn_key === 'conv-sh:tsh1' && !('shadow' in c) && c.backend === 'api' && c.client === 'pluvia' && c.window_size === 3,
+      'T24 用户的话剥掉了「此刻」，带上文、turn_key 和窗口条数；不指定影子模式（记忆服务看设置）', c);
+    const up = upReqs(d)[0];
+    const lastUser = JSON.stringify(up.messages.slice(-1));
+    ok(lastUser.includes('［记忆系统自动附注') && lastUser.includes('一起听过晴天') && lastUser.includes('［附注结束')
+      && lastUser.indexOf('［附注结束') < lastUser.indexOf('你好 [A]'), 'T24 卡片放在附注里、在用户的话前面', lastUser);
+    ok(!d.mem.some(x => x.k === 'search'), 'T24 正式模式不再走旧的随机浮现（不调 /search）', d.mem.map(x => x.k));
+    ok(up.system[0].text.includes('生日：6 月 12 日') && up.system[0].text.includes('不是用户写的'), 'T24 事实接在画像后面；system 里说明附注不是用户说的', up.system[0].text.slice(-900));
+    ok(up.system.some(b => b.text === '[我们的章节]\n· 第 1 章「晴天」' && b.cache_control) && up.system.some(b => b.text.startsWith('[我们最近]') && b.cache_control)
+      && !up.system.some(b => b.text.startsWith('[共同经历叙事]')) && countCC(up) <= 4, 'T24 半静态块、日更块各一个缓存断点，不再放旧的叙事',
+      up.system.map(b => ({ t: b.text.slice(0, 12), cc: !!b.cache_control })));
+    const conf = d.mem.filter(x => x.k === 'confirm');
+    ok(conf.length === 1 && conf[0].b.turn_key === 'conv-sh:tsh1', 'T24 回复正常结束后确认投递', conf);
+    // 不进记忆的请求（标题生成等）不找 compose
     const m2 = mark();
     await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sh', memory_skip: true,
       pluvia: { v: '0.2', turn: { id: 'tsh2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '起个标题 [A]' }] }));
     await sleep(300);
-    ok(since(m2).mem.filter(x => x.k === 'compose').length === 0, 'T24 不进记忆的请求（标题生成等）不发 compose');
+    ok(since(m2).mem.filter(x => x.k === 'compose').length === 0, 'T24 不进记忆的请求（标题生成等）不找 compose');
+    // 正式模式但这一轮没想起什么：不确认；Kelivo 也走同一套
+    await setCompose({ mode: 'live', card: '' });
+    const m3 = mark();
+    const j3 = await (await fetch(GW + '/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', 'x-conversation-id': 'kel-c' },
+      body: JSON.stringify({ model: 'fake-model', stream: false, messages: [{ role: 'user', content: '在吗 [A]' }] }) })).json();
+    await sleep(300);
+    const d3 = since(m3), up3 = upReqs(d3)[0];
+    ok(j3.choices && d3.mem.filter(x => x.k === 'compose').length === 1 && !d3.mem.some(x => x.k === 'confirm')
+      && JSON.stringify(up3.messages).includes('[当前时间') && !JSON.stringify(up3.messages).includes('〈自动浮现'),
+      'T24 没想起什么：只有时间头，不确认', d3.mem.map(x => x.k));
+    // 记忆服务说是影子模式（Dashboard 关了「用新的召回」）：退回旧的随机浮现，不确认
+    await setCompose({ mode: 'shadow', system: 'error' });
+    const m4 = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-sh',
+      pluvia: { v: '0.2', turn: { id: 'tsh3', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '你好呀今天怎么样 [A]' }] }));
+    await sleep(300);
+    const d4 = since(m4), up4 = upReqs(d4)[0];
+    ok(d4.mem.filter(x => x.k === 'compose').length === 1 && !d4.mem.some(x => x.k === 'confirm') && up4 && up4.system.length >= 1
+      && !up4.system.some(b => b.text.startsWith('[我们的章节]')), 'T24 影子模式 / 拿不到新内容：退回旧逻辑，不确认', d4.mem.map(x => x.k));
+    await setCompose({});
   }
 
   console.log('T25 辅助请求（翻译等）可以指定模型：Dashboard「模块模型配置」→「辅助请求」');

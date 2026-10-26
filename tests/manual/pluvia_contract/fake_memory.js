@@ -31,6 +31,17 @@ app.get('/conv/:id/settings', (q, r) => r.json({}));
 app.post('/save_conversation', (q, r) => { log('save', q.body); r.json({ status: 'ok' }); });
 app.post('/thinking', (q, r) => { log('thinking', q.body); r.json({ ok: true }); });
 app.delete('/l0/conversation/:id', (q, r) => { log('delete', { id: q.params.id }); r.json({ status: 'ok', l1_removed: 2 }); });
-app.post('/compose/turn', (q, r) => { log('compose', q.body); r.json({ mode: 'shadow', card: '', picks: [] }); });
+// 召回：测试脚本用 POST /_test/compose 设置这一阵子的回答（mode / card / system）；不设置时是影子模式（网关走旧的随机浮现）
+let compose = {};
+app.post('/_test/compose', (q, r) => { compose = q.body || {}; r.json({ ok: true }); });
+app.post('/compose/turn', (q, r) => {
+  log('compose', q.body);
+  r.json({ mode: compose.mode || 'shadow', card: compose.card || '', turn_key: q.body.turn_key || 'tk-auto', picks: compose.card ? [{ id: 7 }] : [] });
+});
+app.post('/compose/confirm', (q, r) => { log('confirm', q.body); r.json({ status: 'ok', delivered: 1 }); });
+app.get('/compose/system', (q, r) => {
+  if (compose.system === 'error') return r.status(500).json({ status: 'error', message: '测试：出错' });
+  r.json({ status: 'ok', recall_live: compose.mode === 'live', profile_extra: '', semi: '', daily: '', ...(compose.system || {}) });
+});
 app.use((q, r) => { log('other', { path: q.path, method: q.method }); r.json({ status: 'ok' }); });
 app.listen(3998, '127.0.0.1', () => console.log('fake memory on 3998'));

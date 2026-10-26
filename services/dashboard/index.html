@@ -354,10 +354,10 @@
             </div>
         </div>
 
-        <!-- 召回对比（Phase 2 影子模式）-->
+        <!-- 召回（2026-10-26 起正式注入；以前的影子对比记录也在这里）-->
         <div id="recall" class="panel">
-            <h3>召回对比（影子模式）</h3>
-            <p style="font-size:13px;color:#666;line-height:1.7;margin:8px 0 14px;">每一轮聊天，网关照旧用现在的浮现逻辑；新的召回编排在旁边也算一遍，只记录、不注入。这里对比两边各会想起什么。<br>新逻辑：识别意图 → 向量 + 关键词检索 → 精排打分 → 分成强 / 中 / 回忆 / 无由来 → 冷却。点一行看详细过程。</p>
+            <h3>召回 <span id="rc-mode" style="font-size:13px;font-weight:normal;color:#666;"></span></h3>
+            <p style="font-size:13px;color:#666;line-height:1.7;margin:8px 0 14px;">每一轮聊天，记忆服务决定这一轮想起什么：识别意图（寒暄、日常报备不召回）→ 向量 + 关键词检索 → 精排打分 → 分成强 / 中 / 回忆 / 无由来 → 冷却。想起的放在用户消息最前面的「记忆系统自动附注」里，回复正常结束后才计入冷却。<br>「旧逻辑」一列是影子模式期间网关旧的随机浮现，正式以后就没有了。点一行看详细过程。</p>
             <div class="stat-grid" style="grid-template-columns:repeat(auto-fit,minmax(110px,1fr));">
                 <div class="stat-card"><div class="number" id="rc-turns">-</div><div class="label">近 7 天的轮数</div></div>
                 <div class="stat-card"><div class="number" id="rc-legacy">-</div><div class="label">旧逻辑注入了的</div></div>
@@ -367,15 +367,25 @@
             </div>
             <div style="margin:10px 0;"><button class="btn btn-small" onclick="loadRecall()">刷新</button>
                 <button class="btn btn-small" style="margin-left:6px;" onclick="toggleRecallSettings()">调参数</button>
+                <button class="btn btn-small" style="margin-left:6px;" onclick="toggleCompose()">聊天里放什么</button>
                 <button class="btn btn-small" style="margin-left:6px;" onclick="toggleGolden()">黄金集校准</button><span id="rc-intents" style="font-size:12px;color:#666;margin-left:10px;"></span></div>
             <div id="rc-golden" style="display:none;margin:10px 0 16px;padding:14px;background:#f8f8f8;border-radius:8px;font-size:13px;line-height:1.7;">
                 <div style="display:flex;justify-content:space-between;"><b>黄金集校准</b><a href="javascript:void(0)" onclick="toggleGolden()">收起</a></div>
                 <p style="color:#666;margin:6px 0 10px;">怎么标：点开下面任意一轮，在候选记忆旁边点「该想起」或「不该想起」；如果这一轮本来就不该想起任何事（比如寒暄、和过去无关的话），点「这一轮什么都不该想起」。标得越多建议越准，一般 30–50 轮就够，反例也要有一些。<br>这里只用当时存下的精排分来算，不花钱。标注只存在你的库里，不进仓库。</p>
                 <div id="rc-golden-body">加载中…</div>
             </div>
+            <div id="rc-compose" style="display:none;margin:10px 0 16px;padding:14px;background:#f8f8f8;border-radius:8px;font-size:13px;">
+                <div style="display:flex;justify-content:space-between;"><b>聊天里放什么</b><a href="javascript:void(0)" onclick="toggleCompose()">收起</a></div>
+                <p style="color:#666;line-height:1.7;margin:6px 0 10px;">每一轮发给模型的除了人格画像，还有下面这些（关掉哪一层就不放哪一层；章节、近七天关掉时放回旧的叙事、近期摘要）。保存后立即生效。<br>内容只在底下的数据变了时才变（大多是每天整理一次），同一天里多聊几轮都能用上缓存。</p>
+                <div id="rc-compose-form">加载中…</div>
+                <div style="margin-top:12px;"><button class="btn btn-small" onclick="saveCompose()">保存</button>
+                    <button class="btn btn-small" style="margin-left:6px;" onclick="previewCompose()">预览现在会放进去的</button>
+                    <span id="rc-compose-status" style="margin-left:8px;font-size:12px;"></span></div>
+                <div id="rc-compose-preview" style="margin-top:10px;"></div>
+            </div>
             <div id="rc-settings" style="display:none;margin:10px 0 16px;padding:14px;background:#f8f8f8;border-radius:8px;font-size:13px;">
                 <div style="display:flex;justify-content:space-between;"><b>召回参数</b><a href="javascript:void(0)" onclick="toggleRecallSettings()">收起</a></div>
-                <p style="color:#666;line-height:1.7;margin:6px 0 10px;">这些参数只影响新的召回逻辑，保存后立即生效，不用重启。现在还是影子模式（只记录、不注入），改完之后聊几句，在下面的对比记录里看效果；以后切到正式模式，才会真的影响聊天时想起什么。</p>
+                <p style="color:#666;line-height:1.7;margin:6px 0 10px;">保存后立即生效，不用重启。改完之后聊几句，在下面的记录里看效果。门槛在「黄金集校准」里可以按你标注的结果算建议值。</p>
                 <div id="rc-settings-form">加载中…</div>
                 <div style="margin-top:12px;"><button class="btn btn-small" onclick="saveRecallSettings()">保存</button>
                     <button class="btn btn-small" style="background:#999;margin-left:6px;" onclick="resetRecallSettings()">全部恢复默认</button>
@@ -1739,6 +1749,10 @@ function rebuildProfile() {
         }
 
         function loadRecall() {
+            fetch(API + '/compose/settings').then(function(r) { return r.json(); }).then(function(d) {
+                var live = (d.items || []).filter(function(it) { return it.key === 'recall_live'; })[0];
+                if (live) document.getElementById('rc-mode').textContent = live.value ? '（正式：想起的会放进聊天）' : '（影子模式：只记录，聊天里用旧的随机浮现）';
+            }).catch(function() {});
             fetch(API + '/recall/stats').then(function(r) { return r.json(); }).then(function(s) {
                 document.getElementById('rc-turns').textContent = s.turns;
                 document.getElementById('rc-legacy').textContent = s.legacy_inject_turns;
@@ -1765,6 +1779,70 @@ function rebuildProfile() {
             });
         }
 
+        // ---- 聊天里放什么（compose.*）：各层开关 + 预览 ----
+        var cpSettings = [];
+        function toggleCompose() {
+            var el = document.getElementById('rc-compose');
+            if (el.style.display === 'none') { el.style.display = 'block'; loadCompose(); }
+            else el.style.display = 'none';
+        }
+        function cpStatus(text, color) {
+            var st = document.getElementById('rc-compose-status');
+            st.textContent = text;
+            st.style.color = color || '#666';
+        }
+        function loadCompose() {
+            fetch(API + '/compose/settings').then(function(r) { return r.json(); }).then(renderCompose)
+                .catch(function(e) { document.getElementById('rc-compose-form').textContent = '加载失败：' + e; });
+        }
+        function renderCompose(d) {
+            cpSettings = d.items || [];
+            var html = '', section = null;
+            cpSettings.forEach(function(it) {
+                if (it.section !== section) {
+                    section = it.section;
+                    html += '<div style="margin:12px 0 4px;font-weight:bold;color:#555;">' + escapeHtml(section) + '</div>';
+                }
+                html += '<div style="display:flex;flex-wrap:wrap;align-items:center;gap:4px 10px;padding:6px 0;border-bottom:1px solid #eee;">'
+                    + '<input type="checkbox" id="cps-' + it.key + '"' + (it.value ? ' checked' : '') + '>'
+                    + '<label for="cps-' + it.key + '" style="min-width:130px;' + (it.overridden ? 'color:#5b6abf;font-weight:bold;' : '') + '">' + escapeHtml(it.label) + '</label>'
+                    + '<div style="flex-basis:100%;color:#888;font-size:12px;line-height:1.6;">' + escapeHtml(it.help) + '</div></div>';
+            });
+            document.getElementById('rc-compose-form').innerHTML = html;
+            var live = cpSettings.filter(function(it) { return it.key === 'recall_live'; })[0];
+            if (live) document.getElementById('rc-mode').textContent = live.value ? '（正式：想起的会放进聊天）' : '（影子模式：只记录，聊天里用旧的随机浮现）';
+        }
+        function saveCompose() {
+            var values = {}, n = 0;
+            cpSettings.forEach(function(it) {
+                var el = document.getElementById('cps-' + it.key);
+                if (el && el.checked !== it.value) { values[it.key] = el.checked; n++; }
+            });
+            if (!n) { cpStatus('没有改动'); return; }
+            if (values.recall_live === false && !confirm('关掉以后，聊天里改回以前的随机浮现（新逻辑只在旁边记录）。确定吗？')) return;
+            cpStatus('保存中…');
+            fetch(API + '/compose/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(rcHandle)
+                .then(function(d) { renderCompose(d); cpStatus('已保存 ' + n + ' 项，立即生效', '#28a745'); })
+                .catch(function(e) { cpStatus('没有保存：' + e.message, '#dc3545'); });
+        }
+        function previewCompose() {
+            var box = document.getElementById('rc-compose-preview');
+            box.textContent = '加载中…';
+            fetch(API + '/compose/system').then(rcHandle).then(function(d) {
+                var names = { facts: '事实', chapters: '章节', legacy_narrative: '旧的共同经历叙事', arcs: '主题线', lexicon: '共同语汇',
+                    state: '关系状态', digest: '近七天摘要', legacy_summary: '旧的近期摘要', episodes: '最近几天的片段', loops: '还没了结的事' };
+                var parts = [];
+                for (var k in (d.parts || {})) parts.push((names[k] || k) + ' ' + d.parts[k] + ' 字');
+                var block = function(title, text) {
+                    return '<div style="margin-top:10px;"><b>' + title + '</b>（' + (text || '').length + ' 字）</div>'
+                        + '<pre style="white-space:pre-wrap;background:#fff;padding:8px;border-radius:6px;max-height:360px;overflow:auto;">' + (escapeHtml(text || '') || '（空）') + '</pre>';
+                };
+                box.innerHTML = '<div style="color:#666;">放进去的：' + (parts.join('，') || '（没有）') + '</div>'
+                    + block('接在人格画像后面', d.profile_extra) + block('半静态块（每天变一次左右）', d.semi) + block('日更块', d.daily);
+            }).catch(function(e) { box.textContent = '加载失败：' + e.message; });
+        }
+
         // ---- 黄金集校准：按标注算各门槛的命中率 / 误浮现率 ----
         function toggleGolden() {
             var el = document.getElementById('rc-golden');
@@ -1778,19 +1856,20 @@ function rebuildProfile() {
                 var html = '<div>已标 <b>' + c.turns + '</b> 轮：该想起 ' + c.should + ' 条，不该想起 ' + c.should_not + ' 条，什么都不该想起 ' + c.none_turns + ' 轮'
                     + (c.skipped ? '（其中 ' + c.skipped + ' 轮当时精排失败，没有精排分，不算在内）' : '') + '</div>';
                 html += '<div>排序质量：该想起的排进前 5 的比例 <b>' + rcPct(q.recall_at_5) + '</b>；平均倒数排名（MRR）<b>' + (q.mrr == null ? '-' : q.mrr) + '</b>（1 表示每次都排第一）</div>';
-                html += '<div style="color:#888;font-size:12px;margin-top:4px;">命中率：标了「该想起」的记忆里，精排分达到这个门槛的比例（越高越好）。误浮现率：「不该想起」的记忆和「什么都不该想起」的轮次里，分数达到这个门槛的比例（越低越好）。当前精排模型：' + escapeHtml(cur.rerank_model || '') + '，换了模型以后旧的分数就不能直接比了。</div>';
-                html += '<div style="overflow-x:auto;"><table class="extraction-table" style="margin-top:8px;"><thead><tr><th>门槛</th><th>命中率</th><th>误浮现率</th><th></th></tr></thead><tbody>';
+                html += '<div style="color:#888;font-size:12px;margin-top:4px;">命中率：标了「该想起」的记忆里，精排分达到这个门槛的比例（越高越好）。误浮现率（按条）：「不该想起」的记忆和「什么都不该想起」的轮次里，分数达到这个门槛的比例。整轮误浮现：不该想起任何事的那些轮（' + (c.neg_turns || 0) + ' 轮）里，有一条够门槛的比例——也就是平常聊天时这一轮会冒出一件不相干的事的概率，比按条算的更能说明问题。当前精排模型：' + escapeHtml(cur.rerank_model || '') + '，换了模型以后旧的分数就不能直接比了。</div>';
+                html += '<div style="overflow-x:auto;"><table class="extraction-table" style="margin-top:8px;"><thead><tr><th>门槛</th><th>命中率</th><th>误浮现率（按条）</th><th>整轮误浮现</th><th></th></tr></thead><tbody>';
                 (d.rows || []).forEach(function(r) {
                     var tag = [];
                     if (Math.abs(r.t - cur.t_high) < 0.001) tag.push('现在的强门槛');
+                    if (cur.t_recall != null && Math.abs(r.t - cur.t_recall) < 0.001) tag.push('现在的回忆门槛');
                     if (Math.abs(r.t - cur.t_low) < 0.001) tag.push('现在的中门槛');
                     if (sg.ok && Math.abs(r.t - sg.t_high) < 0.001) tag.push('<b>建议强门槛</b>');
                     if (sg.ok && Math.abs(r.t - sg.t_low) < 0.001) tag.push('<b>建议中门槛</b>');
-                    html += '<tr' + (tag.length ? ' style="background:#eef0fb;"' : '') + '><td>' + r.t.toFixed(2) + '</td><td>' + rcPct(r.hit) + '</td><td>' + rcPct(r.fp) + '</td><td style="font-size:12px;">' + tag.join('、') + '</td></tr>';
+                    html += '<tr' + (tag.length ? ' style="background:#eef0fb;"' : '') + '><td>' + r.t.toFixed(2) + '</td><td>' + rcPct(r.hit) + '</td><td>' + rcPct(r.fp) + '</td><td>' + rcPct(r.turn_fp) + '</td><td style="font-size:12px;">' + tag.join('、') + '</td></tr>';
                 });
                 html += '</tbody></table></div>';
                 if (sg.ok) {
-                    html += '<div style="margin-top:8px;">建议：强门槛 <b>' + sg.t_high + '</b>（误浮现率不超过 ' + rcPct(d.targets.fp) + ' 的最低值），中门槛 <b>' + sg.t_low + '</b>（命中率还能保住 ' + rcPct(d.targets.hit) + ' 的最高值）。'
+                    html += '<div style="margin-top:8px;">建议：强门槛 <b>' + sg.t_high + '</b>（' + (sg.by_turn ? '整轮' : '按条算的') + '误浮现率不超过 ' + rcPct(d.targets.fp) + ' 的最低值），中门槛 <b>' + sg.t_low + '</b>（命中率还能保住 ' + rcPct(d.targets.hit) + '，同时平常一轮因为「中」冒出不相干的事不超过 ' + rcPct(d.targets.medium_fp) + '）。'
                         + ' <button class="btn btn-small" onclick="applyGoldenSuggestion(' + sg.t_high + ',' + sg.t_low + ')">填进「调参数」</button></div>';
                     (sg.notes || []).forEach(function(n) { html += '<div style="color:#c77;font-size:12px;">' + escapeHtml(n) + '</div>'; });
                 } else {
@@ -1938,7 +2017,8 @@ function rebuildProfile() {
                 html += '<div>精排：' + (rr.skipped ? escapeHtml(rr.skipped) : (rr.ok ? (escapeHtml(rr.model || '') + '，' + rr.ms + 'ms') : ('失败：' + escapeHtml(rr.error || '') + '，改用向量相似度'))) + '</div>';
                 if (ch.time && ch.time.ranges) html += '<div>时间：' + ch.time.ranges.map(function(r) { return '「' + escapeHtml(r.label) + '」' + (r.from === r.to ? r.from : r.from + ' ~ ' + r.to); }).join('、')
                     + '，这段时间里的记忆 ' + (ch.time.hits || []).length + ' 条（在这段时间里的候选会加分）</div>';
-                if (dec.params) html += '<div>这一轮用的参数：强门槛 ' + dec.params.t_high + '，中门槛 ' + dec.params.t_low + '，中层概率 ' + dec.params.medium_prob
+                if ((dec.episodes || []).length) html += '<div>那段时间的每日片段：' + dec.episodes.map(function(e) { return '#' + e.id + '（' + escapeHtml(e.day || '') + '，精排 ' + (e.rerank == null ? '-' : Number(e.rerank).toFixed(3)) + '）' + ((dec.episode_picks || []).indexOf(e.id) >= 0 ? ' <b>放进去了</b>' : ''); }).join('；') + '</div>';
+                if (dec.params) html += '<div>这一轮用的参数：强门槛 ' + dec.params.t_high + '，中门槛 ' + dec.params.t_low + (dec.params.t_recall != null ? '，回忆门槛 ' + dec.params.t_recall : '') + '，中层概率 ' + dec.params.medium_prob
                     + '，向量兜底 ' + dec.params.min_sim + '，每轮最多 ' + dec.params.max_picks + ' 条</div>';
                 var none = labels['0'] === 'none';
                 html += '<div style="margin-top:8px;display:flex;flex-wrap:wrap;align-items:center;gap:6px;"><b>候选（按精排分）</b>'
@@ -1957,7 +2037,7 @@ function rebuildProfile() {
                 });
                 html += '</tbody></table>';
                 if ((dec.dropped || []).length) html += '<div>被冷却拿掉的：' + dec.dropped.map(function(x) { return name(x.id) + '（' + escapeHtml(x.reason) + '）'; }).join('；') + '</div>';
-                html += '<div style="margin-top:8px;"><b>新逻辑会注入的文字</b></div><pre style="white-space:pre-wrap;background:#fff;padding:8px;border-radius:6px;">' + (escapeHtml(t.card || '') || '（不注入）') + '</pre>';
+                html += '<div style="margin-top:8px;"><b>' + (t.mode === 'live' ? '这一轮放进附注的文字' : '新逻辑会注入的文字（影子模式，没放进去）') + '</b></div><pre style="white-space:pre-wrap;background:#fff;padding:8px;border-radius:6px;">' + (escapeHtml(t.card || '') || '（不注入）') + '</pre>';
                 if (lg.candidates && lg.candidates.length) {
                     html += '<div><b>旧逻辑的候选（向量相似度，门槛 0.55）</b>：' + lg.candidates.map(function(c) { return name(c[0]) + ' ' + Number(c[1]).toFixed(3); }).join('；') + '</div>';
                 }
