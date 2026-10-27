@@ -647,6 +647,103 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(s3.text === KAO && !bad(s3), 'T28 OpenAI 格式的上游（翻译思维链这类辅助请求）：完好', s3);
   }
 
+  console.log('T29 换窗衔接：窗口里的指纹、附注加在哪几条前面（方案第 16 章）');
+  {
+    const setCompose = async b => { await fetch('http://127.0.0.1:3998/_test/compose', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b || {}) }); };
+    const N0 = '［记忆系统附注｜窗口里最早的一条是 10 月 19 日（周一）21:00 的，更早的对话已经不在窗口里了。］';
+    const N2 = '［记忆系统附注｜和上一句隔了 12 小时（10 月 19 日（周一）21:18 → 10 月 20 日（周二）08:55）。］';
+    await setCompose({ mode: 'live', card: '', window: { notes: [{ i: 0, text: N0 }, { i: 1, text: '［不该加在 AI 的话上］' }, { i: 2, text: N2 }],
+      turn_note: '[新窗口] 这是新开的窗口（测试）。' } });
+    const tail = '（此刻：10月20日 周二 09:00）';
+    const hist = [{ role: 'user', content: '早安～' }, { role: 'assistant', content: '[工具记录 · 查天气 · 晴]\n好呀\n[图片：猫.jpg]\n[链接卡片 · 站点] 标题' },
+      { role: 'user', content: '今天去上课 [A]' }, { role: 'assistant', content: '路上小心' }, { role: 'user', content: '到教室啦 [A]\n\n' + tail }];
+    let m = mark();
+    const s = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-win',
+      pluvia: { v: '0.2', turn: { id: 'tw1', round: 1 }, tail }, messages: hist })));
+    await sleep(400);
+    let d = since(m);
+    const w = d.mem.filter(x => x.k === 'window');
+    const e = w[0] && w[0].b.entries;
+    ok(s.text === '你好呀' && w.length === 1 && w[0].b.conv_id === 'conv-win' && e && e.length === 4 && !w[0].b.link,
+      'T29 每一轮问一次 compose/window，带上这一轮之前的 4 条（不含这一轮的话）', w[0] && w[0].b);
+    ok(e && e[0].r === 'u' && e[0].h === '5b18fe3e3260' && e[1].r === 'a' && e[1].h === 'bcea416799bf',
+      'T29 指纹和记忆服务算的一样（AI 的话按存 L0 的写法去掉工具记录和链接卡片）', e);
+    const up = upReqs(d)[0];
+    const msg = i => JSON.stringify(up.messages[i].content);
+    ok(msg(0).startsWith('"' + N0) && msg(0).includes('早安～') && msg(2).includes(N2) && msg(2).indexOf(N2) < msg(2).indexOf('今天去上课'),
+      'T29 附注加在那几条用户的话最前面', [msg(0), msg(2)]);
+    ok(!msg(1).includes('不该加') && !msg(3).includes('附注'), 'T29 AI 的话上不加', [msg(1), msg(3)]);
+    const last = JSON.stringify(up.messages.slice(-1));
+    ok(last.includes('[新窗口] 这是新开的窗口（测试）。') && last.indexOf('[新窗口]') < last.indexOf('［附注结束') && !last.includes(N0),
+      'T29 新窗口那段放在这一轮的附注里', last);
+    const sv = saves(d);
+    ok(sv.length === 1 && sv[0].b.messages[0].content === '早安～' && sv[0].b.messages[2].content === '今天去上课 [A]'
+      && !JSON.stringify(sv[0].b).includes('记忆系统附注'), 'T29 附注不存进记忆库', sv[0] && sv[0].b.messages.slice(0, 3));
+    ok(up.system[0].text.includes('［记忆系统附注｜……］') && up.system[0].text.includes('不要模仿这种写法'), 'T29 system 里说明历史里的附注是系统加的');
+
+    // Anthropic 格式（块数组）：附注是前面多一个文本块；缓存断点不变
+    const H = { 'x-api-key': 'x', 'anthropic-version': '2023-06-01' };
+    m = mark();
+    await sseCollect(await post('/v1/messages', { model: 'fake-model', stream: true, max_tokens: 1000, conversation_id: 'conv-win2',
+      pluvia: { v: '0.2', turn: { id: 'tw2', round: 1 }, tail: '' },
+      messages: [{ role: 'user', content: [{ type: 'text', text: '早安～' }] }, { role: 'assistant', content: [{ type: 'text', text: '好呀' }] },
+        { role: 'user', content: [{ type: 'text', text: '今天去上课 [A]' }] }, { role: 'assistant', content: [{ type: 'text', text: '路上小心' }] },
+        { role: 'user', content: [{ type: 'text', text: '到教室啦 [A]', cache_control: { type: 'ephemeral' } }] }] }, H));
+    await sleep(400);
+    d = since(m);
+    const up2 = upReqs(d)[0];
+    ok(up2 && Array.isArray(up2.messages[0].content) && up2.messages[0].content[0].text === N0 && up2.messages[0].content[1].text === '早安～'
+      && up2.messages[2].content[0].text === N2 && countCC(up2) <= 4, 'T29 Anthropic 格式：附注是前面多一个文本块，缓存断点不变',
+      up2 && up2.messages.slice(0, 3));
+
+    // Kelivo（不带 pluvia）：一样加
+    m = mark();
+    await (await fetch(GW + '/v1/chat/completions', { method: 'POST', headers: { 'content-type': 'application/json', 'x-conversation-id': 'kel-w' },
+      body: JSON.stringify({ model: 'fake-model', stream: false, messages: [{ role: 'user', content: '早安～' }, { role: 'assistant', content: '好呀' },
+        { role: 'user', content: '今天去上课 [A]' }, { role: 'assistant', content: '路上小心' }, { role: 'user', content: '在吗 [A]' }] }) })).json();
+    await sleep(300);
+    d = since(m);
+    ok(d.mem.filter(x => x.k === 'window').length === 1 && JSON.stringify(upReqs(d)[0].messages[2]).includes(N2), 'T29 Kelivo 也加');
+
+    // 记忆服务出错 / 太慢：照常聊天，不加附注
+    for (const mode of ['error', 'slow']) {
+      await setCompose({ mode: 'live', card: '', window: mode });
+      m = mark();
+      const t0 = Date.now();
+      const s2 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-win3',
+        pluvia: { v: '0.2', turn: { id: 'tw3' + mode, round: 1 }, tail: '' }, messages: hist.slice(0, 4).concat([{ role: 'user', content: '在吗 [A]' }]) })));
+      await sleep(300);
+      d = since(m);
+      ok(s2.text === '你好呀' && !JSON.stringify(upReqs(d)[0].messages).includes('［慢］') && Date.now() - t0 < 4000,
+        `T29 compose/window ${mode === 'error' ? '出错' : '太慢（超过 2 秒）'}：照常聊天，这一轮不加`, { text: s2.text, ms: Date.now() - t0 });
+    }
+    await setCompose({});
+  }
+
+  console.log('T30 挑选式搬家：pluvia.forged_from（约定 14）');
+  {
+    const c = await (await fetch(GW + '/v1/pluvia/contract')).json();
+    ok(c.features.includes('forged_from') && c.features.includes('window_notes'), 'T30 能力协商里有 forged_from、window_notes', c);
+    const hist = [{ role: 'user', content: '早 [A]' }, { role: 'assistant', content: '早呀' }, { role: 'user', content: '搬家后第一句 [A]' }];
+    const send = async (conv, tid, f) => {
+      const m = mark();
+      await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: conv,
+        pluvia: { v: '0.2', turn: { id: tid, round: 1 }, tail: '', ...(f !== undefined ? { forged_from: f } : {}) }, messages: hist }));
+      await sleep(300);
+      const d = since(m);
+      return { sv: saves(d), win: d.mem.filter(x => x.k === 'window') };
+    };
+    let r = await send('conv-fg', 'tfg1', { conversation_id: 'conv-old', carried: 2 });
+    ok(r.sv.length === 1 && r.sv[0].b.forged_from && r.sv[0].b.forged_from.conversation_id === 'conv-old' && r.sv[0].b.forged_from.carried === 2
+      && r.sv[0].b.messages.length === 4, 'T30 存记录时带上 forged_from（由记忆服务去掉搬过来的那几条）', r.sv[0] && r.sv[0].b);
+    ok(r.win.length === 1 && r.win[0].b.link && r.win[0].b.link.kind === 'forged' && r.win[0].b.link.conversation_id === 'conv-old'
+      && r.win[0].b.link.carried === 2, 'T30 问窗口附注时也带上（第一轮还没登记，记忆服务直接和旧会话对）', r.win[0] && r.win[0].b.link);
+    r = await send('conv-fg2', 'tfg2', { carried: 3 });
+    ok(r.sv.length === 1 && !('forged_from' in r.sv[0].b) && !r.win[0].b.link, 'T30 没有 conversation_id 的当没带', r.sv[0] && r.sv[0].b);
+    r = await send('conv-fg3', 'tfg3', { conversation_id: 'conv-old', carried: 'x' });
+    ok(r.sv.length === 1 && r.sv[0].b.forged_from && r.sv[0].b.forged_from.carried === null, 'T30 carried 不是数字：当没说', r.sv[0] && r.sv[0].b.forged_from);
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

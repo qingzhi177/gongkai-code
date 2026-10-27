@@ -36,6 +36,11 @@ const SESSION_GAP_THRESHOLD_HOURS = 4;   // 会话间隔感知阈值
 const COMPOSE_ON = String(process.env.GATEWAY_COMPOSE || 'on').trim().toLowerCase() !== 'off';
 const COMPOSE_TURN_TIMEOUT_MS = 4500;      // 嵌入 + 精排一般 1–3 秒（p90 约 3 秒）；超过就这一轮不放记忆，不让回复等太久
 const COMPOSE_SYSTEM_TTL_MS = 3000;        // 同一条回复的几轮工具调用里不重复取
+// 换窗衔接（方案第 16 章）：窗口里哪几条前面加附注（窗口开头那条几点的、滑出窗口那段的小结、隔了很久的地方、
+// 新窗口接上一个窗口、挑选式搬家的断口），由记忆服务的 /compose/window 决定。只加在发给模型的消息里，不存 L0。
+// GATEWAY_WINDOW_NOTES=off 关掉（Dashboard「换窗衔接」页也能分项关）。
+const WINDOW_NOTES_ON = COMPOSE_ON && String(process.env.GATEWAY_WINDOW_NOTES || 'on').trim().toLowerCase() !== 'off';
+const WINDOW_TIMEOUT_MS = 2000;            // 只读库，一般几十毫秒
 
 // bug修复：工具回环短路时不请求上游、没有真实 usage。缓存上一轮真实回答的 usage（按 conv_id），
 // 回环时取出返回，避免 Kelivo 把已显示的 token 数用 0 覆盖（工具场景显示 0 的根因）。
@@ -279,7 +284,7 @@ function buildTurnMessages(messages, aiText) {
 
 // ============ Pluvia 接入约定 v0.2（docs/plan/pluvia-gateway-contract.md） ============
 // 只有 body 里带了 pluvia 对象的请求才走 v0.2 逻辑；Kelivo 等其它客户端的路径不变。
-const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of'] };
+const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes'] };
 
 // 网关时间头：auto（默认）= 前端已经带了「此刻：」就不再加 [当前时间]、带了「离上一句」就不再加 [距上次对话]，
 // 免得模型同时看到两个钟；on = 总是加；off = 都不加。在 .env 里设 GATEWAY_TIME_HEADER 修改。
@@ -298,7 +303,8 @@ function pluviaCtx(req) {
       v: String(p.v || ''), turn, tail: typeof p.tail === 'string' ? p.tail : null,
       system: p.system === 'append' ? 'append' : 'ignore',                      // 约定 8.1
       aux: (typeof p.aux === 'string' && p.aux.trim()) ? p.aux.trim() : null,   // 约定 8.5
-      branch_of: pluviaBranchOf(p.branch_of)                                    // 约定 12：分支会话
+      branch_of: pluviaBranchOf(p.branch_of),                                   // 约定 12：分支会话
+      forged_from: pluviaForgedFrom(p.forged_from)                              // 约定 14：挑选式搬家
     };
   }
   req._pv = ctx;
@@ -311,6 +317,13 @@ function pluviaBranchOf(b) {
   if (!cid || cid.length > 200) return null;
   const tid = b.turn_id == null ? null : String(b.turn_id).slice(0, 200);
   return { conversation_id: cid, turn_id: tid };
+}
+// 挑选式搬家（约定 14）：{ conversation_id: 旧会话, carried?: 带过来几条 }。不合法就当没带
+function pluviaForgedFrom(f) {
+  const b = pluviaBranchOf(f);
+  if (!b) return null;
+  const n = parseInt(f.carried, 10);
+  return { conversation_id: b.conversation_id, carried: Number.isFinite(n) && n >= 0 ? n : null };
 }
 function isPluviaClient(req) {
   return String(req.headers['x-client-name'] || '').trim().toLowerCase() === 'pluvia' || !!pluviaCtx(req);
@@ -434,6 +447,67 @@ function clientClockFlags(req, rawLastUserText) {
     src = raw.slice(stripClientStamp(raw).length);   // 只看被兜底规则认出来的末尾那几段
   }
   return { hasClock: /（\s*此刻：/.test(src), hasGap: /（\s*离上一句/.test(src) };
+}
+
+// ---- 换窗衔接：窗口里每条消息的指纹（和记忆服务 app/windows.py 的 hash_text 一致），附注加在哪几条前面 ----
+const WIN_IMG_RE = /\[图片(?:：[^\]\n]*)?\]/g;
+// 和记忆服务一致的空白字符（不用 \s：JavaScript 和 Python 的 \s 不完全一样）
+const WIN_WS_RE = /[\t\n\v\f\r \x1c-\x1f\x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/g;
+function windowNorm(text) {
+  const raw = text || '';
+  const s = raw.replace(WIN_IMG_RE, '').replace(WIN_WS_RE, '');
+  if (s) return s;
+  const n = (raw.match(WIN_IMG_RE) || []).length;
+  return n ? '[图片]'.repeat(n) : raw.replace(WIN_WS_RE, '');
+}
+function windowHash(role, text) {
+  return crypto.createHash('sha1').update((role === 'user' ? 'u' : 'a') + '\u0000' + windowNorm(text), 'utf8').digest('hex').slice(0, 12);
+}
+// 窗口里这一轮之前的消息 → [{ i: 在 req.body.messages 里的下标, r: 'u'|'a', h: 指纹 }]。
+// 写法和存 L0 时一样（cleanMessagesForSave）：剥掉「此刻」和 Pluvia 的工具记录 / 链接卡片，工具结果不算，
+// 相邻一样的算一条，Pluvia 一条回复拆成几条的合成一条（下标取第一条）。这样才和库里那一行对得上。
+function windowEntries(req, lastUserIdx) {
+  const pv = pluviaCtx(req);
+  const msgs = pv ? memoryMessages(req) : (Array.isArray(req.body.messages) ? req.body.messages : []);
+  const stripStamp = pv ? !req._tailOk : true;
+  const out = [];
+  let lastAssistantText = null, afterToolResult = false;
+  for (let i = 0; i < lastUserIdx && i < msgs.length; i++) {
+    const m = msgs[i];
+    const isToolResult = !!(m && m.role === 'user' && Array.isArray(m.content) &&
+      m.content.some(b => b && typeof b === 'object' && b.type === 'tool_result'));
+    const raw = m ? toPlainText(m.content).trim() : '';
+    if (m && m.role === 'assistant' && raw && afterToolResult && lastAssistantText && dedupKey(raw) === dedupKey(lastAssistantText)) {
+      afterToolResult = false;
+      continue;
+    }
+    if (isToolResult) afterToolResult = true;
+    else if (m && m.role === 'assistant' && raw) { lastAssistantText = raw; afterToolResult = false; }
+    else afterToolResult = false;
+    if (!m || m.role === 'system' || m.role === 'tool') continue;
+    let text = (m.role === 'user' && stripStamp) ? stripClientStamp(toPlainText(m.content)) : toPlainText(m.content);
+    if (pv && m.role === 'assistant') text = stripPluviaAssistantDecor(text).trim();
+    if (!text) continue;
+    const last = out[out.length - 1];
+    if (last && last.role === m.role && dedupKey(last.text) === dedupKey(text)) continue;
+    if (pv && last && last.role === 'assistant' && m.role === 'assistant') { last.text += '\n\n' + text; continue; }
+    out.push({ i, role: m.role, text });
+  }
+  return out.map(e => ({ i: e.i, r: e.role === 'user' ? 'u' : 'a', h: windowHash(e.role, e.text) }));
+}
+// 附注加在那几条用户消息的最前面（字符串前面加一行；块数组前面加一个文本块）。只改发给模型的副本。
+function applyWindowNotes(messages, entries, notes) {
+  if (!notes || !notes.length || !entries) return messages;
+  const out = messages.slice();
+  for (const n of notes) {
+    const e = entries[n.i];
+    if (!e || !n.text) continue;
+    const m = out[e.i];
+    if (!m || m.role !== 'user') continue;
+    if (typeof m.content === 'string') out[e.i] = { ...m, content: n.text + '\n' + m.content };
+    else if (Array.isArray(m.content)) out[e.i] = { ...m, content: [{ type: 'text', text: n.text }, ...m.content] };
+  }
+  return out;
 }
 
 // ---- client_tools：一条回复（turn）在网关这边的状态，按 (conversation_id, turn.id) 存 10 分钟 ----
@@ -986,7 +1060,7 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
     // 查不到上次时间时静默跳过，不影响主流程
   }
 
-  // 3. 头部（时间锚点 + 可选的间隔感知）
+  // 3. 头部（时间锚点 + 可选的间隔感知 + 新窗口接上一个窗口）
   const headerLines = [];
   if (showClock) headerLines.push(`[当前时间：${currentDateStr}（${USER_TZ_LABEL}）]`);
   if (sessionNote) headerLines.push(`[${sessionNote}]`);
@@ -1002,6 +1076,8 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
   } else if (!skip && (!COMPOSE_ON || (r && r.mode === 'shadow'))) {
     card = await legacySurfacing(userMessage, convId, menuCtx);
   }
+  const win = menuCtx && menuCtx.windowP ? await menuCtx.windowP : null;   // 和找记忆同时在问，这里一般早就回来了
+  if (win && win.turn_note) headerLines.push(win.turn_note);
   return frameMemoryNote(headerLines, card);
 }
 
@@ -1029,6 +1105,27 @@ async function composeTurn(userMessage, convId, menuCtx) {
     return d;
   } catch (e) {
     console.log('[COMPOSE] compose/turn 失败（这一轮不放记忆）:', e.message);
+    return null;
+  }
+}
+
+// 窗口里要加的附注（/compose/window）。失败就这一轮不加（不影响聊天）
+async function getWindowNotes(convId, entries, pv) {
+  const link = pv && pv.forged_from ? { kind: 'forged', conversation_id: pv.forged_from.conversation_id, carried: pv.forged_from.carried }
+    : pv && pv.branch_of ? { kind: 'branch', conversation_id: pv.branch_of.conversation_id } : undefined;
+  try {
+    const r = await axios.post(`${MEMORY_SERVICE_URL}/compose/window`, {
+      conv_id: convId || '', entries: entries.map(({ r, h }) => ({ r, h })), link
+    }, { timeout: WINDOW_TIMEOUT_MS });
+    const d = r.data || {};
+    if (d.status !== 'ok') { console.log('[WINDOW] compose/window 出错:', d.message || ''); return null; }
+    const info = d.info || {};
+    console.log(`[WINDOW] 窗口 ${entries.length} 条，对上 ${info.matched || 0} 条，附注 ${(d.notes || []).length} 处`
+      + (info.frozen ? '（开头沿用）' : '') + (info.needs ? `，要写小结 ${info.needs} 块` : '') + (d.turn_note ? '，新窗口' : '')
+      + ` | ${info.ms}ms`);
+    return d;
+  } catch (e) {
+    console.log('[WINDOW] compose/window 失败（这一轮不加窗口附注）:', e.message);
     return null;
   }
 }
@@ -2345,11 +2442,14 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
     { stripStamp: !req._tailOk, mergeAssistant: true, pluviaDecor: true });
   // 分支会话：告诉记忆服务从哪里分出来，和原会话重合的那段历史只在原会话名下存一份（约定 12）
   const branchOf = (pv.branch_of && pv.branch_of.conversation_id !== convId) ? pv.branch_of : undefined;
+  // 挑选式搬家：从旧会话挑过来的几段只在旧会话名下存一份（约定 14）
+  const forgedFrom = (pv.forged_from && pv.forged_from.conversation_id !== convId) ? pv.forged_from : undefined;
   axios.post(MEMORY_SERVICE_URL + '/save_conversation', {
-    conv_id: convId, client: req.headers['x-client-name'] || 'pluvia', messages: cleaned, branch_of: branchOf
+    conv_id: convId, client: req.headers['x-client-name'] || 'pluvia', messages: cleaned, branch_of: branchOf, forged_from: forgedFrom
   }).then(r => {
-    if (branchOf && r.data && r.data.branch_shared != null)
-      console.log(`[PLUVIA] 分支会话 ${convId}（从 ${branchOf.conversation_id} 分出）：和原会话重合 ${r.data.branch_shared} 条，不重复存`);
+    const link = forgedFrom || branchOf;
+    if (link && r.data && r.data.branch_shared != null)
+      console.log(`[PLUVIA] ${forgedFrom ? '搬家' : '分支'}会话 ${convId}（从 ${link.conversation_id} ${forgedFrom ? '搬来' : '分出'}）：和原会话重合 ${r.data.branch_shared} 条，不重复存`);
   }).catch(err => console.error('保存对话失败:', err.message));
   updateDisplayMetrics(shownIds);
   const thinkText = allThinks.join('\n\n');
@@ -2525,6 +2625,10 @@ async function chatCompletionsMain(req, res) {
     // shownIds：本轮浮现的记忆 id，回复成功后再计入展示指标；shadow：影子对比用的上文（Phase 2）
     const menuCtx = { shownIds: [], skipShadow: isTitleGenerationRequest(req),
       shadow: shadowContext(req, lastUserIdx, pv, convIdForMenu) };
+    // 换窗衔接：和找记忆同时问记忆服务窗口里哪几条前面要加附注（续问沿用第 1 轮的，标题生成这类不加）
+    const winEntries = (WINDOW_NOTES_ON && !pvContinuing && !menuCtx.skipShadow && lastUserIdx >= 0)
+      ? windowEntries(req, lastUserIdx) : null;
+    menuCtx.windowP = winEntries ? getWindowNotes(convIdForMenu, winEntries, pv) : null;
     // 放进 system 的新内容（/compose/system）拿得到就用它；拿不到（记忆服务出错、GATEWAY_COMPOSE=off）用旧的叙事和近期摘要
     const [profile, memoryMenu, composed, customPrompt] = await Promise.all([
       getProfile(),
@@ -2574,6 +2678,8 @@ ${profile}${profileFacts}
 用户的消息最前面有时会有一段「［记忆系统自动附注］……［附注结束］」：里面是现在的时间、距上次聊天多久，以及记忆系统按这句话自动找出来的几条记忆。这一段是系统每一轮自动加的，不是用户写的，用户也看不到；用户并没有特意翻出这些记忆，也没有在提它们。每条记忆冒号前面是它发生的大概时间（比如「大约一个月前（今年初秋）」），不是称呼。附注之后才是用户这一轮真正说的话。
 
 这些是我们曾经共同经历过的一点痕迹，可能与当前话题有关，也可能无关。不要刻意复述它们，不用逐条回应，也不要说「系统告诉我」「附注里写着」；只有在它们真的相关、真的有助于理解当前交流时，才自然地用上。
+
+历史消息里，有的用户消息最前面还有一行「［记忆系统附注｜……］」：写的是窗口里最早那条是几点的、更早滑出窗口的那段我记下的几句、和上一句隔了多久（或者中间省略了几条）、新开的窗口接着上一个窗口的哪里。它们也是系统加的，不是用户说的，用户看不到；只是帮你弄清时间和前后，不用回应，也不要模仿这种写法。
 
 记忆片段只是部分提醒，不代表所有相关记忆都已列出。如果你觉得某个话题以前聊过但没看到相关片段，可以用 recall 去找（exact 模式能搜到原始对话）。`;
 
@@ -2625,10 +2731,13 @@ ${profile}${profileFacts}
       }
     }
 
+    // 换窗衔接的附注加在发给模型的副本里（存 L0 用的是 req.body.messages，不受影响）
+    const win = menuCtx.windowP ? await menuCtx.windowP : null;
+    const upMessages = win ? applyWindowNotes(messages, winEntries, win.notes) : messages;
     // Pluvia：OpenAI 格式先转成 Anthropic 格式（工具调用/工具结果/图片），续问时直接用接回的那一轮。
     const augmentedMessages = cont ? cont.messages
-      : (pvClient && !req.body._anthropicFormat) ? oaMessagesToAnthropic(messages)
-      : messages.filter(m => m.role !== 'system').map(m => ({ ...m }));
+      : (pvClient && !req.body._anthropicFormat) ? oaMessagesToAnthropic(upMessages)
+      : upMessages.filter(m => m.role !== 'system').map(m => ({ ...m }));
     if (!cont && memoryMenu && memoryMenu.trim()) {
       for (let i = augmentedMessages.length - 1; i >= 0; i--) {
         if (augmentedMessages[i].role !== 'user') continue;

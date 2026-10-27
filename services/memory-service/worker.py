@@ -208,6 +208,7 @@ def build_handlers():
     # 生成逻辑在 app/pipeline/ 里（从 main.py 拆出来的），worker 不用再导入整个 main.py
     import extract_l1
     from app.pipeline import arcs as arc_pipeline
+    from app.pipeline import bridge as bridge_pipeline
     from app.pipeline import chapters as chapter_pipeline
     from app.pipeline import digests as digest_pipeline
     from app.pipeline import episodes as episode_pipeline
@@ -301,6 +302,9 @@ def build_handlers():
     async def facts_scan(payload, job):
         return await facts_pipeline.scan()
 
+    async def window_bridge(payload, job):
+        return await bridge_pipeline.run(payload["conv_id"])
+
     async def state_refresh(payload, job):
         return await state_pipeline.refresh(force=bool(payload.get("force")))
 
@@ -321,7 +325,8 @@ def build_handlers():
             "settle_day": settle_day, "route_arcs": route_arcs, "narrate_arc": narrate_arc,
             "digest_day": digest_day, "digest_week": digest_week, "digest_recent": digest_recent,
             "lexicon_scan": lexicon_scan, "loops_scan": loops_scan, "facts_scan": facts_scan,
-            "state_refresh": state_refresh, "write_chapter": write_chapter, "propose_chapters": propose_chapters}
+            "state_refresh": state_refresh, "write_chapter": write_chapter, "propose_chapters": propose_chapters,
+            "window_bridge": window_bridge}
 
 
 def main():

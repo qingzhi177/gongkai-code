@@ -11,7 +11,7 @@
 - 统计信号（每天几条消息、几点来、心情走向）只在 Dashboard 上给你看，不放进卡片。
 - 话题边界 topic_policies：normal（正常）/ explicit_only（你提起时才提）/ excluded（不主动提起）。
   现在用在状态卡上；以后召回也会照着它来。
-现在只生成、只在 Dashboard 上看，不放进聊天。
+状态卡放进聊天（app/compose.py，不带每轮都变的「上次聊天」那一行）。
 """
 import hashlib
 import json

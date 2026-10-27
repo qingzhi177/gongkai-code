@@ -165,6 +165,7 @@
             <button class="tab" onclick="showPanel('facts')">事实</button>
             <button class="tab" onclick="showPanel('state')">关系状态</button>
             <button class="tab" onclick="showPanel('chapters')">章节</button>
+            <button class="tab" onclick="showPanel('windows')">换窗衔接</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -459,7 +460,7 @@
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
                 每天把聊天整理成几段「我们的经历」，每个具体细节都标了出处，可以点开对照原文；对不上原文的句子会被自动删掉。
                 凌晨 4 点前算前一天；一天结束（或者安静 6 小时）以后自动整理，之后又有新消息就重新整理那一天。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后它是主题卷、章节、近七天摘要的素材。
+                <b>已经放进聊天</b>：最近两个聊过天的日子的片段标题；话里提到某段时间（昨天、上周三……）时，那段时间的片段也会浮现。它也是主题卷、章节、近七天摘要的素材。（「召回对比」页的「聊天里放什么」可以关掉）
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="ep-enabled" onchange="setEpisodesEnabled(this.checked)"> 自动整理</label>
@@ -481,7 +482,7 @@
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
                 把每日片段按主题归成一条条跨越时间的长线（比如「一起听歌」「下雨天」）。新主题积累到 3 个片段、跨 2 天以上，会在这里请你确认；
                 确认以后自动写成一卷，之后每攒够 2 个新片段追加一小节。每句都标了出处，可以点开对照。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后聊天时只放卷的目录（标题 + 一句话）。
+                <b>已经放进聊天</b>：进行中的卷，每条一行（标题 + 一句话）。
             </div>
             <div style="margin-bottom:14px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="arc-enabled" onchange="setArcsEnabled(this.checked)"> 自动归卷和写卷</label>
@@ -503,7 +504,7 @@
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
                 只有我们之间才懂的称呼、小梗、固定说法、口头禅、歌……每天整理完对话以后自动找；每个词都必须在原文里一字不差地出现过，
                 次数、天数、谁先说的都按原文直接数。在两天以上的对话里出现过的自动收下，只出现过一天的放在候选里等你看。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后聊天时提到这些词，会附上一行它的来处。
+                <b>已经放进聊天</b>：收下的称呼、梗、固定说法和它们的意思（称呼在前、常用的在前，有长度上限）。
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="lx-enabled" onchange="setLexEnabled(this.checked)"> 自动找</label>
@@ -530,7 +531,7 @@
                 答应过的事、一起的计划、在等的结果、放在心上的牵挂、说好下次再聊的话题、定期的约定……每天整理完对话以后自动找，每一件都附一句原话做证据。
                 之后的对话里有了下文（比如结果出来了），会自动标成「有结果了」并记下后续。每件事都可以选跟进方式：<b>相关时可以提</b>、<b>到期时才提</b>、<b>不主动提</b>
                 （标了「不主动提」的，我永远不会主动问起，只有你自己提起时才接）。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后每次开始聊天时，会把下面「开窗预览」里的几件告诉我，每个会话最多主动提一次。
+                <b>已经放进聊天</b>：下面「开窗预览」里的几件（「不主动提」的不放）。
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="lp-enabled" onchange="saveLoopSettings({enabled: this.checked})"> 自动找</label>
@@ -557,7 +558,7 @@
                 一段时间内不会变、聊天时我应该知道的事：住在哪、在读什么、家里的猫叫什么、生日、长期的喜好，我说过的关于自己的事，我们之间的称呼……
                 每天整理完对话以后自动找，每一条都附一句原话做证据。说法变了：<b>明确说的</b>（「我搬家了」）会换成新的，旧的留在「以前的」里；
                 <b>随口一提</b>的不换，先标「可能变了」，你点一下确认，或者等以后说清楚了再换。你改过的事实不会被自动换掉。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后会把下面「档案预览」里的几行告诉我（碰到「轻放」话题的不列）。
+                <b>已经放进聊天</b>：下面「档案预览」里的几行，接在人格画像后面（碰到「轻放」话题的不列）。
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="ft-enabled" onchange="saveFactSettings({enabled: this.checked})"> 自动找</label>
@@ -569,7 +570,7 @@
             <div id="ft-add" style="display:none;background:#f8f9fa;border-radius:8px;padding:10px 12px;margin-bottom:14px;"></div>
             <div id="ft-disputed"></div>
             <div id="ft-groups"></div>
-            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">档案预览（以后放进聊天的样子）</summary>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">档案预览（放进聊天的样子）</summary>
                 <div id="ft-profile" style="margin-top:8px;font-size:13px;line-height:1.9;background:#f6f3fb;border-radius:8px;padding:10px 14px;"></div></details>
             <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;" id="ft-orphan-title">不对的、没有现在值的</summary>
                 <div id="ft-orphan" style="margin-top:8px;"></div></details>
@@ -581,7 +582,7 @@
                 一张「我们最近」的状态卡：节奏、你的天气、正在一起经历的、最近的亲近时刻，每一句都有出处（日摘、片段、未完的事、主题卷）。
                 它不是打分——每天几条消息、几点来、心情走向这些统计只在下面给你看，不会写进卡片。
                 你可以给不想被主动提起的话题设「话题边界」，卡片会避开它们，只留一句「轻放」。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后每次开始聊天时放进去。
+                <b>已经放进聊天</b>（不带「上次聊天」那一行，那一行每轮都变，在每一轮的附注里）。
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="st-enabled" onchange="saveGroupSettings('state', {enabled: this.checked}, 'st-status', loadState)"> 自动更新</label>
@@ -590,7 +591,7 @@
                 <span id="st-status" style="font-size:12px;color:#666;"></span>
             </div>
             <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
-                <div style="font-size:13px;margin-bottom:6px;"><b>以后放进聊天的样子</b></div>
+                <div style="font-size:13px;margin-bottom:6px;"><b>放进聊天的样子</b></div>
                 <div id="st-card" style="font-size:14px;line-height:1.9;white-space:pre-wrap;"></div>
             </div>
             <div id="st-lines" style="margin-bottom:14px;"></div>
@@ -615,7 +616,7 @@
                 按时间走的共同经历：一章是我们关系里的一个时期。每天整理好片段以后，新的片段会写进「进行中」的那一章，每一句都有出处。
                 觉得一个阶段结束了，就点「这一章到这里」（可以顺便起标题）；一章跨得很长时，也会请模型提议在哪里分开，<b>要你确认才生效</b>。
                 以后导入旧聊天、补上更早的片段以后，会先请模型提议怎么分章，你确认以后再一章一章写。
-                <b>现在只在这里看，还不会放进聊天里</b>——以后由章节目录和进行中的这一章，替代现在的「共同经历叙事」。
+                <b>已经放进聊天</b>：章节目录 + 进行中的这一章，替代了以前整篇的「共同经历叙事」（章节关掉或者还没有时，放回旧的）。
             </div>
             <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="ch-enabled" onchange="saveGroupSettings('chapters', {enabled: this.checked}, 'ch-status', loadChapters)"> 自动写</label>
@@ -625,15 +626,42 @@
                 <span id="ch-status" style="font-size:12px;color:#666;"></span>
             </div>
             <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
-                <div style="font-size:13px;margin-bottom:6px;"><b>章节目录</b>（以后放进聊天的样子）</div>
+                <div style="font-size:13px;margin-bottom:6px;"><b>章节目录</b>（放进聊天的样子）</div>
                 <div id="ch-index" style="font-size:13px;line-height:1.9;white-space:pre-wrap;"></div>
             </div>
             <div id="ch-proposals"></div>
             <div id="ch-list"></div>
-            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">旧版共同经历叙事（对比用；现在放进聊天的还是它）</summary>
+            <details style="margin-top:12px;"><summary style="cursor:pointer;font-size:13px;color:#555;">旧版共同经历叙事（对比用；章节关掉或者还没有时才放进聊天）</summary>
                 <div id="ch-legacy" style="margin-top:8px;font-size:13px;line-height:1.8;white-space:pre-wrap;"></div></details>
             <details style="margin-top:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
                 <div id="ch-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
+        <div id="windows" class="panel">
+            <h3>换窗衔接</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                前端每一轮只把最近 70 多条发给模型，窗口一直在往后滑，等于一直在「换窗」。这里补上三件事（都只加在发给模型的消息里，不存进记忆，前端也看不到）：<br>
+                ① <b>窗口里的时间</b>：窗口开头那条写明是几点的；昨晚的晚安和今早的早安之间这种隔了很久的地方，写明隔了多久。<br>
+                ② <b>滑出窗口的那段</b>：滑出去、但还没整理成每日片段的那段（每日片段要等一天过完才写），每 16 条左右写一两句小结，带一个「那会儿」的温度词，放在窗口开头那行附注里。快滑出去时就提前写好；窗口没挪时这一行不变，缓存照常命中。<br>
+                ③ <b>新窗口</b>：新开一个对话时，第一条附上上一个窗口停在什么时候、最后几句；从旧对话挑几段搬过来（前端的「挑选式搬家」）时，挑的几段之间写明隔了多久、中间省略了几条、那段时间的片段。
+            </div>
+            <div style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <select id="win-conv" onchange="loadWindows(this.value)" style="padding:4px;border:1px solid #ddd;border-radius:6px;max-width:320px;"></select>
+                <button class="btn" onclick="windowsBridgeNow()">现在写小结</button>
+                <button class="btn" onclick="loadWindows(winConv)" style="background:#6c757d;">刷新</button>
+                <span id="win-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="win-toggles" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:14px;font-size:13px;"></div>
+            <div style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:14px;">
+                <div style="font-size:13px;margin-bottom:6px;"><b>窗口开头那行附注</b>（这个对话最近一轮发给模型的样子）</div>
+                <div id="win-note" style="font-size:13px;line-height:1.9;white-space:pre-wrap;"></div>
+            </div>
+            <h4 style="margin:6px 0 8px;">滑出窗口那段的小结</h4>
+            <div id="win-bridges" style="margin-bottom:14px;"></div>
+            <h4 style="margin:6px 0 8px;">最近的对话从哪来</h4>
+            <div id="win-convs" style="margin-bottom:14px;font-size:13px;"></div>
+            <details><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
+                <div id="win-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
         <!-- Summary 页面 -->
@@ -641,7 +669,7 @@
             <h3>近七天摘要（新版）</h3>
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:10px;">
                 每天的片段整理好以后写一份「日摘」（几行），一周结束写「周摘」，再由最近七天的日摘写成「近七天摘要」——没有聊天的日子会如实写进去。
-                <b>新版现在只在这里看，还不会放进聊天里</b>；以后由它替代下面的旧版近期摘要。
+                <b>新版的近七天摘要已经放进聊天</b>，替代了下面的旧版近期摘要（新版关掉或者还没有时，放回旧的）。
             </div>
             <div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
                 <label style="font-size:13px;"><input type="checkbox" id="dg-enabled" onchange="setDigestsEnabled(this.checked)"> 自动写</label>
@@ -938,6 +966,7 @@
             if (name === 'facts') loadFacts();
             if (name === 'state') loadState();
             if (name === 'chapters') loadChapters();
+            if (name === 'windows') loadWindows(winConv);
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -1628,7 +1657,7 @@ function rebuildProfile() {
 
         // ============ 后台任务（Phase 1）============
         var jobsFilter = '';
-        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事', facts_scan: '事实', state_refresh: '关系状态', write_chapter: '写章节', propose_chapters: '分章提议' };
+        var JOB_KIND = { extract: '记忆提取', summary: '近期摘要', narrative: '共同经历叙事', profile_rebuild: '画像重建', settle_day: '每日片段', route_arcs: '归卷', narrate_arc: '写卷', digest_day: '日摘', digest_week: '周摘', digest_recent: '近七天摘要', lexicon_scan: '共同语汇', loops_scan: '未完的事', facts_scan: '事实', state_refresh: '关系状态', write_chapter: '写章节', propose_chapters: '分章提议', window_bridge: '窗外小结' };
         var JOB_STATUS = { queued: ['排队中', 'status-pending'], running: ['执行中', 'status-partial'], done: ['完成', 'status-extracted'],
                            dead: ['失败', 'status-dead'], dismissed: ['已忽略', 'status-dismissed'] };
         var JOB_SOURCE = { auto: '自动', dashboard: '手动', api: '接口' };
@@ -1660,6 +1689,7 @@ function rebuildProfile() {
             if (j.kind === 'facts_scan' && r.status === 'ok') return '扫了 ' + (r.chunks || 0) + ' 段对话'
                 + ((r.created || []).length ? ' · 新的：' + r.created.join('、') : '') + ((r.superseded || []).length ? ' · 变了：' + r.superseded.join('、') : '')
                 + ((r.disputed || []).length ? ' · 可能变了：' + r.disputed.join('、') : '') + (r.confirmed ? ' · 又说到 ' + r.confirmed + ' 次' : '');
+            if (j.kind === 'window_bridge' && r.status === 'ok') return '写了 ' + (r.written || 0) + ' 块小结' + (r.more ? ' · 还有，接着写' : '');
             if (j.kind === 'state_refresh' && r.status === 'ok') return r.empty ? '最近七天没有聊天' : '第 ' + r.version + ' 版 · ' + (r.lines || 0) + ' 行';
             if (j.kind === 'state_refresh' && r.status === 'rejected') return '没通过校验，保留旧的';
             if (j.kind === 'write_chapter' && (r.status === 'ok' || r.status === 'rejected')) return '第 ' + r.n + ' 章' + (r.rebuild ? '（整章重写）' : '')
@@ -3034,6 +3064,56 @@ function rebuildProfile() {
                 .then(function(r) { return r.json(); }).then(function(d) { if (d && d.status === 'error') alert(d.message); return d; });
         }
 
+        // ============ 换窗衔接 ============
+        var winConv = null;
+        var WIN_KIND = { new: '新开的', branch: '从这里分出去', forged: '挑选式搬家', unknown: '别处开的' };
+
+        function loadWindows(conv) {
+            fetch(API + '/windows' + (conv ? '?conv_id=' + encodeURIComponent(conv) : '')).then(function(r) { return r.json(); }).then(function(d) {
+                winConv = d.conv_id;
+                var sel = document.getElementById('win-conv');
+                sel.innerHTML = (d.convs || []).map(function(c) {
+                    return '<option value="' + escapeHtml(c.conv_id) + '"' + (c.conv_id === d.conv_id ? ' selected' : '') + '>'
+                        + escapeHtml(c.conv_id.slice(0, 8)) + '… · ' + c.messages + ' 条 · 最后 ' + formatTime(c.last_ts) + '</option>';
+                }).join('');
+                var st = d.state;
+                document.getElementById('win-status').textContent = st ? '窗口从 ' + formatTime(st.window_from) + ' 开始 · ' + formatTime(st.updated_at) + ' 更新'
+                    + ((d.pending || []).length ? ' · 还有 ' + d.pending.length + ' 块等着写小结' : '') : '这个对话还没经过新的网关';
+                document.getElementById('win-note').textContent = d.note || '（没有）';
+                var items = (d.settings_spec || {}).items || [];
+                document.getElementById('win-toggles').innerHTML = items.filter(function(it) { return it.type === 'bool'; }).map(function(it) {
+                    return '<label title="' + escapeHtml(it.help) + '"><input type="checkbox" ' + (it.value ? 'checked' : '') + ' onchange="saveWindowToggle(\'' + it.key + '\', this.checked)"> ' + escapeHtml(it.label) + '</label>';
+                }).join('');
+                renderGroupSettings('win-settings', d.settings_spec || {}, 'windows', 'win-status', function() { loadWindows(winConv); });
+                var bs = d.bridges || [];
+                document.getElementById('win-bridges').innerHTML = bs.length ? bs.map(function(b) {
+                    var t0 = formatTime(b.start_ts), t1 = formatTime(b.end_ts);
+                    return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:13px;line-height:1.7;">'
+                        + '<span style="color:#888;">' + t0 + ' – ' + (t1.slice(0, 10) === t0.slice(0, 10) ? t1.slice(11) : t1) + ' · ' + b.n + ' 条</span> '
+                        + (b.status === 'active' ? escapeHtml(b.gist) + (b.mood ? ' <span style="font-size:11px;background:#f0f0f5;border-radius:8px;padding:1px 7px;">那会儿：' + escapeHtml(b.mood) + '</span>' : '')
+                            : '<span style="color:#aaa;">（没写：' + escapeHtml((b.issues || []).join('；') || '只是寒暄') + '）</span>')
+                        + ((b.status === 'active' && (b.issues || []).length) ? '<div style="font-size:12px;color:#888;">校验：' + b.issues.map(escapeHtml).join('；') + '</div>' : '') + '</div>';
+                }).join('') : '<div style="color:#888;font-size:12px;">还没有（窗口滑过去、或者快滑过去的时候才写）</div>';
+                document.getElementById('win-convs').innerHTML = (d.convs || []).map(function(c) {
+                    return '<div style="padding:3px 0;"><code>' + escapeHtml(c.conv_id.slice(0, 12)) + '</code> · ' + (c.kind ? escapeHtml(WIN_KIND[c.kind] || c.kind) : '以前就有的')
+                        + (c.from ? '，来自 <code>' + escapeHtml(c.from.slice(0, 12)) + '</code>' : '') + (c.carried ? '，带过来 ' + c.carried + ' 条' : '') + '</div>';
+                }).join('') || '<div style="color:#888;">没有</div>';
+            }).catch(function(e) { document.getElementById('win-status').textContent = '读取失败：' + e; });
+        }
+
+        function saveWindowToggle(key, on) {
+            var v = {}; v[key] = on;
+            fetch(API + '/windows/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: v }) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') alert(d.message); else loadWindows(winConv); });
+        }
+
+        function windowsBridgeNow() {
+            if (!winConv) return;
+            apiCall('POST', '/windows/bridge?conv_id=' + encodeURIComponent(winConv)).then(function(d) {
+                document.getElementById('win-status').textContent = d.queued ? '已经开始写，过一会儿刷新看看' : '没有新投递（已经在排队，或者没有要写的）';
+            });
+        }
+
         // ============ 关系状态 ============
         var stPolicyNames = {};
 
@@ -3545,6 +3625,7 @@ function rebuildProfile() {
                     {key: 'facts', label: '事实', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'state', label: '关系状态', hint: '不设置时用「日摘·周摘」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
                     {key: 'chapter', label: '章节', hint: '不设置时用「叙事卷（写卷）」的模型（再往下是「每日片段」「共同经历叙事」「近期摘要」）。'},
+                    {key: 'bridge', label: '窗外小结（换窗衔接）', hint: '滑出聊天窗口的那段，每 16 条左右写一两句。小活，可以选便宜、快的模型。不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'digest', label: '日摘·周摘·近七天摘要', hint: '不设置时用「每日片段」的模型（再往下是「共同经历叙事」「近期摘要」）。'},
                     {key: 'arc_route', label: '归卷（把片段分到叙事卷里）', hint: '分类的小活，可以选便宜、快的模型。不设置时和「叙事卷（写卷）」用同一个。推理模型一次要想很久，非推理的快模型更合适。'},
                     {key: 'aux', label: '辅助请求（翻译思考链等）',

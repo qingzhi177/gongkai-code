@@ -8,7 +8,7 @@
   rejected（你说不要）：以后扫到同样的词（或它的别名）不再提。merged：并进了另一个词（它的叫法变成那个词的别名）。
 - 你在 Dashboard 上改过的含义，以后扫描不会覆盖。
 - match()：一句话里提到了哪些词，以后聊天时每轮做字面匹配、注入一行来处（现在只在 Dashboard 的「试一试」里看）。
-现在只生成、只在 Dashboard 上看，不放进聊天。
+收下的语汇放进聊天（app/compose.py）。
 """
 import json
 import re

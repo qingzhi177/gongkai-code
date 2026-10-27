@@ -38,6 +38,14 @@ app.post('/compose/turn', (q, r) => {
   log('compose', q.body);
   r.json({ mode: compose.mode || 'shadow', card: compose.card || '', turn_key: q.body.turn_key || 'tk-auto', picks: compose.card ? [{ id: 7 }] : [] });
 });
+// 换窗衔接：/_test/compose 里的 window 决定回答（{notes, turn_note} / 'error' / 'slow'）
+app.post('/compose/window', (q, r) => {
+  log('window', q.body);
+  const w = compose.window;
+  if (w === 'error') return r.status(500).json({ status: 'error', message: '测试：出错' });
+  if (w === 'slow') return setTimeout(() => r.json({ status: 'ok', notes: [{ i: 0, text: '［慢］' }] }), 3000);
+  r.json({ status: 'ok', notes: (w && w.notes) || [], turn_note: (w && w.turn_note) || '', info: { matched: (q.body.entries || []).length, ms: 1 } });
+});
 app.post('/compose/confirm', (q, r) => { log('confirm', q.body); r.json({ status: 'ok', delivered: 1 }); });
 app.get('/compose/system', (q, r) => {
   if (compose.system === 'error') return r.status(500).json({ status: 'error', message: '测试：出错' });

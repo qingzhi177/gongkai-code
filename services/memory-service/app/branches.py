@@ -13,6 +13,10 @@
 - 分支的分支也一样：一个会话的完整历史 = 它自己的重合部分 + 它自己存的记录。
 - 提取分支开头的新内容时，从分支点往前取几句当只读上文（extract_l1.py 用 anchor()）。
 
+挑选式搬家（接入约定第 14 节，forged_from）也用这一套，kind='forged'：前端从旧会话里挑几轮带进新会话，
+带过来的几段在原会话里可以不连续。登记时按顺序在原会话的完整历史里往后找（每条找它之后第一条一样的），
+找不到的那条和它之后的都算新会话自己的内容。之后和分支一样：带过来的只在原会话名下存一份。
+
 这个模块只用标准库，调用方传入数据库连接（main.py 的 save_conversation、extract_l1.py 都用它）。
 """
 import hashlib
@@ -28,12 +32,16 @@ def fingerprint(role, content):
 
 
 def get(c, conv_id):
-    """{parent, parent_turn_id, prefix: [[指纹, 会话, 行 id], ...], shared, created_at}；不是分支返回 None"""
+    """{parent, parent_turn_id, prefix: [[指纹, 会话, 行 id], ...], shared, created_at, kind}；不是分支 / 搬家返回 None"""
     try:
-        row = c.execute("SELECT parent_conv_id, parent_turn_id, prefix, shared, created_at FROM conv_branches "
+        row = c.execute("SELECT parent_conv_id, parent_turn_id, prefix, shared, created_at, kind FROM conv_branches "
                         "WHERE conv_id=?", (conv_id,)).fetchone()
-    except sqlite3.OperationalError:     # 表还没建（迁移前）
-        return None
+    except sqlite3.OperationalError:     # 表还没建，或者还没有 kind 列（迁移前）
+        try:
+            row = c.execute("SELECT parent_conv_id, parent_turn_id, prefix, shared, created_at, 'branch' FROM conv_branches "
+                            "WHERE conv_id=?", (conv_id,)).fetchone()
+        except sqlite3.OperationalError:
+            return None
     if not row:
         return None
     try:
@@ -41,7 +49,7 @@ def get(c, conv_id):
     except ValueError:
         prefix = []
     return {"conv_id": conv_id, "parent": row[0], "parent_turn_id": row[1], "prefix": prefix,
-            "shared": row[3], "created_at": row[4]}
+            "shared": row[3], "created_at": row[4], "kind": row[5] or "branch"}
 
 
 def history(c, conv_id):
@@ -71,9 +79,28 @@ def _common(msgs, entries):
     return n
 
 
-def register(c, conv_id, branch_of, msgs, now):
-    """第一次看到分支时登记；已经登记过的不再改（重合部分以第一次为准）。
-    msgs：这次请求里归一化后、去掉 system 和空消息的 [(role, content)]。返回登记记录，不是分支返回 None。"""
+def _matches(fp, e):
+    return fp == e[0] or (len(e) > 3 and fp in (e[3] or []))
+
+
+def _picked(msgs, entries):
+    """挑选式搬家：msgs 开头那些在原会话历史里按顺序找得到的（可以不连续）→ 对应的历史条目。
+    每条从上一条对上的位置往后找第一条一样的；有一条找不到，它和它后面的都算新会话自己的。"""
+    out, pos = [], 0
+    for role, content in msgs:
+        fp = fingerprint(role, content)
+        k = next((j for j in range(pos, len(entries)) if _matches(fp, entries[j])), None)
+        if k is None:
+            break
+        out.append(entries[k])
+        pos = k + 1
+    return out
+
+
+def register(c, conv_id, branch_of, msgs, now, kind="branch"):
+    """第一次看到分支 / 搬家时登记；已经登记过的不再改（重合部分以第一次为准）。
+    msgs：这次请求里归一化后、去掉 system 和空消息的 [(role, content)]。返回登记记录，不是分支返回 None。
+    kind：branch（开头连续一段和原会话一样）/ forged（挑选式搬家，带过来的几段在原会话里可以不连续）。"""
     b = get(c, conv_id)
     if b is not None:
         return b
@@ -82,11 +109,28 @@ def register(c, conv_id, branch_of, msgs, now):
     if not parent or parent == conv_id:
         return None
     entries = history(c, parent)
-    n = _common(msgs, entries)
+    if kind == "forged":
+        # 这一轮（最后一条用户消息和它之后的）一定是新说的；前端说了带过来几条（carried）的，最多认这么多
+        last_user = max((i for i, (role, _) in enumerate(msgs) if role == "user"), default=len(msgs))
+        cand = msgs[:last_user]
+        try:
+            carried = int(branch_of.get("carried"))
+            cand = cand[:max(0, carried)]
+        except (TypeError, ValueError):
+            pass
+        shared = _picked(cand, entries)
+    else:
+        shared = entries[:_common(msgs, entries)]
     turn_id = branch_of.get("turn_id")
-    c.execute("INSERT OR IGNORE INTO conv_branches (conv_id, parent_conv_id, parent_turn_id, prefix, shared, created_at) "
-              "VALUES (?, ?, ?, ?, ?, ?)",
-              (conv_id, parent, None if turn_id is None else str(turn_id)[:200], json.dumps(entries[:n]), n, now))
+    try:
+        c.execute("INSERT OR IGNORE INTO conv_branches (conv_id, parent_conv_id, parent_turn_id, prefix, shared, created_at, kind) "
+                  "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (conv_id, parent, None if turn_id is None else str(turn_id)[:200], json.dumps(shared), len(shared), now,
+                   "forged" if kind == "forged" else "branch"))
+    except sqlite3.OperationalError:     # 还没有 kind 列（迁移前）
+        c.execute("INSERT OR IGNORE INTO conv_branches (conv_id, parent_conv_id, parent_turn_id, prefix, shared, created_at) "
+                  "VALUES (?, ?, ?, ?, ?, ?)",
+                  (conv_id, parent, None if turn_id is None else str(turn_id)[:200], json.dumps(shared), len(shared), now))
     return get(c, conv_id)
 
 

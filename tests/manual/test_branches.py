@@ -81,6 +81,19 @@ def main():
         bn = B.register(c, "Dq", {"conversation_id": "NOPE"}, [u1, a1, u3], NOW)
         check("登记了但没有重合部分：全部照常存", bn["shared"] == 0 and B.shared_len(c, "Dq", [u1, a1, u3]) == 0
               and B.anchor(c, "Dq") is None)
+
+        print("\n[5] 挑选式搬家（kind=forged）：带过来的几段在原会话里可以不连续")
+        u5, a5, u6 = ("user", "那就周六见"), ("assistant", "周六见"), ("user", "搬家以后第一句")
+        qid = add(c, "Q", [u1, a1, u2, a2, u3, a3, u5, a5])
+        f = B.register(c, "Fq", {"conversation_id": "Q"}, [u1, a1, u5, a5, u6, ("assistant", "嗯")], NOW, kind="forged")
+        check("登记：挑过来的 4 条对上原会话的第 1、2、7、8 行", f and f["kind"] == "forged" and f["shared"] == 4
+              and [e[2] for e in f["prefix"]] == [qid[0], qid[1], qid[6], qid[7]], f and f["prefix"])
+        check("以后存记录跳过这 4 条；分支点是最后一条挑过来的",
+              B.shared_len(c, "Fq", [u1, a1, u5, a5, u6, ("assistant", "嗯"), ("user", "再说一句")]) == 4
+              and B.anchor(c, "Fq") == ("Q", qid[7]))
+        check("分支照旧是 branch", B.get(c, "Bq")["kind"] == "branch")
+        f2 = B.register(c, "Fr", {"conversation_id": "Q"}, [u1, a1, u3, ("assistant", "好")], NOW, kind="forged")
+        check("这一轮的话不算挑过来的（哪怕原会话里有一样的）", f2["shared"] == 2, f2["shared"])
         c.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

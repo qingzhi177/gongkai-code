@@ -39,6 +39,8 @@ from app.recall import traces as recall_traces
 from app.recall import golden as recall_golden   # 黄金集标注和门槛校准
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
+from app import windows as window_notes     # 换窗衔接：窗口里的时间标记、滑出窗口那段的小结、新窗口接上一窗（方案第 16 章）
+from app.pipeline import bridge as bridge_pipeline   # 滑出窗口那段的小结（后台任务）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
 from app import uploads   # 大文件分块上传、后台导入任务（Dashboard「备份管理」）
@@ -186,6 +188,7 @@ class SaveRequest(BaseModel):
     client: str = "unknown"
     messages: List[dict]
     branch_of: Optional[dict] = None   # 分支会话：{"conversation_id": 原会话, "turn_id": 分支点}（接入约定第 12 节）
+    forged_from: Optional[dict] = None   # 挑选式搬家：{"conversation_id": 旧会话, "carried"?: 带过来几条}（接入约定第 14 节）
 
 async def get_embedding(text):
     try:
@@ -846,13 +849,15 @@ async def save_conversation(req: SaveRequest):
     try:
         # 分支会话（接入约定第 12 节）：开头那段和原会话一样的历史只在原会话名下存一份，这里跳过，
         # 免得同一段经历被提取成两份记忆。第一次带 branch_of 时登记重合部分，以后按登记的指纹跳过。
-        if req.branch_of or conv_branches.get(c, req.conv_id):
+        # 挑选式搬家（接入约定第 14 节，forged_from）一样：从旧会话挑过来的几段只在旧会话名下存一份。
+        link, link_kind = (req.forged_from, "forged") if req.forged_from else (req.branch_of, "branch")
+        if link or conv_branches.get(c, req.conv_id):
             plain = []
             for m in req.messages:
                 r_, t_ = m.get("role", ""), normalize_content(m.get("content", ""))
                 if t_ and r_ != "system":
                     plain.append((r_, t_))
-            if conv_branches.register(c, req.conv_id, req.branch_of, plain, timeutil.utc_now_str()):
+            if conv_branches.register(c, req.conv_id, link, plain, timeutil.utc_now_str(), kind=link_kind):
                 branch_skip = conv_branches.shared_len(c, req.conv_id, plain)
         seen = 0
 
@@ -1939,6 +1944,11 @@ async def delete_l0_conversation(conv_id: str):
     c.execute('UPDATE l0_messages SET status=? WHERE conv_id=?', ('superseded', conv_id))
     # 3. 硬删该对话下的 active L1
     c.execute("DELETE FROM l1_memories WHERE conv_id=? AND status='active'", (conv_id,))
+    # 4. 换窗衔接：窗口状态、来处、用到这个对话的消息写的小结（方案第 16 章）
+    try:
+        window_notes.forget_conv(c, conv_id)
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     # 4. 从 ChromaDB 删除对应向量
@@ -2932,6 +2942,78 @@ async def compose_system_api():
         logger.error(f"[COMPOSE] system_blocks 出错：{e}", exc_info=True)
         return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
 
+class ComposeWindowRequest(BaseModel):
+    conv_id: str = ""
+    entries: List[dict] = []          # 窗口里这一轮之前的消息：[{"r": "u"/"a", "h": 指纹}]（指纹算法见 app/windows.py）
+    link: Optional[dict] = None       # 前端这一轮带的 {kind: branch/forged, conversation_id, carried?}
+
+@app.post("/compose/window")
+async def compose_window_api(req: ComposeWindowRequest):
+    """每一轮聊天调一次（和 /compose/turn 同时）：窗口里哪几条前面要加附注——窗口开头那条几点的、
+    滑出窗口还没整理成片段那段的小结、隔了很久或省略了几条的地方、新窗口接上一个窗口（app/windows.py）。
+    只读库（记一下窗口状态），不调模型，几十毫秒。要写小结的块投给后台任务。"""
+    import time as _time
+    if not req.conv_id:
+        return {"status": "ok", "notes": [], "turn_note": "", "info": {}}
+    t0 = _time.monotonic()
+    conn = get_conn()
+    try:
+        r = window_notes.compose(conn, req.conv_id, req.entries, req.link)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        logger.error(f"[WINDOW] compose 出错：{e}", exc_info=True)
+        return {"status": "error", "message": str(e)}
+    finally:
+        conn.close()
+    queued = False
+    if r["needs"]:
+        try:
+            queued = window_notes.enqueue_bridge(req.conv_id)
+        except Exception as e:
+            logger.error(f"[WINDOW] 投递写小结失败：{e}")
+    info = dict(r["info"], needs=len(r["needs"]), queued=bool(queued), ms=round((_time.monotonic() - t0) * 1000))
+    return {"status": "ok", "notes": r["notes"], "turn_note": r["turn_note"], "info": info}
+
+@app.get("/windows")
+async def windows_overview(conv_id: Optional[str] = None):
+    """「换窗衔接」页：最近的会话（来处）、窗口开头那行附注、滑出窗口那段的小结"""
+    conn = get_conn()
+    try:
+        out = window_notes.overview(conn, conv_id)
+    finally:
+        conn.close()
+    return {"status": "ok", **out, "settings_spec": app_settings.describe("windows")}
+
+@app.post("/windows/bridge")
+async def windows_bridge_now(conv_id: str):
+    """现在写小结（不等下一轮聊天）"""
+    try:
+        queued = window_notes.enqueue_bridge(conv_id, source="manual")
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    return {"status": "ok", "queued": bool(queued)}
+
+@app.get("/windows/settings")
+async def get_windows_settings():
+    return app_settings.describe("windows")
+
+@app.put("/windows/settings")
+async def put_windows_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("windows", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("windows")}
+
+@app.post("/windows/settings/reset")
+async def reset_windows_settings(req: SettingsReset):
+    try:
+        app_settings.reset("windows", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("windows")}
+
 @app.get("/compose/settings")
 async def get_compose_settings():
     return app_settings.describe("compose")
@@ -3481,7 +3563,7 @@ async def get_pipeline_status():
 
 
 # 模块模型配置的用途。aux：Pluvia 的辅助请求（翻译思考链等），不设置时网关用前端选的模型、走当前中转
-MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "facts", "state", "chapter", "aux"]
+MODEL_PURPOSES = ["chat", "l1_extract", "embedding", "narrative", "summary", "episode", "arc", "arc_route", "digest", "lexicon", "loops", "facts", "state", "chapter", "bridge", "aux"]
 
 @app.get("/config/models")
 async def get_all_model_configs():
