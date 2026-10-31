@@ -921,3 +921,26 @@ Pluvia 新加了「从这里分出去」：把到某一行为止的历史复制�
 - `tests/manual/test_keepwarm.js` 28 项（id 前缀、换时长、心跳发的消息、什么时候发、什么时候停、5 分钟缓存、续问、别的中转）；`test_cache_stats.py` 12 项；`test_notes.py` 23 项；`test_branches.py` 第 6 节（滑过去 8 条、只剩 1 条、整个滑过、滑过后又改了一条、从很长的会话分出来、只碰巧对上 1 条不算、搬家）。
 - 网关 `tests/manual/pluvia_contract` 128 项：T31（默认换成 1 小时、设成 5 分钟、用量报给记忆服务、辅助请求不记、不是 OpenRouter 不带 provider、心跳真的流式发出去并读到用量）；T32（模型拿得到 jot、system 里画像改名、网关执行 jot 并带上对话 id、前端收到工具事件、Dashboard 关掉时不给 jot、能力协商）。
 - `test_migrations.py` 里「不符合命名的文件被忽略」用的文件名 `notes.py` 正好和新迁移 `020_notes` 重名，换成了 `scratch.py`。
+
+## 2026-10-31 · Phase 3 第一步：cc-bridge（print 跑法）、Claude Code 里的记忆工具、生命线
+
+> 设计：`docs/plan/claude-code-bridge.md`。**聊天还没有切过去**，切换前用户要先在聊天里和 ta 说一声。
+
+### 做了什么
+- `services/cc-bridge/bridge.js`：网关和本机 Claude Code 之间的桥（只听 127.0.0.1:3010）。print 跑法：每个对话一个常驻的 `claude -p`（stream-json 进出），转成统一的事件流（`init` / `thinking` / `text` / `tool` / `retry` / `compact` / `done`）；`/v1/interrupt` 用 `control_request` 让这一轮停下；对话 ↔ session 存盘，进程闲太久关掉、下次 `--resume` 接上；system 变了在两轮之间换进程、用新 system `--resume`；子进程去掉 `ANTHROPIC_API_KEY` 这类变量（只用订阅登录）。sdk、tmux 两种跑法留了位置（同一个接口）。
+- 新进程里的 MCP 是异步连上的（实测 3 秒左右）：第一次冒烟时第一句话发早了，模型手里没有工具。现在用 `mcp_status` 控制请求轮询，连上再发第一句。
+- `services/cc-bridge/mcp_memory.js`：手写的 stdio MCP server，记忆工具的清单和执行都转给网关的内部接口；网关新开一个只听本机的端口（3011，nginx 不转发）：`GET /internal/tools`、`POST /internal/tool`，用的是和 API 模式同一份工具说明、同一套 `executeTool`（不给联网搜索）。
+- `services/cc-bridge/lifeline.js`：PreToolUse 钩子，拦关 tmux、结束桥 / 网关 / claude 的进程、停服务、删记忆库数据和会话记录、碰登录凭证、强推。print 跑法默认不给内置工具，这条是给以后开工具时兜底的。
+- 读了那份 tmux 讨论和两份 Claude Code 教程：哪些用上了、哪些留给 tmux 跑法，写在设计文档第 6、7 节。
+
+### 冒烟（真机，haiku，测试对话不落盘）
+- 两轮同一个进程，第二轮记得第一轮；思考过程和正文逐字出来；`done` 带用量。
+- 修好 MCP 等待以后：等了 3.1 秒，模型调了 `get_current_time`（MCP → 网关内部接口 → executeTool），回答的时间是对的。
+- 隐藏参数 `--system-prompt-file`、`--thinking-display summarized` 在 2.1.206 上有效。
+
+### 测试
+- `tests/manual/cc_bridge/run_test.js` 28 项：生命线；MCP（初始化、清单、调用带对话 id、网关没起来时不卡住）；桥（假 claude：事件转换、子代理的不转、工具名、去掉 API key、参数、先等 MCP 再发第一句、常驻、换 system 时 `--resume`、存盘、忙时 409、interrupt、测试对话不落盘）。
+- 网关 T33（内部接口：清单、执行带对话 id、名单外的不执行）；网关测试共 132 项。
+
+### 接下来
+网关里加「聊天走哪条路」（默认 API）和 Claude Code 这条路的转发；桥做成服务；按用量轮换会话（Forge Reload）；Claude Code 模式的心跳（先实测）；sdk、tmux 跑法。

@@ -823,6 +823,26 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     await (await fetch('http://127.0.0.1:3998/_test/compose', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) })).json();
   }
 
+  console.log('T33 内部接口：Claude Code 那条路的记忆工具（只听本机的端口）');
+  {
+    const IN = 'http://127.0.0.1:3996';
+    await sleep(3100);   // 上一节关掉小本子的设置还在网关的 3 秒缓存里
+    const tl = await (await fetch(IN + '/internal/tools')).json();
+    const names = tl.tools.map(t => t.name);
+    ok(['recall', 'feel', 'update_profile', 'jot', 'get_current_time'].every(n => names.includes(n)) && !names.includes('bocha_search')
+      && tl.tools.every(t => t.description && t.inputSchema && t.inputSchema.type === 'object'), 'T33 列出记忆工具（MCP 的格式），不给联网搜索', names);
+    const m = mark();
+    const r = await (await fetch(IN + '/internal/tool', { method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ name: 'jot', args: { text: '从 Claude Code 记的一笔' }, conv_id: 'cc-conv' }) })).json();
+    await sleep(100);
+    const notes = since(m).mem.filter(x => x.k === 'note');
+    ok(!r.is_error && /记下了/.test(r.content) && notes.length === 1 && notes[0].b.conv_id === 'cc-conv', 'T33 执行工具：和 API 模式同一套逻辑，带上对话 id', { r, notes: notes.map(x => x.b) });
+    const bad = await fetch(IN + '/internal/tool', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'bocha_search', args: {} }) });
+    ok(bad.status === 400, 'T33 不在名单里的工具不执行');
+    const t = await (await fetch(IN + '/internal/tool', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ name: 'get_current_time', args: {} }) })).json();
+    ok(/当前时间/.test(t.content), 'T33 get_current_time', t);
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

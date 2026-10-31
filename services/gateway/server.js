@@ -3330,6 +3330,38 @@ app.all('/api/*splat', async (req, res) => {
   }
 });
 
+// ============ 内部接口：给 Claude Code 那条路的记忆工具用（services/cc-bridge/mcp_memory.js） ============
+// 单独一个只听本机的端口（默认 3011，GATEWAY_INTERNAL_PORT），nginx 不转发到这里，外面访问不到。
+// Claude Code 里的记忆工具（recall / feel / update_profile / jot / get_current_time）通过 MCP 调到这里，
+// 用的是和 API 模式同一份工具说明、同一套执行逻辑（executeTool），两条路的记忆工具不会走样。
+// 不对外的工具（联网搜索）不给：Claude Code 自己有 WebSearch，要不要开由 cc-bridge 决定。
+const INTERNAL_PORT = parseInt(process.env.GATEWAY_INTERNAL_PORT || '3011', 10);
+const INTERNAL_TOOLS = ['recall', 'feel', 'update_profile', 'jot', 'get_current_time'];
+const internal = express();
+internal.use(express.json({ limit: '2mb' }));
+internal.get('/internal/tools', async (req, res) => {
+  const composed = await getComposeSystem();
+  const list = TOOLS.filter(t => INTERNAL_TOOLS.includes(t.function.name))
+    .filter(t => !(t.function.name === 'jot' && composed && composed.notebook === false))
+    .map(t => ({ name: t.function.name, description: t.function.description, inputSchema: t.function.parameters }));
+  res.json({ tools: list });
+});
+internal.post('/internal/tool', async (req, res) => {
+  const { name, args, conv_id } = req.body || {};
+  if (!INTERNAL_TOOLS.includes(name)) return res.status(400).json({ content: `没有这个工具：${name}`, is_error: true });
+  try {
+    const out = await executeTool(name, args || {}, { convId: conv_id || null });
+    const text = out == null || out === '' ? '（无返回内容）' : String(out);
+    res.json({ content: text, is_error: TOOL_ERR_RE.test(text) });
+  } catch (e) {
+    res.json({ content: `工具执行失败: ${e.message}`, is_error: true });
+  }
+});
+if (process.env.GATEWAY_INTERNAL !== 'off') {
+  const isrv = internal.listen(INTERNAL_PORT, '127.0.0.1', () => console.log(`[INTERNAL] 内部接口（cc-bridge 的记忆工具）：127.0.0.1:${INTERNAL_PORT}`));
+  isrv.on('error', e => console.error('[INTERNAL] 监听失败（不影响聊天）:', e.message));
+}
+
 // 启动
 // S1 安全加固：只监听本机回环地址（IPv4 + IPv6），不再对公网开放 *:3000。
 // 外部客户端统一走 nginx（https://域名/v1/，nginx 校验 Bearer token 后转发到 localhost:3000）。
