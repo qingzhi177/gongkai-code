@@ -167,6 +167,7 @@
             <button class="tab" onclick="showPanel('chapters')">章节</button>
             <button class="tab" onclick="showPanel('windows')">换窗衔接</button>
             <button class="tab" onclick="showPanel('cache')">缓存与心跳</button>
+            <button class="tab" onclick="showPanel('notebook')">小本子</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -638,6 +639,33 @@
                 <div id="ch-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
+        <div id="notebook" class="panel">
+            <h3>小本子</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                模型自己随手记下的小事：聊天里偶然冒出来的细碎细节、有意思的小瞬间、想以后接上的小线头（它用 <code>jot</code> 工具记，前端会看到一张小签）。
+                和「画像」分开：画像是对彼此稳定的认识和理解，小本子是一件件具体的小事；和 feel 也分开：feel 是它自己的感受。<br>
+                放进聊天：今天之前最近几天记的、钉住的，放在 system 里（每天只变一次，不影响缓存）；今天新记的放在窗口开头那行附注里，窗口下次往后挪时带上。
+                记错了可以在这里改、擦掉（擦掉的能恢复），也可以自己写一笔。删除对话并勾了「同时删除记忆库里的记录」时，在那个对话里记的几笔也一起删掉。
+            </div>
+            <div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <select id="nb-status" onchange="loadNotebook()" style="padding:4px;border:1px solid #ddd;border-radius:6px;">
+                    <option value="active">记着的</option><option value="erased">擦掉的</option><option value="all">全部</option>
+                </select>
+                <button class="btn" onclick="loadNotebook()" style="background:#6c757d;">刷新</button>
+                <span id="nb-statusline" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div style="display:flex;gap:8px;margin-bottom:12px;">
+                <textarea id="nb-new" rows="2" placeholder="自己写一笔（第一人称，「我」是 AI，「你」是你）" style="flex:1;padding:6px;border:1px solid #ddd;border-radius:6px;font-size:13px;"></textarea>
+                <button class="btn" onclick="notebookWrite()">记下</button>
+            </div>
+            <div id="nb-toggles" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:14px;font-size:13px;"></div>
+            <div id="nb-list" style="margin-bottom:14px;"></div>
+            <details style="margin-bottom:8px;"><summary style="cursor:pointer;font-size:13px;color:#555;">现在放进聊天的样子</summary>
+                <div id="nb-preview" style="margin-top:8px;font-size:13px;line-height:1.8;white-space:pre-wrap;background:#f6f3fb;border-radius:8px;padding:8px 12px;"></div></details>
+            <details><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
+                <div id="nb-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
         <div id="cache" class="panel">
             <h3>缓存与心跳</h3>
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
@@ -990,6 +1018,7 @@
             if (name === 'chapters') loadChapters();
             if (name === 'windows') loadWindows(winConv);
             if (name === 'cache') loadCache();
+            if (name === 'notebook') loadNotebook();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -3085,6 +3114,58 @@ function rebuildProfile() {
         function apiCall(method, path, body) {
             return fetch(API + path, { method: method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
                 .then(function(r) { return r.json(); }).then(function(d) { if (d && d.status === 'error') alert(d.message); return d; });
+        }
+
+        // ============ 小本子 ============
+        function loadNotebook() {
+            var st = document.getElementById('nb-status').value;
+            fetch(API + '/notes?status=' + st).then(function(r) { return r.json(); }).then(function(d) {
+                var cnt = d.counts || {};
+                document.getElementById('nb-statusline').textContent = '记着 ' + (cnt.active || 0) + ' 条 · 擦掉 ' + (cnt.erased || 0) + ' 条';
+                var spec = d.settings_spec || {};
+                document.getElementById('nb-toggles').innerHTML = (spec.items || []).filter(function(it) { return it.type === 'bool'; }).map(function(it) {
+                    return '<label title="' + escapeHtml(it.help) + '"><input type="checkbox" ' + (it.value ? 'checked' : '') + ' onchange="saveNotebookToggle(\'' + it.key + '\', this.checked)"> ' + escapeHtml(it.label) + '（开着时模型能记、也会放进聊天）</label>';
+                }).join('');
+                renderGroupSettings('nb-settings', spec, 'notebook', 'nb-statusline', loadNotebook);
+                var notes = d.notes || [];
+                document.getElementById('nb-list').innerHTML = notes.length ? notes.map(function(n) {
+                    var erased = n.status === 'erased';
+                    return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:13px;line-height:1.7;' + (erased ? 'opacity:.55;' : '') + '">'
+                        + '<span style="color:#888;">#' + n.id + ' · ' + formatTime(n.created_at) + ' · ' + (n.source === 'user' ? '我写的' : 'ta 记的')
+                        + (n.edited_by && n.updated_at !== n.created_at ? ' · ' + (n.edited_by === 'user' ? '我' : 'ta') + '改过' : '') + (n.pinned ? ' · 📌 钉住' : '') + '</span><br>'
+                        + '<span id="nb-text-' + n.id + '">' + escapeHtml(n.text) + '</span>'
+                        + '<div style="margin-top:4px;display:flex;gap:10px;font-size:12px;">'
+                        + (erased ? '<a href="#" onclick="notebookAct(\'restore\',' + n.id + ');return false;">恢复</a>'
+                            : '<a href="#" onclick="notebookEdit(' + n.id + ');return false;">改</a>'
+                              + '<a href="#" onclick="notebookAct(\'' + (n.pinned ? 'unpin' : 'pin') + '\',' + n.id + ');return false;">' + (n.pinned ? '取消钉住' : '钉住') + '</a>'
+                              + '<a href="#" style="color:#c0392b;" onclick="notebookAct(\'erase\',' + n.id + ');return false;">擦掉</a>')
+                        + '</div></div>';
+                }).join('') : '<div style="color:#888;font-size:12px;">还没有</div>';
+                var pv = (d.in_system || '（system 里现在没有：今天之前还没记过，或者关着）') + ((d.fresh || []).length ? '\n\n窗口开头那行附注（今天新记的，窗口下次往后挪时带上）：\n' + d.fresh.join('\n') : '');
+                document.getElementById('nb-preview').textContent = pv;
+            }).catch(function(e) { document.getElementById('nb-statusline').textContent = '读取失败：' + e; });
+        }
+        function notebookAct(action, id, text) {
+            return apiCall('POST', '/notes/act', { action: action, id: id, text: text, by: 'user' }).then(function(d) {
+                if (d && d.status !== 'error') { document.getElementById('nb-statusline').textContent = d.message || '好了'; loadNotebook(); }
+            });
+        }
+        function notebookEdit(id) {
+            var cur = document.getElementById('nb-text-' + id).textContent;
+            var t = prompt('改成：', cur);
+            if (t != null && t.trim() && t !== cur) notebookAct('edit', id, t);
+        }
+        function notebookWrite() {
+            var el = document.getElementById('nb-new');
+            if (!el.value.trim()) return;
+            apiCall('POST', '/notes/act', { action: 'write', text: el.value, by: 'user' }).then(function(d) {
+                if (d && d.status !== 'error') { document.getElementById('nb-statusline').textContent = d.message || '记下了'; el.value = ''; loadNotebook(); }
+            });
+        }
+        function saveNotebookToggle(key, on) {
+            var v = {}; v[key] = on;
+            fetch(API + '/notebook/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: v }) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') alert(d.message); else loadNotebook(); });
         }
 
         // ============ 缓存与心跳 ============

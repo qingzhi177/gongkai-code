@@ -29,6 +29,7 @@ from datetime import timedelta
 
 import timeutil
 from app import branches
+from app import notes as notebook
 from app import settings as app_settings
 from app.pipeline import episodes as EP
 
@@ -494,6 +495,10 @@ def compose(c, conv_id, entries, link=None, now=None, settings=None):
                     start += "更早、还没整理成每日片段的那部分，我在它们滑出窗口前记下了几句：\n" + "\n".join(lines)
                 if pending >= 4:
                     start += f"\n（还有 {pending} 条也已经不在窗口里，还没来得及记下）"
+        # 今天新记在小本子上的（还没进 system 的日更块）：跟着这一行定格，窗口下次往后挪时再带上更新的
+        fresh = notebook.fresh_lines(c, now) if s["notes"] else []
+        if fresh:
+            start += ("\n" if start else "") + "这几笔是我新记在小本子上的（还没整理进 system）：\n" + "\n".join(fresh)
         start = note(start) if start else ""
         c.execute("INSERT INTO window_state (conv_id, first_row_id, sig, note, pending, updated_at) VALUES (?, ?, ?, ?, ?, ?) "
                   "ON CONFLICT(conv_id) DO UPDATE SET first_row_id=excluded.first_row_id, sig=excluded.sig, note=excluded.note, "

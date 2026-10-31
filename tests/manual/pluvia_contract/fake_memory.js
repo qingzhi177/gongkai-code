@@ -46,6 +46,7 @@ app.post('/compose/window', (q, r) => {
   if (w === 'slow') return setTimeout(() => r.json({ status: 'ok', notes: [{ i: 0, text: '［慢］' }] }), 3000);
   r.json({ status: 'ok', notes: (w && w.notes) || [], turn_note: (w && w.turn_note) || '', info: { matched: (q.body.entries || []).length, ms: 1 } });
 });
+app.post('/notes/act', (q, r) => { log('note', q.body); r.json({ status: 'ok', note: { id: 7 }, message: '记下了（#7）：「' + (q.body.text || '') + '」' }); });
 app.post('/compose/confirm', (q, r) => { log('confirm', q.body); r.json({ status: 'ok', delivered: 1 }); });
 app.get('/compose/system', (q, r) => {
   if (compose.system === 'error') return r.status(500).json({ status: 'error', message: '测试：出错' });

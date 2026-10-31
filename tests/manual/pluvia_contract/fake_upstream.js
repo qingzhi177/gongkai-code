@@ -18,7 +18,7 @@ async function splitWrite(res, str) {
   res.write(b.subarray(prev));
 }
 function scenario(body) {
-  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N|U)\]/g);
+  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N|U|J)\]/g);
   return m ? m[m.length - 1][1] : 'A';
 }
 function resultIds(msgs) {
@@ -122,6 +122,8 @@ http.createServer((req, res) => {
     } else if (scen === 'D' && !ids.has('toolu_d2')) {
       blocks = [{ type: 'thinking', thinking: '再拾个贝', signature: 'SIGD2' }, { type: 'text', text: '再存一下' },
         { type: 'tool_use', id: 'toolu_d2', name: 'keepsake', input: { note: 'x' } }]; stop = 'tool_use';
+    } else if (scen === 'J' && !ids.has('toolu_jot1')) {   // 小本子：模型记一笔
+      blocks = [{ type: 'tool_use', id: 'toolu_jot1', name: 'jot', input: { text: '你说楼下的猫换了蓝色的项圈' } }]; stop = 'tool_use';
     } else if (scen === 'S') {
       blocks = [{ type: 'text', text: '慢慢说', slow: true }];
     } else {

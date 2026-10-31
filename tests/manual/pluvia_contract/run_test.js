@@ -794,6 +794,35 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
       'T31 心跳：从 message_start 读到用量就收工（假上游只读了 10 个，当成缓存没了、不再心跳）', logs);
   }
 
+  console.log('T32 小本子：jot 工具（约定 16）');
+  {
+    const m = mark();
+    const s1 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-jot',
+      pluvia: { v: '0.2', turn: { id: 'tj1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '楼下的猫 [J]' }] })));
+    await sleep(300);
+    const d = since(m);
+    const notes = d.mem.filter(x => x.k === 'note');
+    const up = upReqs(d);
+    const cc = await (await fetch(GW + '/v1/pluvia/contract')).json();
+    ok(['cache_ttl', 'keepwarm', 'jot'].every(f => cc.features.includes(f)), 'T32 能力协商里有 cache_ttl、keepwarm、jot', cc.features);
+    ok(up[0] && up[0].tools.some(t => t.name === 'jot') && /小本子/.test(JSON.stringify(up[0].system)), 'T32 模型拿得到 jot，system 里说明了小本子', up[0] && up[0].tools.map(t => t.name));
+    ok(/对彼此的认识和理解/.test(JSON.stringify(up[0].system)) && !/\[人格画像\]/.test(JSON.stringify(up[0].system)), 'T32 画像那段改叫「对彼此的认识和理解」');
+    ok(notes.length === 1 && notes[0].b.action === 'write' && notes[0].b.conv_id === 'conv-jot' && notes[0].b.by === 'ai'
+      && notes[0].b.text === '你说楼下的猫换了蓝色的项圈', 'T32 网关执行 jot：转给记忆服务，带上对话 id', notes.map(x => x.b));
+    const ev = s1.tools.filter(t => t.name === 'jot');
+    ok(ev.some(t => t.status === 'done' && /记下了（#7）/.test(t.content || '')), 'T32 前端收到 jot 的工具事件（running → done）', ev);
+    ok(up[1] && JSON.stringify(up[1].messages).includes('记下了（#7）') && s1.text === '好啦，弄好了', 'T32 结果交回模型，接着说完', s1.text);
+    await (await fetch('http://127.0.0.1:3998/_test/compose', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ system: { notebook: false } }) })).json();
+    await sleep(3100);   // 网关把 /compose/system 缓存 3 秒
+    const m2 = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-jot2',
+      pluvia: { v: '0.2', turn: { id: 'tj2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '随便聊聊' }] }));
+    await sleep(200);
+    const up2 = upReqs(since(m2))[0];
+    ok(up2 && !up2.tools.some(t => t.name === 'jot') && up2.tools.some(t => t.name === 'recall'), 'T32 Dashboard 关掉小本子：不给 jot', up2 && up2.tools.map(t => t.name));
+    await (await fetch('http://127.0.0.1:3998/_test/compose', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) })).json();
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

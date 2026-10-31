@@ -203,8 +203,8 @@ def test_failure(tmp):
         raised = True
     check("编号重复会报错", raised)
     (mdir / "900_dup.py").unlink()
-    (mdir / "notes.py").write_text("x = 1", encoding="utf-8")
-    check("不符合命名的文件被忽略", all(m.name != "notes" for m in db.discover(mdir)))
+    (mdir / "scratch.py").write_text("x = 1", encoding="utf-8")   # 不能和真的迁移重名（020_notes 的 name 就是 notes）
+    check("不符合命名的文件被忽略", all(m.name != "scratch" for m in db.discover(mdir)))
 
 
 # ---------- 4. 两个进程同时启动 ----------

@@ -288,7 +288,7 @@ function buildTurnMessages(messages, aiText) {
 
 // ============ Pluvia 接入约定 v0.2（docs/plan/pluvia-gateway-contract.md） ============
 // 只有 body 里带了 pluvia 对象的请求才走 v0.2 逻辑；Kelivo 等其它客户端的路径不变。
-const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes'] };
+const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes', 'cache_ttl', 'keepwarm', 'jot'] };
 
 // 网关时间头：auto（默认）= 前端已经带了「此刻：」就不再加 [当前时间]、带了「离上一句」就不再加 [距上次对话]，
 // 免得模型同时看到两个钟；on = 总是加；off = 都不加。在 .env 里设 GATEWAY_TIME_HEADER 修改。
@@ -762,20 +762,20 @@ function toolLoopLacksThinking(messages) {
 }
 
 // ---- tool_events：记忆工具执行过程，推给前端只做显示 ----
-const TOOL_ERR_RE = /^(检索失败|记忆检索出错|记录感受失败|更新画像失败|网络搜索失败|网络搜索未配置|工具执行失败)/;
+const TOOL_ERR_RE = /^(检索失败|记忆检索出错|记录感受失败|更新画像失败|网络搜索失败|网络搜索未配置|工具执行失败|小本子没记上)/;
 function toolEventContent(name, out) {
   let s = String(out == null ? '' : out);
   if (name === 'recall') s = s.replace(/\n*😊 情感：valence [^\n]*/g, '');   // 内部打分不给前端看
   s = s.replace(/^\s+/, '');
   return s.length > 2000 ? s.slice(0, 2000) + '…' : s;
 }
-async function runServerTool(u, emitter, events) {
+async function runServerTool(u, emitter, events, ctx = {}) {
   const base = { id: u.id, name: u.name, arguments: u.input || {} };
   if (emitter) emitter.toolEvent({ ...base, status: 'running' });
   let out;
   let status = 'done';
   try {
-    out = await executeTool(u.name, u.input || {});
+    out = await executeTool(u.name, u.input || {}, ctx);
     if (out == null || out === '') out = '（无返回内容）';
     if (TOOL_ERR_RE.test(String(out))) status = 'error';
   } catch (e) {
@@ -899,7 +899,7 @@ const TOOLS = [
     type: "function",
     function: {
       name: "update_profile",
-      description: "更新人格画像。当对话中出现值得长期记住的特征、偏好变化、关系发展时使用。",
+      description: "更新「对彼此的认识和理解」（system 里那一段，分 about_user / about_ai / about_us）：对你、对我自己、对我们之间有了新的、会长期成立的认识时使用（偏好变了、相处的样子有了新的变化……）。这里写的是从一起经历的事里慢慢形成的稳定理解，不是一件件具体的事——具体的小事、小瞬间请记在小本子上（jot）。",
       parameters: {
         type: "object",
         properties: {
@@ -919,6 +919,22 @@ const TOOLS = [
           }
         },
         required: ["section", "action", "content"]
+      }
+    }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'jot',
+      description: '在你自己的小本子上随手记一笔。记的是聊天里偶然冒出来的细碎细节、有意思的小瞬间、想以后接上的小线头——每日片段和摘要可能抓不住、但你想记住的那种。\n\n- 用第一人称写一两句（「我」是你，「你」是和你说话的人），只写发生了的事，不用写日期（会自动记上）。\n- 和 update_profile 不同：画像写的是对彼此稳定的认识，小本子记的是具体的小事；和 feel 不同：feel 记你自己的感受。\n- 不用每轮都记，觉得「这个想记住」的时候再记；想记的时候不用问对方。\n- 记错了、过时了：action=edit（带 id 和改好的 text）或 erase（带 id）。编号在 system 的「小本子」那段和历史消息开头的附注里。\n- 不要记身份证号、卡号、密码这类敏感信息。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['write', 'edit', 'erase'], description: 'write=记一笔（默认）, edit=改一条, erase=擦掉一条' },
+          text: { type: 'string', description: '要记的内容（write / edit 时），一两句，200 字以内' },
+          id: { type: 'integer', description: '要改 / 擦的那一条的编号（edit / erase 时）' }
+        },
+        required: []
       }
     }
   },
@@ -982,7 +998,7 @@ async function getProfile() {
 
     return `## 关于用户\n${aboutUser}\n## 关于AI\n${aboutAi}\n## 关于我们\n${aboutUs}`;
   } catch (e) {
-    return '（画像暂无内容）';
+    return '（暂时还没有）';
   }
 }
 
@@ -1435,7 +1451,7 @@ function toolResultToItems(name, resultText) {
   return [mk(head || '已完成')];
 }
 
-async function executeTool(name, args) {
+async function executeTool(name, args, ctx = {}) {
   console.log('[TOOL] 调用:', name, JSON.stringify(args));
 
   if (name === 'recall') {
@@ -1502,7 +1518,7 @@ async function executeTool(name, args) {
       if (args.action === 'append') {
         const current = await fs.readFile(filePath, 'utf8').catch(() => '');
         await fs.writeFile(filePath, current + '\n' + args.content, 'utf8');
-        return '已追加到画像（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」';
+        return '已追加到「对彼此的认识和理解」（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」';
       } else if (args.action === 'rewrite') {
         // 备份旧版本
         const current = await fs.readFile(filePath, 'utf8').catch(() => '');
@@ -1511,13 +1527,26 @@ async function executeTool(name, args) {
           await fs.writeFile(`${dataDir}/${backupName}`, current, 'utf8');
         }
         await fs.writeFile(filePath, args.content, 'utf8');
-        return '画像已重写（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」（旧版本已备份）';
+        return '「对彼此的认识和理解」已重写（' + (args.section || '') + '）：「' + String(args.content || '').slice(0, 80) + '」（旧版本已备份）';
       }
     } catch (e) {
       return `更新画像失败: ${e.message}`;
     }
   }
   
+  // 小本子（记忆服务 app/notes.py）：write / edit / erase
+  if (name === 'jot') {
+    try {
+      const r = await axios.post(`${MEMORY_SERVICE_URL}/notes/act`, {
+        action: args.action || 'write', id: args.id, text: args.text || args.content, conv_id: ctx.convId || null, by: 'ai'
+      }, { timeout: 8000 });
+      const d = r.data || {};
+      return d.status === 'error' ? `小本子没记上：${d.message || '出错了'}` : (d.message || '记下了');
+    } catch (e) {
+      return `小本子没记上：${e.message}`;
+    }
+  }
+
   // Kelivo 常用工具兼容（前端实际传的时间工具名是 get_time_info）
   if (name === 'get_current_time' || name === 'get_time' || name === 'get_time_info') {
     return '当前时间：' + fmtLocal(new Date(), { seconds: true, weekday: true }) + '（' + USER_TZ_LABEL + '）';
@@ -2367,7 +2396,7 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
       // 同一次回复里既有记忆工具又有前端工具：先执行记忆工具、结果留着，只把前端工具交出去
       const serverResults = {};
       for (const u of uses) {
-        if (isServerTool(u.name)) serverResults[u.id] = await runServerTool(u, emitter, toolEvents);
+        if (isServerTool(u.name)) serverResults[u.id] = await runServerTool(u, emitter, toolEvents, { convId });
       }
       convo.push({ role: 'assistant', content: result.content });
       const clientUses = uses.filter(u => !isServerTool(u.name));
@@ -2680,13 +2709,14 @@ about_user（关于用户的理解）、about_ai（关于自身交流方式和�
 
 这些内容不是固定人格设定，也不是必须遵守的规则。它们代表过去形成的认识，可以帮助理解当前交流。随着新的交流，这些理解也可以变化。
 
-[人格画像]
+[对彼此的认识和理解]（从一起经历的事里慢慢形成的，不是设定）
 ${profile}${profileFacts}
 
 你可以使用以下工具：
 - recall: 需要更多细节时搜索记忆库（semantic=语义联想 / exact=逐字搜索完整原始对话记录，不受是否已被提炼进记忆摘要影响）
 - feel: 记录你当下的感受
-- update_profile: 更新人格画像
+- update_profile: 更新对彼此的认识和理解（稳定的认识）
+- jot: 在小本子上随手记一笔（聊天里细碎的细节、有意思的小瞬间）
 - bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）
 
 当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。
@@ -2699,7 +2729,7 @@ ${profile}${profileFacts}
 
 这些是我们曾经共同经历过的一点痕迹，可能与当前话题有关，也可能无关。不要刻意复述它们，不用逐条回应，也不要说「系统告诉我」「附注里写着」；只有在它们真的相关、真的有助于理解当前交流时，才自然地用上。
 
-历史消息里，有的用户消息最前面还有一行「［记忆系统附注｜……］」：写的是窗口里最早那条是几点的、更早滑出窗口的那段我记下的几句、和上一句隔了多久（或者中间省略了几条）、新开的窗口接着上一个窗口的哪里。它们也是系统加的，不是用户说的，用户看不到；只是帮你弄清时间和前后，不用回应，也不要模仿这种写法。
+历史消息里，有的用户消息最前面还有一行「［记忆系统附注｜……］」：写的是窗口里最早那条是几点的、更早滑出窗口的那段我记下的几句、最近新记在小本子上的几笔、和上一句隔了多久（或者中间省略了几条）、新开的窗口接着上一个窗口的哪里。它们也是系统加的，不是用户说的，用户看不到；只是帮你弄清时间和前后，不用回应，也不要模仿这种写法。
 
 记忆片段只是部分提醒，不代表所有相关记忆都已列出。如果你觉得某个话题以前聊过但没看到相关片段，可以用 recall 去找（exact 模式能搜到原始对话）。`;
 
@@ -2800,7 +2830,9 @@ ${profile}${profileFacts}
     // 前端工具已是原生格式，TOOLS 是 OpenAI 格式，toAnthropicTool 做统一归一。
     // Pluvia v0.2：前端工具和记忆工具撞名时以网关为准（去掉前端那份）。
     const clientTools = (req.body.tools || []).filter(t => !(pv && isServerTool(toolNameOf(t))));
-    const allTools = [...clientTools, ...TOOLS].map(toAnthropicTool);
+    // 小本子在 Dashboard 上关掉时不给 jot（记忆服务的 /compose/system 带着开关；拿不到时照常给）
+    const gwTools = TOOLS.filter(t => !(t.function.name === 'jot' && composed && composed.notebook === false));
+    const allTools = [...clientTools, ...gwTools].map(toAnthropicTool);
     console.log('[TOOLS] 合并后:', JSON.stringify(allTools.map(t => t.name)));
     // OpenAI 格式的 tool_choice（如 Pluvia 第 5 轮的 "none"）转成 Anthropic 格式；Anthropic 格式原样
     const toolChoice = toAnthropicToolChoice(req.body.tool_choice);
@@ -2875,7 +2907,7 @@ ${profile}${profileFacts}
           for (const toolUse of toolUseBlocks) {
             // 下面两张卡片（toolUseCard / toolResolve）是专为 Kelivo 显示做的变通，Pluvia 不需要
             if (!pvClient) emitter.toolUseCard(toolUse.id, toolUse.name, toolUse.input);
-            const toolResult = await executeTool(toolUse.name, toolUse.input);
+            const toolResult = await executeTool(toolUse.name, toolUse.input, { convId: computeConvId(req) });
             // 卡片是 tool_use 块 → Kelivo 会创建 loading 工具块，且因为它没有该工具的 onToolCall
             // 而永不解除，hasLoadingTool 恒真 → 阻断 token 归属（显示 0 的根因）。
             // 补发一个 tool_use_id 匹配的结果块解除该 loading（Kelivo 唯一会解析成 toolResults 的流块）。
@@ -2990,7 +3022,7 @@ if (thinkAcc.length && result) {
       // 执行工具
       const toolResults = [];
       for (const toolUse of toolUseBlocks) {
-        const toolResult = await executeTool(toolUse.name, toolUse.input);
+        const toolResult = await executeTool(toolUse.name, toolUse.input, { convId: computeConvId(req) });
         toolResults.push({
           type: 'tool_result',
           tool_use_id: toolUse.id,

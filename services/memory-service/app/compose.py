@@ -3,7 +3,7 @@
 网关的 system 分三段，每段都带 1 小时缓存断点；内容只在底下的数据变了时才变，同一天里多轮聊天都能命中缓存：
 - 静态块：人设与原则、记忆使用说明、人格画像（md）——网关自己拼；这里给它接在画像后面的「事实」档案几行（profile_extra）；
 - 半静态块（semi）：章节目录 + 进行中的这一章、进行中的主题线、共同语汇；
-- 日更块（daily）：关系状态卡（「我们最近」）、近七天摘要、最近几天的片段标题、还没了结的事。
+- 日更块（daily）：关系状态卡（「我们最近」）、近七天摘要、最近几天的片段标题、还没了结的事、小本子（今天之前记的）。
 
 每一层都能在 Dashboard 上单独关掉（app_settings 的 compose.*）。章节或新版摘要关掉、或者还没有时，放回旧的
 「共同经历叙事」「近期摘要」，保证不会突然少一大块。
@@ -14,6 +14,7 @@ import json
 from datetime import date
 
 from app import settings as app_settings
+from app import notes as notebook
 from app.config import get_conn
 from app.pipeline import arcs as AR
 from app.pipeline import chapters as C
@@ -186,6 +187,7 @@ def system_blocks(now=None):
     """返回 {recall_live, profile_extra, semi, daily, parts: {名字: 字数}, legacy: [...]}。
     parts 里只列真的放进去的；legacy 列出哪几块用了旧的（叙事 / 近期摘要）。"""
     c = cfg()
+    nb = notebook.cfg()
     conn = get_conn()
     try:
         pols = S.policies(conn)
@@ -221,12 +223,13 @@ def system_blocks(now=None):
         daily = [use("state", c["state"], lambda: state_text(conn, pols)),
                  digest,
                  use("episodes", c["episodes"], lambda: episodes_text(conn, kws)),
-                 use("loops", c["loops"], lambda: loops_text(now))]
+                 use("loops", c["loops"], lambda: loops_text(now)),
+                 use("notebook", nb["enabled"], lambda: notebook.system_text(conn, now, nb))]
     finally:
         conn.close()
     semi = [x for x in semi if x]
     daily = [x for x in daily if x]
-    return {"recall_live": c["recall_live"], "profile_extra": profile_extra,
+    return {"recall_live": c["recall_live"], "notebook": bool(nb["enabled"]), "profile_extra": profile_extra,
             "semi": "\n\n".join([SEMI_INTRO] + semi) if semi else "",
             "daily": "\n\n".join([DAILY_INTRO] + daily) if daily else "",
             "parts": parts, "legacy": legacy}

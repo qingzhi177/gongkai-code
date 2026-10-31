@@ -41,6 +41,7 @@ from app import settings as app_settings   # Dashboard 上可调的参数（召�
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app import windows as window_notes     # 换窗衔接：窗口里的时间标记、滑出窗口那段的小结、新窗口接上一窗（方案第 16 章）
 from app import cache_stats   # 缓存记录与缓存心跳（Dashboard「缓存与心跳」页）
+from app import notes as notebook   # 小本子：模型自己随手记下的小事（jot 工具）
 from app.pipeline import bridge as bridge_pipeline   # 滑出窗口那段的小结（后台任务）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
@@ -1950,9 +1951,14 @@ async def delete_l0_conversation(conv_id: str):
         window_notes.forget_conv(c, conv_id)
     except sqlite3.OperationalError:
         pass
+    # 5. 小本子：在这个对话里记下的几笔（从这段对话来的，跟着一起删）
+    try:
+        c.execute("DELETE FROM notes WHERE conv_id=?", (conv_id,))
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
-    # 4. 从 ChromaDB 删除对应向量
+    # 6. 从 ChromaDB 删除对应向量
     if l1_ids:
         try:
             l1_collection.delete(ids=[f"l1_{i}" for i in l1_ids])
@@ -3014,6 +3020,57 @@ async def reset_windows_settings(req: SettingsReset):
     except ValueError as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
     return {"status": "ok", **app_settings.describe("windows")}
+
+# ============ 小本子（模型用 jot 工具随手记下的小事；Dashboard 上能看、改、擦、钉住、自己写） ============
+class NoteAct(BaseModel):
+    action: str = "write"          # write / edit / erase / restore / pin / unpin
+    id: Optional[int] = None
+    text: Optional[str] = None
+    conv_id: Optional[str] = None
+    by: str = "ai"                 # ai（网关转来的 jot）/ user（Dashboard）
+
+@app.post("/notes/act")
+async def notes_act(req: NoteAct):
+    if req.by != "user" and not notebook.cfg()["enabled"]:
+        return {"status": "error", "message": "小本子现在关着（Dashboard 上能打开）"}
+    conn = get_conn()
+    try:
+        out = notebook.act(conn, req.action, req.id, req.text, req.conv_id, by=req.by)
+        conn.commit()
+    finally:
+        conn.close()
+    return out
+
+@app.get("/notes")
+async def list_notes(status: str = "active", limit: int = 200):
+    conn = get_conn()
+    try:
+        out = notebook.overview(conn, status, max(1, min(1000, limit)))
+        out["in_system"] = notebook.system_text(conn)
+        out["fresh"] = notebook.fresh_lines(conn)
+    finally:
+        conn.close()
+    return {**out, "settings_spec": app_settings.describe("notebook")}
+
+@app.get("/notebook/settings")
+async def get_notebook_settings():
+    return app_settings.describe("notebook")
+
+@app.put("/notebook/settings")
+async def put_notebook_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("notebook", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("notebook")}
+
+@app.post("/notebook/settings/reset")
+async def reset_notebook_settings(req: SettingsReset):
+    try:
+        app_settings.reset("notebook", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("notebook")}
 
 # ============ 缓存与心跳（网关报用量，Dashboard 看命中率、调缓存时长和心跳） ============
 class CacheEvent(BaseModel):
