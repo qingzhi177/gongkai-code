@@ -166,6 +166,7 @@
             <button class="tab" onclick="showPanel('state')">关系状态</button>
             <button class="tab" onclick="showPanel('chapters')">章节</button>
             <button class="tab" onclick="showPanel('windows')">换窗衔接</button>
+            <button class="tab" onclick="showPanel('cache')">缓存与心跳</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -637,6 +638,27 @@
                 <div id="ch-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
+        <div id="cache" class="panel">
+            <h3>缓存与心跳</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                模型那边会把发过去的前缀（system + 聊天记录）缓存一阵子，下一轮开头一样的部分直接读缓存，只要全价的十分之一；没命中就要重新写一遍（1 小时缓存是全价的 2 倍、5 分钟缓存 1.25 倍）。这里能看到每一轮命中了多少，也能调：<br>
+                ① <b>缓存时长</b>：前端打在聊天记录上的缓存标记，网关统一换成这里选的时长（默认 1 小时，隔一会儿再回也能命中）。<br>
+                ② <b>同一家</b>：OpenRouter 会把同一个模型分给 Anthropic、Google Vertex、Amazon Bedrock，每家的缓存是分开的，换一家就要重新写；开着时下一轮优先发给上一轮那家。<br>
+                ③ <b>缓存心跳</b>：停下来没聊的时候，隔一段时间把上一轮原样再发一次（只读缓存，模型只回一个字，前端看不到、不存记忆），缓存就不会过期。停下太久、或者当天次数到了上限就不再发。<br>
+                前端的滑动窗口每挪一次，聊天记录那部分本来就要重新写一次（system 那部分照样命中），这是正常的。设置改了以后半分钟内生效。
+            </div>
+            <div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <button class="btn" onclick="loadCache()" style="background:#6c757d;">刷新</button>
+                <span id="cache-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="cache-summary" style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;line-height:1.9;"></div>
+            <div id="cache-toggles" style="margin-bottom:12px;display:flex;flex-wrap:wrap;gap:14px;font-size:13px;"></div>
+            <h4 style="margin:6px 0 8px;">最近几轮</h4>
+            <div id="cache-events" style="margin-bottom:14px;overflow-x:auto;"></div>
+            <details><summary style="cursor:pointer;font-size:13px;color:#555;">心跳的设置</summary>
+                <div id="cache-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
         <div id="windows" class="panel">
             <h3>换窗衔接</h3>
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
@@ -967,6 +989,7 @@
             if (name === 'state') loadState();
             if (name === 'chapters') loadChapters();
             if (name === 'windows') loadWindows(winConv);
+            if (name === 'cache') loadCache();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -3062,6 +3085,44 @@ function rebuildProfile() {
         function apiCall(method, path, body) {
             return fetch(API + path, { method: method, headers: { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : JSON.stringify(body) })
                 .then(function(r) { return r.json(); }).then(function(d) { if (d && d.status === 'error') alert(d.message); return d; });
+        }
+
+        // ============ 缓存与心跳 ============
+        function pct(x) { return x == null ? '—' : Math.round(x * 100) + '%'; }
+        function usd(x) { return x == null ? '—' : '$' + (x < 0.01 ? x.toFixed(4) : x.toFixed(3)); }
+        function loadCache() {
+            fetch(API + '/cache').then(function(r) { return r.json(); }).then(function(d) {
+                var day = d.day || {}, kw = d.keepwarm || {};
+                var prov = Object.keys(day.by_provider || {}).map(function(k) { return escapeHtml(k || '?') + ' ' + day.by_provider[k] + ' 轮'; }).join('、');
+                var html = '<b>最近 24 小时</b>：聊了 ' + (day.turns || 0) + ' 轮，平均命中 ' + pct(day.avg_hit_rate) + '，其中 ' + (day.misses || 0) + ' 轮重新写了一大段缓存'
+                    + (prov ? '；回答的：' + prov : '') + '；聊天约 ' + usd(day.turn_cost) + '<br>'
+                    + '<b>心跳</b>：' + (day.beats || 0) + ' 次，约 ' + usd(day.beat_cost) + '（只算读缓存，心跳的输出没算进来，一般只有几十个字）<br>';
+                if (kw.armed) html += '<b>正在保温</b>：对话 <code>' + escapeHtml(String(kw.conv_id || '').slice(0, 10)) + '</code>' + (kw.provider ? ' · ' + escapeHtml(kw.provider) : '')
+                    + ' · ' + escapeHtml(kw.ttl || '') + ' · 下一次 ' + formatTime(kw.next_at) + ' · 最晚保温到 ' + formatTime(kw.idle_until) + ' · 今天 ' + (kw.beats_today || 0) + ' 次';
+                else html += '<b>现在没在保温</b>' + (kw.reason ? '：' + escapeHtml(kw.reason) : (kw.updated_at ? '' : '（网关还没报过状态，聊一轮以后就有）'));
+                html += '<div style="font-size:12px;color:#888;">费用按公开价格粗算（认得出的模型才算），不是账单。</div>';
+                document.getElementById('cache-summary').innerHTML = html;
+                var spec = d.settings_spec || {};
+                document.getElementById('cache-toggles').innerHTML = (spec.items || []).filter(function(it) { return it.type === 'bool'; }).map(function(it) {
+                    return '<label title="' + escapeHtml(it.help) + '"><input type="checkbox" ' + (it.value ? 'checked' : '') + ' onchange="saveCacheToggle(\'' + it.key + '\', this.checked)"> ' + escapeHtml(it.label) + '</label>';
+                }).join('');
+                renderGroupSettings('cache-settings', spec, 'cache', 'cache-status', loadCache);
+                var ev = d.events || [];
+                document.getElementById('cache-events').innerHTML = ev.length ? '<table style="border-collapse:collapse;font-size:12px;min-width:620px;"><tr style="color:#888;text-align:left;">'
+                    + '<th style="padding:3px 8px;">时间</th><th>是什么</th><th>哪家</th><th>时长</th><th style="text-align:right;">读缓存</th><th style="text-align:right;">写缓存</th><th style="text-align:right;">没缓存的输入</th><th style="text-align:right;">命中</th><th style="text-align:right;">约</th></tr>'
+                    + ev.map(function(e) {
+                        var bg = e.kind === 'beat' ? '#f3f8f3' : (e.miss ? '#fff4f0' : '');
+                        return '<tr style="border-top:1px solid #eee;background:' + bg + ';"><td style="padding:3px 8px;white-space:nowrap;">' + formatTime(e.ts) + '</td><td>' + (e.kind === 'beat' ? '心跳' : '聊天') + (e.note ? '（' + escapeHtml(e.note) + '）' : '')
+                            + '</td><td>' + escapeHtml(e.provider || '') + '</td><td>' + escapeHtml(e.ttl || '') + '</td><td style="text-align:right;">' + e.cache_read + '</td><td style="text-align:right;">' + e.cache_write
+                            + '</td><td style="text-align:right;">' + e.input + '</td><td style="text-align:right;">' + pct(e.hit_rate) + '</td><td style="text-align:right;">' + usd(e.cost) + '</td></tr>';
+                    }).join('') + '</table><div style="font-size:12px;color:#888;margin-top:4px;">浅红：这一轮重新写了一大段（换了一家、缓存过期了、或者前端的窗口刚挪过）；浅绿：心跳。</div>'
+                    : '<div style="color:#888;font-size:12px;">还没有记录（网关更新以后聊一轮就有）</div>';
+            }).catch(function(e) { document.getElementById('cache-status').textContent = '读取失败：' + e; });
+        }
+        function saveCacheToggle(key, on) {
+            var v = {}; v[key] = on;
+            fetch(API + '/cache/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: v }) })
+                .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') alert(d.message); else loadCache(); });
         }
 
         // ============ 换窗衔接 ============

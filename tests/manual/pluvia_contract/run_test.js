@@ -744,6 +744,56 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(r.sv.length === 1 && r.sv[0].b.forged_from && r.sv[0].b.forged_from.carried === null, 'T30 carried 不是数字：当没说', r.sv[0] && r.sv[0].b.forged_from);
   }
 
+  console.log('T31 缓存时长、用量记录（约定 16）');
+  {
+    const H = { 'x-api-key': 'x', 'anthropic-version': '2023-06-01' };
+    const msg = { role: 'user', content: [{ type: 'text', text: '缓存测试', cache_control: { type: 'ephemeral' } }] };
+    const send = async (conv, extra) => {
+      const m = mark();
+      await sseCollect(await post('/v1/messages', { model: 'fake-model', max_tokens: 100, stream: true, conversation_id: conv,
+        pluvia: { v: '0.2', turn: { id: 't-' + conv, round: 1 }, tail: '', ...(extra || {}) }, messages: [msg] }, H));
+      await sleep(300);
+      const d = since(m);
+      const req = upReqs(d)[0];
+      const last = req && req.messages[req.messages.length - 1];
+      return { req, cc: last && Array.isArray(last.content) ? last.content.filter(b => b.cache_control).map(b => b.cache_control) : [],
+        ev: d.mem.filter(x => x.k === 'cache_event'), kw: d.mem.filter(x => x.k === 'keepwarm') };
+    };
+    let r = await send('conv-cache1');
+    ok(r.cc.length === 1 && r.cc[0].ttl === '1h', 'T31 默认：前端打的 5 分钟断点换成 1 小时', r.cc);
+    ok((r.req.system || []).filter(b => b.cache_control).every(b => b.cache_control.ttl === '1h'), 'T31 system 的断点都是 1 小时', r.req.system);
+    ok(r.ev.length === 1 && r.ev[0].b.kind === 'turn' && r.ev[0].b.conv_id === 'conv-cache1' && r.ev[0].b.ttl === '1h'
+      && r.ev[0].b.input === 100 && r.ev[0].b.cache_read === 10 && r.ev[0].b.output === 20 && r.ev[0].b.relay === 'fake', 'T31 一轮聊天的用量报给记忆服务（只有数字）', r.ev[0] && r.ev[0].b);
+    ok(r.kw.length >= 1 && r.kw[r.kw.length - 1].b.conv_id === 'conv-cache1', 'T31 这一轮设成缓存心跳的对象', r.kw.map(x => x.b));
+    await (await fetch('http://127.0.0.1:3998/_test/cache', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ttl_1h: false }) })).json();
+    await (await fetch(GW + '/reload-config', { method: 'POST' })).json();
+    r = await send('conv-cache2');
+    ok(r.cc.length === 1 && !('ttl' in r.cc[0]) && r.cc[0].type === 'ephemeral', 'T31 设成 5 分钟：断点不带 ttl（5 分钟）', r.cc);
+    ok(r.ev.length === 1 && r.ev[0].b.ttl === '5m', 'T31 用量里记着 5 分钟', r.ev[0] && r.ev[0].b);
+    await (await fetch('http://127.0.0.1:3998/_test/cache', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({}) })).json();
+    await (await fetch(GW + '/reload-config', { method: 'POST' })).json();
+    r = await send('conv-cache3', { aux: 'translate' });
+    ok(r.ev.length === 0 && r.kw.length === 0, 'T31 辅助请求（翻译）不记用量、不设成心跳对象', r.ev.map(x => x.b));
+    ok(!('provider' in (r.req || {})), 'T31 不是 OpenRouter：请求里不带 provider', r.req && r.req.provider);
+    // 心跳真的发出去：流式，收到 message_start 就断开（用假上游，假时钟）
+    const K = require(require('path').join(__dirname, '../../../services/gateway/keepwarm.js'));
+    let t = Date.now();
+    const logs = [];
+    const kw = K.createKeepwarm({ memoryUrl: 'http://127.0.0.1:3998', report: false, now: () => t, log: x => logs.push(x) });
+    kw._setSettings({});
+    const tgt = { name: 'fake', apiUrl: 'http://127.0.0.1:3997/v1/messages', apiKey: 'k', model: 'fake-model' };
+    kw.noteTurn({ convId: 'conv-beat', target: tgt, result: { id: 'msg_u' }, usage: {}, ttlUsed: '1h',
+      base: { system: [{ type: 'text', text: 'S', cache_control: { type: 'ephemeral', ttl: '1h' } }], messages: [msg], tools: [], thinking: null } });
+    const m = mark();
+    t += 51 * 60000; await kw.tick();
+    await sleep(200);
+    const br = upReqs(since(m))[0];
+    ok(br && br.stream === true && br.messages[0].content.slice(-1)[0].text === K.BEAT_TEXT && br.max_tokens === 256,
+      'T31 心跳：流式发出去，消息到断点为止再加保温说明', br && { ...br, system: 0 });
+    ok(logs.some(x => /心跳：读缓存 10 \| 写缓存 5/.test(x)) && !kw._armed() && /没了/.test(kw.state().reason),
+      'T31 心跳：从 message_start 读到用量就收工（假上游只读了 10 个，当成缓存没了、不再心跳）', logs);
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

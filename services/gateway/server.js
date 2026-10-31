@@ -85,6 +85,10 @@ function stripClientStamp(text) {
 // （.env 的 USER_TZ，默认 Asia/Shanghai）。以前有的地方把 UTC 当北京时间用，日期会差 8 小时（凌晨的事被算成前一天）。
 const USER_TZ = process.env.USER_TZ || 'Asia/Shanghai';
 const USER_TZ_LABEL = USER_TZ === 'Asia/Shanghai' ? '北京时间' : USER_TZ;
+// 缓存时长、同一家供应商、缓存心跳（keepwarm.js；Dashboard「缓存与心跳」页能调）。GATEWAY_KEEPWARM=off：心跳整个不跑（缓存时长照样按设置换）。
+const { createKeepwarm, providerOf, providerName, isOpenRouter } = require('./keepwarm');
+const KEEPWARM_ON = String(process.env.GATEWAY_KEEPWARM || 'on').trim().toLowerCase() !== 'off';
+const keepwarm = createKeepwarm({ memoryUrl: MEMORY_SERVICE_URL, userTz: USER_TZ });
 const WEEKDAY_CN = { Mon: '周一', Tue: '周二', Wed: '周三', Thu: '周四', Fri: '周五', Sat: '周六', Sun: '周日' };
 // 解析库里存的时间：不带时区的当 UTC，带 Z / 偏移的按本身，也支持毫秒时间戳。解析不了返回 null。
 function parseStoredTs(v) {
@@ -1832,7 +1836,7 @@ function makeEmitter(res, isAnthropic, requestModel) {
 // 跑一轮上游流式请求：边收边把正文文本转发给前端，同时重建完整 content（含 tool_use）用于工具循环。
 // 返回 { id, content, stop_reason }，与非流式的上游响应结构一致。
 // signal（可选）：前端断开时中止上游请求（Pluvia 路径用；Kelivo 路径不传，行为不变）。
-async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens, toolChoice, signal, cands }) {
+async function streamRound({ apiUrl, apiKey, requestModel, system, messages, tools, emitter, thinking, outputConfig, maxTokens, toolChoice, signal, cands, providerPref }) {
   // 功能2：仅透传前端请求的 thinking。开启时 max_tokens 必须大于 budget_tokens。
   // max_tokens 优先用前端传的值（Kelivo 里的设置），未传才兜底 4096。
   const body = {
@@ -1858,7 +1862,8 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
   logUpstreamBody(body);
   // 建连：此时还没往前端发任何数据，重试、换中转都安全（见 postWithFailover）。
   // 抵御中转站冷启动 / 偶发失败（空回主因），以及余额不足、密钥失效这类整个中转不可用的情况。
-  const upstream = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: true, signal, cands })).resp;
+  const posted = await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: true, signal, cands, providerPref });
+  const upstream = posted.resp;
 
   return await new Promise((resolve, reject) => {
     const blocks = {};       // 上游 index -> block
@@ -1960,7 +1965,7 @@ async function streamRound({ apiUrl, apiKey, requestModel, system, messages, too
       console.log('[THINK-DBG] 聚合块:', JSON.stringify(content.map(function(c){ return c.type; })));
       console.log('[THINK-DBG] 聚合块:', JSON.stringify(content.map(function(c){ return c.type; })));
       ended = true;
-      resolve({ id: msgId, content, stop_reason: stopReason, usage });
+      resolve({ id: msgId, content, stop_reason: stopReason, usage, target: posted.target });
     });
 
     upstream.data.on('error', reject);
@@ -2183,7 +2188,7 @@ function isFailoverError(e) {
 }
 // 发一次上游请求：主中转对偶发错误最多试 3 次；不行就按顺序换中转（每个试 1 次）。
 // 成功返回 { resp, target }；全部失败时抛出最后一个错误，message 里列出每个中转的失败原因。
-async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, signal, cands: given }) {
+async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, signal, cands: given, providerPref }) {
   const cands = (given && given.length) ? given : upstreamCandidates(apiUrl, apiKey, requestModel);
   const failures = [];
   let lastErr = null;
@@ -2192,8 +2197,10 @@ async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, si
     const attempts = ci === 0 ? 3 : 1;
     for (let attempt = 1; attempt <= attempts; attempt++) {
       try {
+        // OpenRouter：优先发给上一轮回答的那家（每家的缓存是分开的），那家不可用时照样换（keepwarm.js）
+        const pin = (providerPref && isOpenRouter(c.apiUrl)) ? { provider: { order: [providerPref], allow_fallbacks: true } } : {};
         const resp = c.format === 'openai' ? await postOpenAIAsAnthropic(c, body, stream, signal)
-          : await axios.post(c.apiUrl, { ...body, model: c.model }, {
+          : await axios.post(c.apiUrl, { ...body, model: c.model, ...pin }, {
             headers: { 'Authorization': `Bearer ${c.apiKey}`, 'Content-Type': 'application/json', 'anthropic-version': '2023-06-01' },
             timeout: 120000,
             signal,
@@ -2234,7 +2241,7 @@ async function postWithFailover({ apiUrl, apiKey, requestModel, body, stream, si
 }
 
 // 非流式跑一次上游（Pluvia 非流式用），返回结构与 streamRound 一致
-async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal, cands }) {
+async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, tools, thinking, outputConfig, maxTokens, toolChoice, signal, cands, providerPref }) {
   const body = { model: requestModel, system, messages, max_tokens: maxTokens || 4096 };
   if (tools && tools.length) body.tools = tools;
   if (toolChoice && body.tools) body.tool_choice = toolChoice;
@@ -2245,9 +2252,9 @@ async function upstreamOnce({ apiUrl, apiKey, requestModel, system, messages, to
   }
   if (outputConfig) body.output_config = outputConfig;
   logUpstreamBody(body);
-  const r = (await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: false, signal, cands })).resp;
-  const d = r.data || {};
-  return { id: d.id, content: Array.isArray(d.content) ? d.content : [], stop_reason: d.stop_reason, usage: d.usage };
+  const posted = await postWithFailover({ apiUrl, apiKey, requestModel, body, stream: false, signal, cands, providerPref });
+  const d = posted.resp.data || {};
+  return { id: d.id, content: Array.isArray(d.content) ? d.content : [], stop_reason: d.stop_reason, usage: d.usage, target: posted.target };
 }
 
 function addUsageTo(total, u) {
@@ -2294,7 +2301,7 @@ async function runPluviaAux(req, res, pv) {
 //  - 模型调了前端工具 → 把这些调用交回前端（OpenAI finish_reason=tool_calls / Anthropic stop_reason=tool_use），
 //    这一轮的上游状态按 (conversation_id, turn.id) 存 10 分钟，前端带着工具结果续问时接回去；
 //  - 只在一条回复的最后一轮存 L0（整条回复的文字合成一条 assistant）；前端中途断开（用户点停）就不存，并中止上游。
-async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, requestModel, systemBlocks, messages, allTools, toolChoice, menuCtx, convId, continued, upstreamCands }) {
+async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, requestModel, systemBlocks, messages, allTools, toolChoice, menuCtx, convId, continued, upstreamCands, ttlUsed }) {
   const key = pv.turn ? turnKey(convId, pv.turn.id) : null;
   const prev = (key && continued) ? turnStoreGet(key) : null;   // 本条回复前几轮的累计（文字、思考、浮现的记忆）
   const skipMemory = isTitleGenerationRequest(req) || !!pv.aux;   // 辅助请求（翻译思考链等）不进记忆
@@ -2309,6 +2316,13 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
     console.log('[PLUVIA] 续问时拿不回带签名的思考块，这一轮不带 thinking 参数');
     thinking = undefined;
   }
+  // 缓存心跳要重放的前缀：这一轮第一次发给上游的样子（工具循环会往 messages 后面追加，先抄一份）。续问、辅助请求不算。
+  const warmBase = (!skipMemory && !continued) ? {
+    system: systemBlocks, messages: messages.slice(), tools: allTools, thinking,
+    outputConfig: req.body.output_config, toolChoice
+  } : null;
+  // OpenRouter：优先发给这个对话上一轮回答的那家（每家缓存分开）
+  const providerPref = skipMemory ? null : keepwarm.preferFor(convId, apiUrl);
 
   let emitter = null;
   if (stream) {
@@ -2336,7 +2350,7 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
       const args = {
         apiUrl, apiKey, requestModel, system: systemBlocks, messages: convo, tools: allTools,
         thinking, outputConfig: req.body.output_config, maxTokens: req.body.max_tokens, toolChoice, signal: ac.signal,
-        cands: upstreamCands
+        cands: upstreamCands, providerPref
       };
       result = stream ? await streamRound({ ...args, emitter }) : await upstreamOnce(args);
       addUsageTo(totalUsage, result.usage);
@@ -2385,6 +2399,11 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
   const allThinks = [...(prev ? prev.thinks : []), ...thinkTexts];
   const shownIds = prev ? (prev.shownIds || []) : (menuCtx.shownIds || []);
   rememberUsage(convId, totalUsage);
+  // 用量报给记忆服务（Dashboard「缓存与心跳」），记住是哪家回答的；这一轮设成缓存心跳的对象（辅助请求、试一句不算）
+  const answeredBy = result ? providerOf(result.id) : null;
+  if (!skipMemory && result) {
+    keepwarm.noteTurn({ convId, target: result.target, result, usage: totalUsage, base: KEEPWARM_ON ? warmBase : null, ttlUsed });
+  }
 
   if (handoff) {
     if (key) {
@@ -2423,7 +2442,8 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
   }
   if (key) turnStore.delete(key);
   console.log('[CACHE] 输入', totalUsage.input_tokens, '| 写缓存', totalUsage.cache_creation_input_tokens || 0,
-    '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens);
+    '| 读缓存', totalUsage.cache_read_input_tokens || 0, '| 输出', totalUsage.output_tokens,
+    '|', [providerName(answeredBy), ttlUsed, result && result.target ? result.target.name : ''].filter(Boolean).join(' · '));
   if (skipMemory) return;
 
   // 存 L0：截掉本条回复前几轮的 assistant(工具调用)/工具结果，整条回复的文字合成一条 assistant
@@ -2784,14 +2804,22 @@ ${profile}${profileFacts}
     console.log('[TOOLS] 合并后:', JSON.stringify(allTools.map(t => t.name)));
     // OpenAI 格式的 tool_choice（如 Pluvia 第 5 轮的 "none"）转成 Anthropic 格式；Anthropic 格式原样
     const toolChoice = toAnthropicToolChoice(req.body.tool_choice);
+    // 消息里的缓存标记（前端打在最后一条 user 消息上，默认 5 分钟）统一换成设置里的时长（默认 1 小时，keepwarm.js）
+    const ttlUsed = keepwarm.ttl();
+    keepwarm.applyTtl(nonSystemMessages);
     capCacheControl(systemBlocks, nonSystemMessages, allTools);
 
     if (pv) {
-      return await runPluvia({
-        req, res, pv, stream: !!stream, isAnthropic: !!req.body._anthropicFormat,
-        apiUrl, apiKey, requestModel, systemBlocks, messages: nonSystemMessages, allTools, toolChoice,
-        menuCtx, convId: convIdForMenu, continued: !!cont
-      });
+      keepwarm.begin();
+      try {
+        return await runPluvia({
+          req, res, pv, stream: !!stream, isAnthropic: !!req.body._anthropicFormat,
+          apiUrl, apiKey, requestModel, systemBlocks, messages: nonSystemMessages, allTools, toolChoice,
+          menuCtx, convId: convIdForMenu, continued: !!cont, ttlUsed
+        });
+      } finally {
+        keepwarm.end();
+      }
     }
 
     // ============ 功能1：流式分支（stream:true 时走这里，非流式逻辑完全不变） ============
@@ -3236,6 +3264,7 @@ app.get('/health', (req, res) => {
 app.post('/reload-config', async (req, res) => {
   const state = await loadActiveConfig();
   await refreshModelsCache(true);
+  await keepwarm.refresh();   // 缓存时长、心跳的设置也立刻重新读
   // active/unconfigured 都算重载成功（unconfigured 是正常状态，回退 .env）；只有 error 是拉取失败
   res.json({
     status: state === 'error' ? 'error' : 'ok',
@@ -3289,6 +3318,7 @@ for (const host of BIND_HOSTS) {
     }
     // 启动时刷新一次模型列表缓存
     await refreshModelsCache();
+    if (KEEPWARM_ON) keepwarm.start();
   });
   srv.on('error', e => console.error(`[BIND] ${host}:${PORT} 监听失败:`, e.message));
 }

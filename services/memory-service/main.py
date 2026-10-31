@@ -40,6 +40,7 @@ from app.recall import golden as recall_golden   # 黄金集标注和门槛校�
 from app import settings as app_settings   # Dashboard 上可调的参数（召回门槛等）
 from app import branches as conv_branches   # 分支会话：和原会话重合的历史不重复存（接入约定第 12 节）
 from app import windows as window_notes     # 换窗衔接：窗口里的时间标记、滑出窗口那段的小结、新窗口接上一窗（方案第 16 章）
+from app import cache_stats   # 缓存记录与缓存心跳（Dashboard「缓存与心跳」页）
 from app.pipeline import bridge as bridge_pipeline   # 滑出窗口那段的小结（后台任务）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
@@ -3013,6 +3014,64 @@ async def reset_windows_settings(req: SettingsReset):
     except ValueError as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
     return {"status": "ok", **app_settings.describe("windows")}
+
+# ============ 缓存与心跳（网关报用量，Dashboard 看命中率、调缓存时长和心跳） ============
+class CacheEvent(BaseModel):
+    kind: str = "turn"
+    conv_id: Optional[str] = None
+    provider: Optional[str] = None
+    relay: Optional[str] = None
+    model: Optional[str] = None
+    ttl: Optional[str] = None
+    input: int = 0
+    cache_write: int = 0
+    cache_read: int = 0
+    output: int = 0
+    note: Optional[str] = None
+
+@app.post("/cache/events")
+async def post_cache_event(ev: CacheEvent):
+    conn = get_conn()
+    try:
+        cache_stats.record(conn, ev.dict())
+        conn.commit()
+    finally:
+        conn.close()
+    return {"status": "ok"}
+
+@app.post("/cache/keepwarm")
+async def post_cache_keepwarm(state: dict):
+    cache_stats.set_keepwarm({**state, "updated_at": timeutil.utc_now_str()})
+    return {"status": "ok"}
+
+@app.get("/cache")
+async def get_cache_overview(limit: int = 80):
+    conn = get_conn()
+    try:
+        out = cache_stats.overview(conn, limit=max(1, min(500, limit)))
+    finally:
+        conn.close()
+    return {**out, "settings_spec": app_settings.describe("cache")}
+
+@app.get("/cache/settings")
+async def get_cache_settings():
+    return app_settings.describe("cache")
+
+@app.put("/cache/settings")
+async def put_cache_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("cache", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("cache")}
+
+@app.post("/cache/settings/reset")
+async def reset_cache_settings(req: SettingsReset):
+    try:
+        app_settings.reset("cache", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("cache")}
 
 @app.get("/compose/settings")
 async def get_compose_settings():

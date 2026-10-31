@@ -17,6 +17,10 @@
 带过来的几段在原会话里可以不连续。登记时按顺序在原会话的完整历史里往后找（每条找它之后第一条一样的），
 找不到的那条和它之后的都算新会话自己的内容。之后和分支一样：带过来的只在原会话名下存一份。
 
+前端发的是滑动窗口（最近 N 条，攒够几条一起往后挪）：分支 / 搬家的对话聊长了以后，开头那段重合的会滑出窗口，
+请求里的历史从重合部分的中间开始，甚至一开始（从很长的原会话分出来时）就只带着重合部分的后一截。所以对齐时不要求
+从第一条开始：窗口开头那一串，和重合部分（登记时是原会话的历史）里连续的一段一样，就算重合。
+
 这个模块只用标准库，调用方传入数据库连接（main.py 的 save_conversation、extract_l1.py 都用它）。
 """
 import hashlib
@@ -69,18 +73,29 @@ def history(c, conv_id):
     return out
 
 
-def _common(msgs, entries):
-    n = 0
-    for (role, content), e in zip(msgs, entries):
-        fp = fingerprint(role, content)
-        if fp != e[0] and not (len(e) > 3 and fp in (e[3] or [])):
-            break
-        n += 1
-    return n
-
-
 def _matches(fp, e):
     return fp == e[0] or (len(e) > 3 and fp in (e[3] or []))
+
+
+def _align(msgs, entries, to_end=False):
+    """窗口开头那一串和 entries 里哪一段连续一样 → (起点 j, 条数 n)；对不上返回 (0, 0)。
+    从第一条开始对得上的（j=0）照旧算；从中间开始的（窗口滑过去了）要连着对上至少 2 条，或者一直对到 entries 的最后一条
+    （to_end：重合部分的结尾——窗口里重合的那截后面紧接着就是新会话自己的内容）。一样长时取靠前的起点。
+    窗口开头误认几条只会少存几条本来就存过的（新的话总在窗口最后），所以这里宁可多认。"""
+    if not msgs or not entries:
+        return 0, 0
+    fps = [fingerprint(r, t) for r, t in msgs]
+    best = (0, 0)
+    for j in range(len(entries)):
+        if not _matches(fps[0], entries[j]):
+            continue
+        n = 1
+        while n < len(fps) and j + n < len(entries) and _matches(fps[n], entries[j + n]):
+            n += 1
+        ok = j == 0 or n >= 2 or (to_end and j + n == len(entries))
+        if ok and n > best[1]:
+            best = (j, n)
+    return best
 
 
 def _picked(msgs, entries):
@@ -120,7 +135,9 @@ def register(c, conv_id, branch_of, msgs, now, kind="branch"):
             pass
         shared = _picked(cand, entries)
     else:
-        shared = entries[:_common(msgs, entries)]
+        # 从很长的原会话分出来时，第一次请求里可能已经只带着后一截（窗口装不下全部）：重合部分 = 原会话到对上的最后一条为止
+        j, n = _align(msgs, entries)
+        shared = entries[:j + n] if n else []
     turn_id = branch_of.get("turn_id")
     try:
         c.execute("INSERT OR IGNORE INTO conv_branches (conv_id, parent_conv_id, parent_turn_id, prefix, shared, created_at, kind) "
@@ -139,7 +156,8 @@ def shared_len(c, conv_id, msgs):
     b = get(c, conv_id)
     if not b or not b["prefix"]:
         return 0
-    return _common(msgs, b["prefix"])
+    # 窗口往后滑了以后，请求里的历史从重合部分的中间开始（开头几条已经不在窗口里）
+    return _align(msgs, b["prefix"], to_end=True)[1]
 
 
 def anchor(c, conv_id):

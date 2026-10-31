@@ -51,5 +51,11 @@ app.get('/compose/system', (q, r) => {
   if (compose.system === 'error') return r.status(500).json({ status: 'error', message: '测试：出错' });
   r.json({ status: 'ok', recall_live: compose.mode === 'live', profile_extra: '', semi: '', daily: '', ...(compose.system || {}) });
 });
+// 缓存与心跳：测试脚本用 POST /_test/cache 设置 /cache/settings 的值（{ttl_1h: false} 之类），网关报来的用量记到 mem.jsonl
+let cacheVals = {};
+app.post('/_test/cache', (q, r) => { cacheVals = q.body || {}; r.json({ ok: true }); });
+app.get('/cache/settings', (q, r) => r.json({ group: 'cache', items: Object.entries(cacheVals).map(([key, value]) => ({ key, value })) }));
+app.post('/cache/events', (q, r) => { log('cache_event', q.body); r.json({ status: 'ok' }); });
+app.post('/cache/keepwarm', (q, r) => { log('keepwarm', q.body); r.json({ status: 'ok' }); });
 app.use((q, r) => { log('other', { path: q.path, method: q.method }); r.json({ status: 'ok' }); });
 app.listen(3998, '127.0.0.1', () => console.log('fake memory on 3998'));

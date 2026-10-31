@@ -94,6 +94,31 @@ def main():
         check("分支照旧是 branch", B.get(c, "Bq")["kind"] == "branch")
         f2 = B.register(c, "Fr", {"conversation_id": "Q"}, [u1, a1, u3, ("assistant", "好")], NOW, kind="forged")
         check("这一轮的话不算挑过来的（哪怕原会话里有一样的）", f2["shared"] == 2, f2["shared"])
+
+        print("\n[6] 滑动窗口：开头那段重合的滑出了窗口")
+        long_p = [("user" if i % 2 == 0 else "assistant", f"原会话第 {i} 句：今天的云是第 {i} 朵") for i in range(30)]
+        lid = add(c, "LP", long_p)
+        b6 = B.register(c, "B6", {"conversation_id": "LP"}, long_p[:20] + [("user", "分支第一句")], NOW)
+        check("登记：重合 20 条", b6["shared"] == 20)
+        own6 = [("user", "分支第一句"), ("assistant", "分支的回答"), ("user", "分支第二句"), ("assistant", "嗯")]
+        check("窗口还从头开始：跳过 20 条", B.shared_len(c, "B6", long_p[:20] + own6) == 20)
+        check("窗口滑过去 8 条：跳过剩下的 12 条", B.shared_len(c, "B6", long_p[8:20] + own6) == 12)
+        check("窗口只剩重合部分的最后 1 条：也跳过它", B.shared_len(c, "B6", long_p[19:20] + own6) == 1)
+        check("窗口已经整个滑过重合部分：一条都不跳", B.shared_len(c, "B6", own6) == 0)
+        check("滑过去以后又在分支里改了重合部分的一条：只跳过改的那条之前的",
+              B.shared_len(c, "B6", long_p[8:15] + [("user", "改过的一句")] + own6) == 7)
+        b7 = B.register(c, "B7", {"conversation_id": "LP"}, long_p[6:20] + [("user", "从很长的会话分出来")], NOW)
+        check("从很长的原会话分出来、第一次请求就只带着后一截：重合部分 = 原会话到第 20 条为止",
+              b7["shared"] == 20 and [e[2] for e in b7["prefix"]] == lid[:20] and B.anchor(c, "B7") == ("LP", lid[19]), b7["shared"])
+        b8 = B.register(c, "B8", {"conversation_id": "LP"}, [long_p[6], ("user", "只碰巧一样的一句")], NOW)
+        check("从中间开始只对上 1 条：不算（可能是碰巧一样）", b8["shared"] == 0)
+        fq = B.register(c, "F6", {"conversation_id": "LP", "carried": 6},
+                        [long_p[2], long_p[3], long_p[10], long_p[11], long_p[20], long_p[21], ("user", "搬家后第一句")], NOW, kind="forged")
+        check("搬家登记 6 条", fq["shared"] == 6)
+        own_f = [("user", "搬家后第一句"), ("assistant", "好"), ("user", "第二句")]
+        check("搬家的对话窗口滑过去 4 条：跳过剩下的 2 条", B.shared_len(c, "F6", [long_p[20], long_p[21]] + own_f) == 2)
+        check("搬家的对话窗口滑过去 3 条：跳过剩下的 3 条（带过来的几段在新对话里是连着的）",
+              B.shared_len(c, "F6", [long_p[11], long_p[20], long_p[21]] + own_f) == 3)
         c.close()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
