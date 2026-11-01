@@ -606,6 +606,77 @@ def forget_conv(c, conv_id):
 
 # ---------- Dashboard ----------
 
+KIND_LABEL = {"new": "新开的窗口", "branch": "从别的对话分出来的", "forged": "挑选式搬家（换窗）", "unknown": "别处开的"}
+CARRIED_EXCERPT = 60
+CHAIN_MAX = 6
+
+
+def _carried_segments(c, b):
+    """分支 / 搬家带过来的那几段：按原对话里连着的切成一段段（每段的时间、条数、开头结尾一句、和上一段之间省略了几条）"""
+    ids = [e[2] for e in (b or {}).get("prefix") or [] if len(e) > 2]
+    if not ids:
+        return []
+    got = {}
+    for k in range(0, len(ids), 500):
+        part = ids[k:k + 500]
+        for r in c.execute(f"SELECT id, conv_id, role, content, ts, msg_idx FROM l0_messages WHERE id IN ({','.join('?' * len(part))})", part):
+            got[r[0]] = r
+    rows = [got[i] for i in ids if i in got]
+    segs = []
+    for r in rows:
+        last = segs[-1]["_last"] if segs else None
+        if last and last[1] == r[1] and last[5] is not None and r[5] is not None and r[5] == last[5] + 1:
+            segs[-1]["rows"].append(r)
+        else:
+            segs.append({"rows": [r]})
+        segs[-1]["_last"] = r
+    out = []
+    prev = None
+    for sg in segs:
+        rs = sg["rows"]
+        skipped = 0
+        if prev is not None and prev[1] == rs[0][1] and prev[5] is not None and rs[0][5] is not None and rs[0][5] - prev[5] > 1:
+            skipped = c.execute("SELECT COUNT(*) FROM l0_messages WHERE conv_id=? AND status='active' AND msg_idx > ? AND msg_idx < ?",
+                                (prev[1], prev[5], rs[0][5])).fetchone()[0]
+        out.append({"from_ts": rs[0][4], "to_ts": rs[-1][4], "n": len(rs), "skipped_before": skipped,
+                    "first": {"role": rs[0][2], "text": _one_line(rs[0][3], CARRIED_EXCERPT)},
+                    "last": {"role": rs[-1][2], "text": _one_line(rs[-1][3], CARRIED_EXCERPT)}})
+        prev = rs[-1]
+    return out
+
+
+def detail(c, conv_id, now=None):
+    """给前端的「换窗」详情页（接入约定第 18 节）：这个窗口从哪来、带过来了哪几段、窗口开头那行附注、
+    滑出窗口那段的小结、还没来得及写小结的，以及往前几个窗口（一条线上的前几个对话）。只读。"""
+    now = now or timeutil.utc_now_str()
+    lin = lineage(c, conv_id)
+    b = branches.get(c, conv_id)
+    kind = (b["kind"] if b else None) or (lin["kind"] if lin else None)
+    own = c.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM l0_messages WHERE conv_id=? AND status='active'", (conv_id,)).fetchone()
+    out = {"conversation_id": conv_id, "kind": kind, "kind_label": KIND_LABEL.get(kind or "", "以前就有的对话"),
+           "from_conversation_id": (b["parent"] if b else None) or (lin["prev"] if lin else None),
+           "started_at": (lin["created_at"] if lin else None) or own[1], "messages": own[0], "last_ts": own[2],
+           "carried": _carried_segments(c, b), "window": None, "start_note": "", "bridges": [], "pending": [], "chain": []}
+    st = c.execute("SELECT first_row_id, note, pending, updated_at FROM window_state WHERE conv_id=?", (conv_id,)).fetchone()
+    if st:
+        r = c.execute("SELECT ts FROM l0_messages WHERE id=?", (st[0],)).fetchone()
+        out["window"] = {"from_ts": r[0] if r else None, "slid_out_unsummarized": st[2], "updated_at": st[3]}
+        out["start_note"] = st[1] or ""
+    ov = overview(c, conv_id, now)
+    out["bridges"] = [{k: x[k] for k in ("start_ts", "end_ts", "n", "gist", "mood")} for x in ov["bridges"] if x["status"] == "active"]
+    out["pending"] = ov["pending"]
+    cur, seen = out["from_conversation_id"], {conv_id}
+    while cur and cur not in seen and len(out["chain"]) < CHAIN_MAX:
+        seen.add(cur)
+        l2, b2 = lineage(c, cur), branches.get(c, cur)
+        k2 = (b2["kind"] if b2 else None) or (l2["kind"] if l2 else None)
+        r = c.execute("SELECT COUNT(*), MIN(ts), MAX(ts) FROM l0_messages WHERE conv_id=? AND status='active'", (cur,)).fetchone()
+        out["chain"].append({"conversation_id": cur, "kind": k2, "kind_label": KIND_LABEL.get(k2 or "", "以前就有的对话"),
+                             "messages": r[0], "first_ts": r[1], "last_ts": r[2]})
+        cur = (b2["parent"] if b2 else None) or (l2["prev"] if l2 else None)
+    return out
+
+
 def overview(c, conv_id=None, now=None):
     """「换窗衔接」页：最近聊过的几个会话、它们的来处和窗口开头那行附注；选中的会话的小结。"""
     convs = [{"conv_id": r[0], "last_ts": r[1], "messages": r[2]} for r in c.execute(

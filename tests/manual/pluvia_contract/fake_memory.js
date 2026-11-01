@@ -84,5 +84,7 @@ app.post('/wake/plans', (q, r) => { log('wake_plan', q.body); r.json({ status: '
 app.get('/wake/inbox', (q, r) => { log('wake_inbox', q.query); r.json({ status: 'ok', messages: [{ id: 21, conversation_id: q.query.conv_id || null, text: '考完了吗', at: '2026-10-31T13:00:00Z', kind: 'random' }] }); });
 app.post('/wake/ack', (q, r) => { log('wake_ack', q.body); r.json({ status: 'ok', results: (q.body.ids || []).map(id => ({ id, status: 'delivered', l0_id: 99 })) }); });
 app.post('/wake/push/register', (q, r) => { log('wake_push', q.body); r.json({ status: 'ok', endpoints: 1 }); });
+app.get('/wake/events', (q, r) => { log('wake_events', q.query); r.json({ status: 'ok', events: [{ id: 21, conversation_id: q.query.conv_id || null, at: '2026-10-31T13:00:00Z', kind: 'random', kind_label: '随机醒来', outcome: 'silent', message_id: null, tools: ['jot'], line: '21:00 醒来了一下（随机醒来）· 没说话 · 在小本子上记了一笔', detail: { plan_reason: null, aside: null, thinking: null } }] }); });
+app.get('/windows/detail', (q, r) => { log('window_detail', q.query); r.json({ status: 'ok', conversation_id: q.query.conv_id, kind: 'forged', kind_label: '挑选式搬家（换窗）', from_conversation_id: 'conv-old', carried: [{ n: 2, skipped_before: 0 }], window: null, start_note: '', bridges: [], pending: [], chain: [] }); });
 app.use((q, r) => { log('other', { path: q.path, method: q.method }); r.json({ status: 'ok' }); });
 app.listen(3998, '127.0.0.1', () => console.log('fake memory on 3998'));

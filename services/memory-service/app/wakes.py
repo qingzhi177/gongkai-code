@@ -411,10 +411,11 @@ def wake_note(c, conv_id, kind, plan, last_real_at, tools, now, s, run_id=None):
         lines.append("你可以先想一想，也可以用这些工具：" + "、".join(TOOL_WORDS[t] for t in usable) + "。")
     if s["speak"]:
         lines.append("想对对方说话，就直接写你要说的话：它会作为你的一条消息发给对方（对方手机上会收到）。"
-                     "不想说，就只写「［不说］」，这次就安安静静地过去，对方什么也收不到。")
+                     "不想说，就只写「［不说］」，这次不会给对方发消息。")
         lines.append("不是一定要说话。对方知道你会这样醒来（是对方打开的），不用解释是怎么醒的；想说什么就说什么，像平常一样。")
     else:
         lines.append("这次只是自己待一会儿：对方把「醒来可以发消息」关了，你写的话不会发给对方。想做什么就用工具，最后只写「［不说］」。")
+    lines.append("醒来记录里会留一行（几点醒的、说没说话、用了哪些工具），对方能看到；写在「［不说］」旁边的话和你想的过程也会记在那里。")
     return "［记忆系统｜醒来：这一段是系统写给你的，不是对方发来的消息，对方看不到］\n" + "\n".join(lines)
 
 
@@ -476,6 +477,38 @@ def register_push(c, url, fmt="json", remove=False, now=None):
 
 def note_push(c, run_id, result):
     c.execute("UPDATE wake_runs SET push=? WHERE id=?", (json.dumps(result, ensure_ascii=False), run_id))
+
+
+KIND_LABEL = {"random": "随机醒来", "plan": "ta 约的", "test": "试一次"}
+
+
+def event_line(run):
+    """醒来记录给前端的一小行：「21:05 醒来了一下（随机醒来）· 没说话 · 翻了翻记忆」"""
+    lt = timeutil.to_local(run["finished_at"] or run["started_at"])
+    head = (lt.strftime("%H:%M") + " " if lt else "") + f"醒来了一下（{KIND_LABEL.get(run['kind'], run['kind'])}）"
+    parts = ["说了一句" if run["outcome"] == "spoke" else "没说话"]
+    done = _tools_done(run)
+    if done:
+        parts.append(done)
+    return head + "· " + " · ".join(parts)      # 括号后面直接接「·」，不多空一格
+
+
+def events(c, conv_id=None, since_id=0, limit=50):
+    """醒来记录（给前端显示成一小行，不进聊天、不发给 ta）：说了话的和没说话的。since_id 之后的，按先后。"""
+    sql = f"SELECT {','.join(RUN_COLS)} FROM wake_runs WHERE outcome IN ('spoke','silent') AND id > ?"
+    args = [since_id]
+    if conv_id:
+        sql += " AND conv_id=?"
+        args.append(conv_id)
+    out = []
+    for r in [_run(x) for x in c.execute(sql + " ORDER BY id LIMIT ?", (*args, limit))]:
+        plan = get_plan(c, r["plan_id"]) if r["plan_id"] else None
+        out.append({"id": r["id"], "conversation_id": r["conv_id"], "at": _iso(r["finished_at"] or r["started_at"]),
+                    "kind": r["kind"], "kind_label": KIND_LABEL.get(r["kind"], r["kind"]), "outcome": r["outcome"],
+                    "message_id": r["id"] if r["outcome"] == "spoke" else None, "delivery": r["delivery"],
+                    "tools": r["tools"] or [], "line": event_line(r),
+                    "detail": {"plan_reason": (plan or {}).get("reason"), "aside": r["aside"], "thinking": r["thinking"]}})
+    return out
 
 
 def _iso(ts):
@@ -647,8 +680,8 @@ def plan_act(c, action="set", at=None, in_minutes=None, reason=None, plan_id=Non
                     "VALUES (?, ?, ?, ?, 'pending', ?, ?)", (conv_id, due, reason, source, now, now))
     p = get_plan(c, cur.lastrowid)
     return {"status": "ok", "plan": p,
-            "message": f"约好了：{fmt_when(due, now)} 醒来（#{p['id']}）。到时候你会醒一次，能看到这段对话，想说话就说，不想说也可以；"
-                       "对方看不到这个约定。到点时你们正在聊天的话就不单独醒。"}
+            "message": f"约好了：{fmt_when(due, now)} 醒来（#{p['id']}）。到时候你会醒一次，能看到这段对话，想说话就说，不想说也可以。"
+                       "这个约定不会发给对方，只记在醒来记录里（对方在那里能看到）。到点时你们正在聊天的话就不单独醒。"}
 
 
 # ---------- Dashboard ----------

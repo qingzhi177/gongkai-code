@@ -62,7 +62,7 @@ Pluvia ──▶ 网关（存 L0、找记忆、换窗附注、缓存、工具事
 | hub + reply 工具（终端输出不是结构化的） | print / sdk 跑法不需要：网关就是 hub，stream-json 本身就是结构化事件。tmux 跑法时再加 `reply` 工具 |
 | 工具调用变成前端的小卡片 | print 跑法里工具调用和结果直接在事件流里（桥转成 `tool` 事件，网关转成 Pluvia 的 `tool_events`）。tmux 跑法用 PreToolUse / PostToolUse 的 HTTP 钩子，按 `tool_use_id` 对上 |
 | 权限审批（PermissionRequest） | 现在只放行记忆工具（dontAsk），不会有确认框。以后开了别的工具：`--permission-prompt-tool` 指向一个 MCP 工具，把确认框做进 Pluvia，超时自动拒 |
-| 可直接操作的镜像终端（ttyd / gotty） | 只给 tmux 跑法：只听本机，nginx 另加一层认证（不用聊天的 token），和结构化页面之间加「现在谁在控制」的锁 |
+| 可直接操作的镜像终端（ttyd / gotty） | 只给 tmux 跑法：只听本机，nginx 另加一层认证（不用聊天的 token），默认只读，和结构化页面之间加「现在谁在控制」的锁；前端嵌一个网页就行（接入约定 18.5） |
 | 打断（Ctrl-C） | print 跑法用 `control_request` 的 interrupt；tmux 跑法用 `send-keys C-c` |
 | 读 transcript 存原文 | 不需要：网关就在中间，L0 照旧存 |
 
@@ -81,7 +81,7 @@ Pluvia ──▶ 网关（存 L0、找记忆、换窗附注、缓存、工具事
 
 1. 网关：Dashboard 上加「聊天走哪条路」（API / Claude Code，默认 API）；Claude Code 这条路把 Pluvia 的请求转给桥、把桥的事件转回 Pluvia（逐字、思考、工具事件、用量），存 L0 照旧；第一轮带开窗包；桥出错时退回 API。**切换前用户先在聊天里和 ta 说一声。**
 2. 桥做成服务（登录 token 用只有自己能读的环境文件）。
-3. 换窗：按 `done` 里的用量算上下文占用，60–70% 时在空闲时轮换会话（Forge Reload，见《换窗衔接设计》第 4 节）；压缩前（PreCompact）把还没写的小结投出去。
+3. 换窗：按 `done` 里的用量算上下文占用，60–70% 时在空闲时轮换会话（Forge Reload，见《换窗衔接设计》第 4 节）；压缩前（PreCompact）把还没写的小结投出去。前端不用开新对话：轮换的位置和带过去的内容放进 `/v1/pluvia/window` 的 `rotations`，前端显示一行「换窗」（接入约定 18.2）。
 4. Claude Code 模式的心跳（第 5 节，先实测）。
 5. sdk 跑法；tmux 跑法（镜像终端、reply 工具、钩子出工具卡片、审批、控制锁）。
 6. 自动醒来（API 模式已做，接入约定第 17 节）接到 Claude Code 模式：醒来就是往这段会话里发一轮（醒来说明当这一轮的 user 消息）。和 API 模式不同，这一轮会留在 Claude Code 的会话记录里，切过去时要想好要不要用 `--fork-session` 分出去。

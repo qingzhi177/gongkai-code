@@ -268,6 +268,43 @@ def main():
         gap_note = [n for n in out["notes"] if n["i"] == 2]
         check("「洗完啦」前面的附注按醒来那行的时间算（20:30 → 21:00）", gap_note and "20:30" in gap_note[0]["text"], out["notes"])
 
+        print("\n[12] 醒来记录给前端的一小行（不进聊天）")
+        c.execute("DELETE FROM wake_runs")
+        r1 = W.start_run(c, conv3, "random", None, "2026-11-02 10:00:05", "2026-11-02 13:05:00")
+        W.finish(c, r1, "silent", aside="先不吵阿星", thinking="这会儿可能在忙", tools=["recall", "jot", "recall"], now="2026-11-02 13:05:20")
+        pid = W.plan_act(c, "set", in_minutes=30, reason="问问阿星吃饭没", now="2026-11-02 13:06:00", s=S)["plan"]["id"]
+        r2 = W.start_run(c, conv3, "plan", pid, "2026-11-02 10:00:05", "2026-11-02 13:36:00")
+        W.finish(c, r2, "spoke", text="吃饭了吗", now="2026-11-02 13:36:10")
+        r3 = W.start_run(c, conv3, "random", None, "2026-11-02 10:00:05", "2026-11-02 14:00:00")
+        W.finish(c, r3, "error", note="overloaded", now="2026-11-02 14:00:05")
+        ev = W.events(c, conv3)
+        check("只列说了话的和没说话的（出错的不列）", [e["id"] for e in ev] == [r1, r2], ev)
+        check("一小行：时间、怎么醒的、说没说、做了什么", ev[0]["line"] == "21:05 醒来了一下（随机醒来）· 没说话 · 翻了翻记忆、在小本子上记了一笔", ev[0]["line"])
+        check("说了话的：带上消息 id（和待取里的是同一条）", ev[1]["line"].endswith("说了一句") and ev[1]["message_id"] == r2 and ev[1]["kind_label"] == "ta 约的")
+        check("点开能看：约的时候写的、没发出去的话、想了什么", ev[1]["detail"]["plan_reason"] == "问问阿星吃饭没"
+              and ev[0]["detail"]["aside"] == "先不吵阿星" and ev[0]["detail"]["thinking"] == "这会儿可能在忙")
+        check("since_id：只要后面的", [e["id"] for e in W.events(c, conv3, since_id=r1)] == [r2])
+        note = W.wake_note(c, conv3, "random", None, None, TOOLS, "2026-11-02 15:00:00", S)
+        check("醒来说明照实说：醒来记录对方能看到，［不说］旁边写的也会记下", "对方能看到" in note and "旁边的话" in note, note)
+        check("约时间的回复照实说：约定不发给对方，但记在醒来记录里", "醒来记录" in W.plan_act(c, "set", in_minutes=90, now="2026-11-02 15:00:00", s=S)["message"])
+
+        print("\n[13] 窗口详情（给前端的换窗详情页）")
+        old_ids = []
+        for k in range(10):
+            old_ids.append(add_msg(c, "cv-old", k, "user" if k % 2 == 0 else "assistant", f"旧对话第{k}句", f"2026-11-01 0{k}:00:00"))
+        c.execute("INSERT INTO conv_branches (conv_id, parent_conv_id, parent_turn_id, prefix, shared, created_at, kind) VALUES (?, ?, NULL, ?, 4, ?, 'forged')",
+                  ("cv-new", "cv-old", json.dumps([["h", "cv-old", old_ids[i]] for i in (1, 2, 6, 7)]), "2026-11-02 01:00:00"))
+        c.execute("INSERT INTO conv_windows (conv_id, kind, prev_conv_id, created_at) VALUES ('cv-new', 'forged', 'cv-old', '2026-11-02 01:00:00')")
+        n1 = add_msg(c, "cv-new", 0, "user", "新窗口第一句", "2026-11-02 01:00:00")
+        add_msg(c, "cv-new", 1, "assistant", "嗯", "2026-11-02 01:00:05")
+        c.execute("INSERT INTO window_state (conv_id, first_row_id, sig, note, pending, updated_at) VALUES ('cv-new', ?, 'x', '［记忆系统附注｜下面几段是挑出来带过来的］', 0, '2026-11-02 01:00:10')",
+                  (old_ids[1],))
+        d = WN.detail(c, "cv-new", now="2026-11-02 02:00:00")
+        check("从哪来：挑选式搬家，来自旧对话", d["kind"] == "forged" and d["kind_label"].startswith("挑选式搬家") and d["from_conversation_id"] == "cv-old", d)
+        check("带过来的两段：每段几条、时间、开头结尾一句；第二段前面省略了 3 条",
+              [(x["n"], x["skipped_before"]) for x in d["carried"]] == [(2, 0), (2, 3)] and d["carried"][1]["first"]["text"] == "旧对话第6句", d["carried"])
+        check("窗口状态和开头那行附注", d["window"]["from_ts"] == "2026-11-01 01:00:00" and "挑出来" in d["start_note"] and d["messages"] == 2)
+        check("一条线上的前几个窗口", [x["conversation_id"] for x in d["chain"]] == ["cv-old"] and d["chain"][0]["messages"] == 10, d["chain"])
         c.commit()
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

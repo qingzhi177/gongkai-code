@@ -2998,6 +2998,16 @@ async def windows_overview(conv_id: Optional[str] = None):
         conn.close()
     return {"status": "ok", **out, "settings_spec": app_settings.describe("windows")}
 
+@app.get("/windows/detail")
+async def windows_detail(conv_id: str):
+    """给前端的「换窗」详情页（接入约定第 18 节）：这个窗口从哪来、带了哪几段、开头那行附注、滑出去那段的小结"""
+    conn = get_conn()
+    try:
+        out = window_notes.detail(conn, conv_id)
+    finally:
+        conn.close()
+    return {"status": "ok", **out}
+
 @app.post("/windows/bridge")
 async def windows_bridge_now(conv_id: str):
     """现在写小结（不等下一轮聊天）"""
@@ -3222,6 +3232,15 @@ async def wake_finish(req: WakeFinish):
 async def wake_push_result(req: WakePushResult):
     _wake_tx(lambda conn: wakes.note_push(conn, req.run_id, req.result))
     return {"status": "ok"}
+
+@app.get("/wake/events")
+async def wake_events(conv_id: Optional[str] = None, since_id: int = 0, limit: int = 50):
+    """醒来记录（给前端显示成一小行，不进聊天）"""
+    conn = get_conn()
+    try:
+        return {"status": "ok", "events": wakes.events(conn, conv_id or None, max(0, since_id), max(1, min(200, limit)))}
+    finally:
+        conn.close()
 
 @app.get("/wake/inbox")
 async def wake_inbox(conv_id: Optional[str] = None, limit: int = 20):

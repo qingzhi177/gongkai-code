@@ -911,6 +911,28 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     await fetch(GW + '/reload-config', { method: 'POST' });
   }
 
+  console.log('T35 醒来记录、窗口详情（约定第 18 节）');
+  {
+    const cc = await (await fetch(GW + '/v1/pluvia/contract')).json();
+    ok(cc.features.includes('wake_events') && cc.features.includes('window_detail'), 'T35 能力协商里有 wake_events、window_detail', cc.features);
+    let m = mark();
+    const ev = await (await fetch(GW + '/v1/pluvia/wake/events?conversation_id=conv-wake&since_id=3')).json();
+    await sleep(100);
+    const q = since(m).mem.find(x => x.k === 'wake_events');
+    ok(ev.events && ev.events[0].line.includes('醒来了一下') && q && q.b.conv_id === 'conv-wake' && q.b.since_id === '3', 'T35 醒来记录：转给记忆服务（带对话、since_id）', { ev, q: q && q.b });
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-win',
+      pluvia: { v: '0.2', turn: { id: 'tw9', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [A]' }] }));
+    await sleep(200);
+    const w = await (await fetch(GW + '/v1/pluvia/window?conversation_id=conv-win')).json();
+    const lp = w.last_prompt || {};
+    ok(w.conversation_id === 'conv-win' && w.kind === 'forged' && Array.isArray(w.carried), 'T35 窗口详情：记忆服务那部分（从哪来、带了哪几段）', w);
+    ok(lp.system && lp.system[0].label.startsWith('静态') && lp.system.every(b => typeof b.text === 'string' && b.label)
+      && /记忆系统自动附注/.test(lp.turn_note) && lp.tools.includes('recall') && lp.model === 'fake-model', 'T35 窗口详情：最近一轮实际发给模型的 system（分段、带名字）、附注、工具', { labels: (lp.system || []).map(b => b.label), tools: lp.tools });
+    const w2 = await (await fetch(GW + '/v1/pluvia/window?conversation_id=never-seen')).json();
+    ok(w2.last_prompt === null, 'T35 没聊过的对话：last_prompt 是 null');
+    ok((await fetch(GW + '/v1/pluvia/window')).status === 400, 'T35 没带 conversation_id：400');
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });

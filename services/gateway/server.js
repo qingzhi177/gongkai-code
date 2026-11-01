@@ -293,7 +293,7 @@ function buildTurnMessages(messages, aiText) {
 
 // ============ Pluvia 接入约定 v0.2（docs/plan/pluvia-gateway-contract.md） ============
 // 只有 body 里带了 pluvia 对象的请求才走 v0.2 逻辑；Kelivo 等其它客户端的路径不变。
-const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes', 'cache_ttl', 'keepwarm', 'jot', 'wake'] };
+const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes', 'cache_ttl', 'keepwarm', 'jot', 'wake', 'wake_events', 'window_detail'] };
 
 // 网关时间头：auto（默认）= 前端已经带了「此刻：」就不再加 [当前时间]、带了「离上一句」就不再加 [距上次对话]，
 // 免得模型同时看到两个钟；on = 总是加；off = 都不加。在 .env 里设 GATEWAY_TIME_HEADER 修改。
@@ -973,7 +973,7 @@ const TOOLS = [
     type: 'function',
     function: {
       name: 'schedule_wake',
-      description: '约一个时间让自己醒来（对方不在的时候）。到点时你会醒来一次：能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息（对方手机上会收到），不想说也可以不说。\n\n- 适合：对方说了晚点要做的事（考试、面试、出门、看病），你想到时候问问；或者你自己想过一阵再来看看。\n- 不用每次都约；对方正在和你聊的时候，想说什么直接说就好。\n- 时间按对方的时区：at 写「2026-11-01 08:30」或「08:30」（今天过了就是明天），也可以用 in_minutes（多少分钟以后）。最早 10 分钟以后，最晚 7 天以内，最多同时约 3 个。\n- reason 写到时候想做什么（只有你自己醒来时看得到，对方看不到这个约定）。到点时你们正在聊天，就不单独醒。\n- 取消：action=cancel 带上编号 id；看约了哪些：action=list。',
+      description: '约一个时间让自己醒来（对方不在的时候）。到点时你会醒来一次：能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息（对方手机上会收到），不想说也可以不说。\n\n- 适合：对方说了晚点要做的事（考试、面试、出门、看病），你想到时候问问；或者你自己想过一阵再来看看。\n- 不用每次都约；对方正在和你聊的时候，想说什么直接说就好。\n- 时间按对方的时区：at 写「2026-11-01 08:30」或「08:30」（今天过了就是明天），也可以用 in_minutes（多少分钟以后）。最早 10 分钟以后，最晚 7 天以内，最多同时约 3 个。\n- reason 写到时候想做什么（醒来时你会看到；不会发给对方，但会记在醒来记录里，对方能看到）。到点时你们正在聊天，就不单独醒。\n- 取消：action=cancel 带上编号 id；看约了哪些：action=list。',
       parameters: {
         type: 'object',
         properties: {
@@ -1177,6 +1177,24 @@ async function getWindowNotes(convId, entries, pv) {
     console.log('[WINDOW] compose/window 失败（这一轮不加窗口附注）:', e.message);
     return null;
   }
+}
+
+// 最近一轮实际发给模型的样子（每个对话一份，只在内存里，网关重启后要聊一轮才有）：给前端的「窗口详情」页看（约定第 18 节）
+const LAST_PROMPT_MAX = 30;
+const lastPromptByConv = new Map();
+function rememberPrompt(convId, p) {
+  if (!convId) return;
+  lastPromptByConv.delete(convId);
+  lastPromptByConv.set(convId, p);
+  while (lastPromptByConv.size > LAST_PROMPT_MAX) lastPromptByConv.delete(lastPromptByConv.keys().next().value);
+}
+function systemBlockLabel(b, i, composed) {
+  if (i === 0) return '静态：人设、记忆怎么用、对彼此的认识和理解、工具说明';
+  if (composed && b.text === composed.semi) return '半静态：章节、主题线、共同语汇';
+  if (composed && b.text === composed.daily) return '日更：我们最近、近七天、最近几天、还没了结的事、小本子';
+  if (/^\[共同经历叙事\]/.test(b.text || '')) return '共同经历叙事（旧）';
+  if (/^\[近期阶段摘要\]/.test(b.text || '')) return '近期阶段摘要（旧）';
+  return '前端的 system';
 }
 
 // 自动醒来：对方回来说话了——还没送到的醒来消息不再送，醒来过的几次写成附注里的一行（/wake/turn_note）
@@ -2804,7 +2822,7 @@ ${profile}${profileFacts}
 
     // 自动醒来打开着：告诉 ta 有这回事（开关一变 system 变一次，那一轮缓存重写一次）
     if (wakeOn) {
-      systemPrefix += `\n\n---\n\n对方打开了「自动醒来」：对方不在的时候，你偶尔会醒来一下（随机的${wakeToolOn ? '，或者你自己用 schedule_wake 约的时间' : ''}）。醒来时能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息，也可以不说。醒来时，用户消息的位置会是一段「［记忆系统｜醒来：……］」的说明，那是系统写给你的，不是对方说的话。对方回来以后，附注里会告诉你你醒来过几次、说了什么。`;
+      systemPrefix += `\n\n---\n\n对方打开了「自动醒来」：对方不在的时候，你偶尔会醒来一下（随机的${wakeToolOn ? '，或者你自己用 schedule_wake 约的时间' : ''}）。醒来时能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息，也可以不说。醒来时，用户消息的位置会是一段「［记忆系统｜醒来：……］」的说明，那是系统写给你的，不是对方说的话。醒来记录（几点醒的、说没说话、做了什么）对方能看到。对方回来以后，附注里会告诉你你醒来过几次、说了什么。`;
     }
 
     // 如果有 Custom Prompt，追加到 systemPrefix
@@ -2917,6 +2935,15 @@ ${profile}${profileFacts}
     capCacheControl(systemBlocks, nonSystemMessages, allTools);
 
     if (pv) {
+      if (!pvContinuing && !menuCtx.skipShadow) {
+        rememberPrompt(convIdForMenu, {
+          at: new Date().toISOString(), model: requestModel,
+          system: systemBlocks.map((b, i) => ({ label: systemBlockLabel(b, i, composed), text: b.text || '' })),
+          turn_note: memoryMenu || '', tools: allTools.map(t => t.name),
+          window: win ? { entries: (win.info || {}).entries || 0, matched: (win.info || {}).matched || 0, frozen: !!(win.info || {}).frozen,
+            notes: (win.notes || []).map(n => ({ i: n.i, text: n.text })), turn_note: win.turn_note || '' } : null
+        });
+      }
       keepwarm.begin();
       try {
         return await runPluvia({
@@ -3459,6 +3486,30 @@ app.post('/v1/pluvia/inbox/ack', async (req, res) => {
     res.status(502).json({ error: { message: '没记上：' + e.message, type: 'gateway_error' } });
   }
 });
+// 醒来记录（前端显示成一小行，不进聊天、不发给 ta）
+app.get('/v1/pluvia/wake/events', async (req, res) => {
+  try {
+    const conv = req.query.conversation_id || req.query.conv_id || '';
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/wake/events`, { params: { conv_id: conv || undefined, since_id: req.query.since_id, limit: req.query.limit }, timeout: 5000 });
+    res.json({ events: (r.data && r.data.events) || [] });
+  } catch (e) {
+    res.status(502).json({ error: { message: '取不到：' + e.message, type: 'gateway_error' } });
+  }
+});
+
+// 窗口详情（约定第 18 节）：这个窗口从哪来、带了哪几段、开头那行附注、滑出去那段的小结，加上最近一轮实际发给模型的 system 和附注
+app.get('/v1/pluvia/window', async (req, res) => {
+  const conv = String(req.query.conversation_id || req.query.conv_id || '');
+  if (!conv) return res.status(400).json({ error: { message: '要带上 conversation_id', type: 'bad_request' } });
+  try {
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/windows/detail`, { params: { conv_id: conv }, timeout: 5000 });
+    const { status, ...d } = r.data || {};
+    res.json({ ...d, last_prompt: lastPromptByConv.get(conv) || null });
+  } catch (e) {
+    res.status(502).json({ error: { message: '取不到：' + e.message, type: 'gateway_error' } });
+  }
+});
+
 // 前端登记推送地址（UnifiedPush 之类：说了话时网关往这里 POST 一个 JSON）
 app.post('/v1/pluvia/push/register', async (req, res) => {
   const b = req.body || {};
