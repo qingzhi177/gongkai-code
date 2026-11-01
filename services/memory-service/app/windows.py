@@ -200,16 +200,39 @@ def _aliases(c, rows):
     return out
 
 
+RUN_MAX = 6
+
+
 def align(rows, entries, aliases=None):
-    """窗口里的第 i 条 → 历史里的第 j 行。按顺序对齐（difflib），对不上的不给。"""
+    """窗口里的第 i 条 → 历史里的第 j 行。按顺序对齐（difflib），对不上的不给。
+    前端会把同一方相邻的几条合成一条发来（比如 ta 醒来时说的话，库里单独一行，接在 ta 上一条回复后面）：
+    库里连着的几行合起来的指纹正好是窗口里的一条时，把那几行当成一行，对到最后一行（后面那句话离它多久，按最后一行的时间算）。"""
     aliases = aliases or {}
-    h = [hash_text(r["role"], r["content"]) for r in rows]
     e = [aliases.get(x.get("h"), x.get("h")) for x in entries]
+    want = set(e)
+    units, h = [], []
+    i, n = 0, len(rows)
+    while i < n:
+        best = None
+        j = i + 1
+        while j < n and j - i < RUN_MAX and rows[j]["role"] == rows[i]["role"]:
+            hh = hash_text(rows[i]["role"], "".join(r["content"] or "" for r in rows[i:j + 1]))
+            if hh in want:
+                best = (j, hh)
+            j += 1
+        if best:
+            units.append(best[0])
+            h.append(best[1])
+            i = best[0] + 1
+        else:
+            units.append(i)
+            h.append(hash_text(rows[i]["role"], rows[i]["content"]))
+            i += 1
     sm = difflib.SequenceMatcher(None, h, e, autojunk=False)
     pairs = {}
     for a, b, size in sm.get_matching_blocks():
         for k in range(size):
-            pairs[b + k] = a + k
+            pairs[b + k] = units[a + k]
     return pairs
 
 

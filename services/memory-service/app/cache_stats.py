@@ -1,6 +1,6 @@
 """缓存记录与缓存心跳的状态（Dashboard「缓存与心跳」页）。
 
-网关每一轮聊天、每一次缓存心跳结束后 POST /cache/events 报一下用量（只有数字，不带内容），存进 cache_events（迁移 019）；
+网关每一轮聊天、每一次缓存心跳、每一次自动醒来结束后 POST /cache/events 报一下用量（只有数字，不带内容），存进 cache_events（迁移 019）；
 心跳现在在等谁、下一次什么时候，网关变化时 POST /cache/keepwarm，这里只放在内存里（重启就清空，网关下一轮会再报）。
 
 费用只是按公开价格粗算（缓存读 0.1 倍、5 分钟缓存写 1.25 倍、1 小时缓存写 2 倍），不是账单。
@@ -54,7 +54,7 @@ def _int(v):
 
 def record(c, ev, now=None):
     now = now or timeutil.utc_now_str()
-    kind = ev.get("kind") if ev.get("kind") in ("turn", "beat") else "turn"
+    kind = ev.get("kind") if ev.get("kind") in ("turn", "beat", "wake") else "turn"
     c.execute("INSERT INTO cache_events (ts, kind, conv_id, provider, relay, model, ttl, input, cache_write, cache_read, output, note) "
               "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
               (now, kind, str(ev.get("conv_id") or "")[:120] or None, str(ev.get("provider") or "")[:40] or None,
@@ -98,6 +98,7 @@ def overview(c, now=None, limit=80):
         recent = []
     turns = [e for e in recent if e["kind"] == "turn"]
     beats = [e for e in recent if e["kind"] == "beat"]
+    wakes = [e for e in recent if e["kind"] == "wake"]
     rates = [hit_rate(e) for e in turns if hit_rate(e) is not None]
 
     def total(es):
@@ -112,6 +113,7 @@ def overview(c, now=None, limit=80):
         "day": {"turns": len(turns), "misses": sum(1 for e in turns if e["cache_write"] > MISS_WRITE),
                 "avg_hit_rate": round(sum(rates) / len(rates), 3) if rates else None,
                 "turn_cost": total(turns), "beats": len(beats), "beat_cost": total(beats),
+                "wakes": len(wakes), "wake_cost": total(wakes),
                 "by_provider": by_provider},
         "keepwarm": keepwarm(),
     }

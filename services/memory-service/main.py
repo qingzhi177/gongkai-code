@@ -42,6 +42,7 @@ from app import branches as conv_branches   # 分支会话：和原会话重合�
 from app import windows as window_notes     # 换窗衔接：窗口里的时间标记、滑出窗口那段的小结、新窗口接上一窗（方案第 16 章）
 from app import cache_stats   # 缓存记录与缓存心跳（Dashboard「缓存与心跳」页）
 from app import notes as notebook   # 小本子：模型自己随手记下的小事（jot 工具）
+from app import wakes                # 自动醒来：对方不在的时候 ta 偶尔醒来一下
 from app.pipeline import bridge as bridge_pipeline   # 滑出窗口那段的小结（后台任务）
 from app import l0_edit   # Dashboard 上手动修改 L0 原文
 from app import l0_merge   # 实时存记录时窗口和库里的序列对齐
@@ -1956,6 +1957,11 @@ async def delete_l0_conversation(conv_id: str):
         c.execute("DELETE FROM notes WHERE conv_id=?", (conv_id,))
     except sqlite3.OperationalError:
         pass
+    # 5b. 自动醒来：在这个对话里醒来说的话、约的时间
+    try:
+        wakes.forget_conv(c, conv_id)
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
     # 6. 从 ChromaDB 删除对应向量
@@ -3129,6 +3135,165 @@ async def reset_cache_settings(req: SettingsReset):
     except ValueError as e:
         return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
     return {"status": "ok", **app_settings.describe("cache")}
+
+# ============ 自动醒来（app/wakes.py；网关 services/gateway/wake.js 每分钟来问一次要不要醒） ============
+class WakeCheck(BaseModel):
+    conv_id: Optional[str] = None
+    last_real_at: Optional[str] = None
+    tools: List[str] = []
+    has_context: bool = True
+
+class WakeFinish(BaseModel):
+    run_id: int
+    outcome: str
+    text: Optional[str] = None
+    aside: Optional[str] = None
+    thinking: Optional[str] = None
+    tools: List[str] = []
+    usage: Dict[str, Any] = {}
+    note: Optional[str] = None
+
+class WakePushResult(BaseModel):
+    run_id: int
+    result: Dict[str, Any] = {}
+
+class WakeAck(BaseModel):
+    ids: List[int] = []
+    dropped: List[int] = []
+
+class WakeTurn(BaseModel):
+    conv_id: Optional[str] = None
+
+class WakeSeen(BaseModel):
+    runs: List[int] = []
+    plans: List[int] = []
+
+class WakePlanAct(BaseModel):
+    action: str = "set"            # set / cancel / list
+    at: Optional[str] = None
+    in_minutes: Optional[float] = None
+    reason: Optional[str] = None
+    id: Optional[int] = None
+    conv_id: Optional[str] = None
+    source: str = "ai"             # ai（网关转来的 schedule_wake）/ user（Dashboard）
+
+class WakePushRegister(BaseModel):
+    url: str
+    format: str = "json"
+    remove: bool = False
+
+def _wake_tx(fn):
+    conn = get_conn()
+    try:
+        out = fn(conn)
+        conn.commit()
+        return out
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+@app.post("/wake/check")
+async def wake_check(req: WakeCheck):
+    """网关每分钟来问一次：要不要醒。要醒的话已经记下这一次（running），返回给 ta 的醒来说明"""
+    last_real = timeutil.to_utc_str(req.last_real_at) if req.last_real_at else None   # 和库里一样的写法（按字符串比较）
+
+    def run(conn):
+        now = timeutil.utc_now_str()
+        wakes.state_set(conn, "gateway", {"conv_id": req.conv_id, "last_real_at": last_real, "tools": req.tools,
+                                          "has_context": req.has_context, "checked_at": now}, now)
+        return wakes.decide(conn, req.conv_id, last_real, req.tools, req.has_context, now=now)
+    return {"status": "ok", **_wake_tx(run)}
+
+@app.post("/wake/finish")
+async def wake_finish(req: WakeFinish):
+    def run(conn):
+        r = wakes.finish(conn, req.run_id, req.outcome, req.text, req.aside, req.thinking, req.tools, req.usage, req.note)
+        s = wakes.cfg()
+        push = wakes.push_targets(conn, s) if r and r["outcome"] == "spoke" else []
+        return {"run": r, "push": push, "push_title": s.get("push_title") or "", "push_preview": bool(s.get("push_preview"))}
+    out = _wake_tx(run)
+    if not out["run"]:
+        return JSONResponse({"status": "error", "message": f"没有这一次醒来：{req.run_id}"}, status_code=404)
+    return {"status": "ok", **out}
+
+@app.post("/wake/push_result")
+async def wake_push_result(req: WakePushResult):
+    _wake_tx(lambda conn: wakes.note_push(conn, req.run_id, req.result))
+    return {"status": "ok"}
+
+@app.get("/wake/inbox")
+async def wake_inbox(conv_id: Optional[str] = None, limit: int = 20):
+    conn = get_conn()
+    try:
+        return {"status": "ok", "messages": wakes.inbox(conn, conv_id or None, max(1, min(100, limit)))}
+    finally:
+        conn.close()
+
+@app.post("/wake/ack")
+async def wake_ack(req: WakeAck):
+    return {"status": "ok", "results": _wake_tx(lambda conn: wakes.ack(conn, req.ids, req.dropped))}
+
+@app.post("/wake/turn_note")
+async def wake_turn_note(req: WakeTurn):
+    """对方回来说话了：还没送到的不再送；醒来过的几次写成一行附注"""
+    return {"status": "ok", **_wake_tx(lambda conn: wakes.turn_note(conn, req.conv_id))}
+
+@app.post("/wake/seen")
+async def wake_seen(req: WakeSeen):
+    _wake_tx(lambda conn: wakes.seen(conn, req.runs, req.plans))
+    return {"status": "ok"}
+
+@app.post("/wake/plans")
+async def wake_plans(req: WakePlanAct):
+    return _wake_tx(lambda conn: wakes.plan_act(conn, req.action, req.at, req.in_minutes, req.reason, req.id, req.conv_id,
+                                                 source="user" if req.source == "user" else "ai"))
+
+@app.post("/wake/test")
+async def wake_test():
+    """Dashboard：现在醒一次（网关下一次来问时醒，一分钟之内）"""
+    if not wakes.cfg()["enabled"]:
+        return JSONResponse({"status": "error", "message": "先打开「自动醒来」的总开关（可以把随机醒来和 ta 自己约都关掉，只用来试）"},
+                            status_code=400)
+    _wake_tx(lambda conn: wakes.state_set(conn, "test_requested", timeutil.utc_now_str()))
+    return {"status": "ok", "message": "一分钟之内醒一次"}
+
+@app.post("/wake/push/register")
+async def wake_push_register(req: WakePushRegister):
+    out = _wake_tx(lambda conn: wakes.register_push(conn, req.url, req.format, req.remove))
+    if out.get("status") != "ok":
+        return JSONResponse(out, status_code=400)
+    return out
+
+@app.get("/wake")
+async def wake_overview(limit: int = 50):
+    conn = get_conn()
+    try:
+        out = wakes.overview(conn, limit=max(1, min(300, limit)))
+    finally:
+        conn.close()
+    return {**out, "settings_spec": app_settings.describe("wake")}
+
+@app.get("/wake/settings")
+async def get_wake_settings():
+    return app_settings.describe("wake")
+
+@app.put("/wake/settings")
+async def put_wake_settings(req: SettingsUpdate):
+    try:
+        app_settings.update("wake", req.values)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("wake")}
+
+@app.post("/wake/settings/reset")
+async def reset_wake_settings(req: SettingsReset):
+    try:
+        app_settings.reset("wake", req.keys)
+    except ValueError as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=400)
+    return {"status": "ok", **app_settings.describe("wake")}
 
 @app.get("/compose/settings")
 async def get_compose_settings():

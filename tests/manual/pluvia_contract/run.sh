@@ -13,7 +13,7 @@ cd "$T"   # 不在网关目录下启动，免得读到真实 .env
 node "$HERE/fake_upstream.js" > "$T/up.log" 2>&1 & P1=$!
 node "$HERE/fake_memory.js" > "$T/mem.log" 2>&1 & P2=$!
 sleep 0.5
-PORT=3999 GATEWAY_INTERNAL_PORT=3996 GATEWAY_BIND_HOSTS=127.0.0.1 MEMORY_SERVICE_URL=http://127.0.0.1:3998 MEMORY_DATA_DIR="$T/data" \
+PORT=3999 GATEWAY_INTERNAL_PORT=3996 GATEWAY_WAKE_TICK_MS=300 GATEWAY_WAKE_STATE="$T/wake_last_turn.json" GATEWAY_BIND_HOSTS=127.0.0.1 MEMORY_SERVICE_URL=http://127.0.0.1:3998 MEMORY_DATA_DIR="$T/data" \
   node "$GW_FILE" > "$T/gw.log" 2>&1 & P3=$!
 for i in $(seq 1 40); do curl -sf http://127.0.0.1:3999/health >/dev/null && break; sleep 0.25; done
 sleep 0.5

@@ -168,6 +168,7 @@
             <button class="tab" onclick="showPanel('windows')">换窗衔接</button>
             <button class="tab" onclick="showPanel('cache')">缓存与心跳</button>
             <button class="tab" onclick="showPanel('notebook')">小本子</button>
+            <button class="tab" onclick="showPanel('wake')">自动醒来</button>
             <button class="tab" onclick="showPanel('summary')">近期摘要</button>
             <button class="tab" onclick="showPanel('import')">导入</button>
             <button class="tab" onclick="showPanel('config')">配置</button>
@@ -666,6 +667,36 @@
                 <div id="nb-settings" style="margin-top:8px;font-size:13px;"></div></details>
         </div>
 
+        <div id="wake" class="panel">
+            <h3>自动醒来</h3>
+            <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
+                你不在的时候，ta 偶尔醒来一下：能看到这段对话，可以想一想、翻翻记忆、记小本子，想说话就给你发一条消息，也可以不说。<br>
+                ① <b>随机醒来</b>：你停下一段时间以后，每隔一阵掷一次骰子，白天、夜里的概率分开设（夜里默认不随机醒）。<br>
+                ② <b>ta 自己约</b>：平时聊天时 ta 可以用 <code>schedule_wake</code> 约下次几点醒（比如「你考完试那会儿我来问问」）；到点时你们正在聊天就不单独醒。<br>
+                醒来走的是平时聊天那条路：同样的 system、历史和工具，缓存也一样，醒一次大约多花一轮的钱。叫醒 ta 的那段说明只给 ta 看，不进聊天记录。
+                ta 说了话：等前端来取，取走（显示）以后才存进聊天记录；只写「［不说］」就只记在下面的醒来记录里。你回来说话时，附注里会告诉 ta「你不在的时候醒来过几次」。<br>
+                <b>前端要能收消息（接入约定第 17 节）以后再打开总开关</b>；打开之前想先在聊天里和 ta 说一声也可以。只想先看看是什么样子：打开总开关、把随机醒来和 ta 自己约都关掉，再点「现在醒一次」。
+            </div>
+            <div style="margin-bottom:10px;display:flex;flex-wrap:wrap;gap:10px;align-items:center;">
+                <label style="font-size:14px;"><input type="checkbox" id="wake-enabled" onchange="saveWakeSettings({enabled: this.checked})"> <b>自动醒来（总开关）</b></label>
+                <button class="btn" onclick="wakeTest()" style="background:#6f42c1;">现在醒一次</button>
+                <button class="btn" onclick="loadWake()" style="background:#6c757d;">刷新</button>
+                <span id="wake-status" style="font-size:12px;color:#666;"></span>
+            </div>
+            <div id="wake-summary" style="background:#f6f3fb;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:13px;line-height:1.9;"></div>
+            <h4 style="margin:6px 0 8px;">ta 约好的时间</h4>
+            <div id="wake-plans" style="margin-bottom:8px;"></div>
+            <div style="display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:12px;margin-bottom:14px;">
+                <input id="wake-plan-at" placeholder="几点，比如 21:30 或 2026-11-01 08:30" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:220px;">
+                <input id="wake-plan-reason" placeholder="到时候想做什么（ta 醒来时看得到）" style="padding:4px 6px;border:1px solid #ddd;border-radius:6px;width:240px;">
+                <button class="btn" style="padding:3px 12px;font-size:12px;background:#28a745;" onclick="wakeAddPlan()">替 ta 约一个</button>
+            </div>
+            <h4 style="margin:6px 0 8px;">醒来记录</h4>
+            <div id="wake-runs" style="margin-bottom:14px;"></div>
+            <details open><summary style="cursor:pointer;font-size:13px;color:#555;">设置</summary>
+                <div id="wake-settings" style="margin-top:8px;font-size:13px;"></div></details>
+        </div>
+
         <div id="cache" class="panel">
             <h3>缓存与心跳</h3>
             <div style="font-size:13px;color:#666;line-height:1.7;margin-bottom:12px;">
@@ -1019,6 +1050,7 @@
             if (name === 'windows') loadWindows(winConv);
             if (name === 'cache') loadCache();
             if (name === 'notebook') loadNotebook();
+            if (name === 'wake') loadWake();
             if (name === 'summary') { loadSummary(); loadDigests(); }
         }
 
@@ -3168,6 +3200,111 @@ function rebuildProfile() {
                 .then(function(r) { return r.json(); }).then(function(d) { if (d.status === 'error') alert(d.message); else loadNotebook(); });
         }
 
+        // ============ 自动醒来 ============
+        var WAKE_KIND = { random: '随机醒来', plan: 'ta 约的', test: '试一次' };
+        var WAKE_OUT = { running: '醒着…', spoke: '说了话', silent: '没说话', error: '出错', interrupted: '停下了（你正好回来）' };
+        var WAKE_DELIV = { pending: '等前端来取', delivered: '前端取走了，存进了聊天记录', missed: '没送到（你先发了消息）', dropped: '前端没显示' };
+        var WAKE_PLAN = { pending: '等着', done: '醒过了', cancelled: '取消了', skipped: '没醒' };
+        function loadWake() {
+            fetch(API + '/wake').then(function(r) { return r.json(); }).then(function(d) {
+                var spec = d.settings_spec || {}, vals = {};
+                (spec.items || []).forEach(function(it) { vals[it.key] = it.value; });
+                document.getElementById('wake-enabled').checked = !!vals.enabled;
+                var gw = d.gateway || {}, pk = d.peek || {}, roll = d.last_roll, l24 = d.last_24h || {};
+                var html = '<b>现在</b>：' + (vals.enabled ? '开着' : '关着') + (vals.enabled ? '（随机醒来' + (vals.random ? '开' : '关') + ' · ta 自己约' + (vals.plans ? '开' : '关') + ' · ' + (vals.speak ? '醒来可以发消息' : '静默档：不发消息') + '）' : '') + '<br>';
+                html += '<b>接着说的对话</b>：' + (gw.conv_id ? '<code>' + escapeHtml(String(gw.conv_id).slice(0, 12)) + '</code>，你最后一次聊天 ' + formatTime(gw.last_real_at) : '（网关还没来问过，或者重启以后还没聊过天）')
+                    + (gw.checked_at ? ' · 网关 ' + formatTime(gw.checked_at) + ' 来问过' : '') + '<br>';
+                html += '<b>下一步</b>：' + escapeHtml(pk.reason || '—') + (pk.next_at ? '（大约 ' + formatTime(pk.next_at) + '）' : '')
+                    + (pk.part ? ' · ' + (pk.part === 'day' ? '白天' : '夜里') + '已经醒了 ' + pk.used + ' / ' + pk.cap + ' 次' : '') + '<br>';
+                if (roll && roll.at) html += '<b>上次掷骰子</b>：' + formatTime(roll.at) + '，' + (roll.hit ? '掷中了' : '没掷中') + '（' + Math.round((roll.p || 0) * 100) + '%）<br>';
+                html += '<b>最近 24 小时</b>：说了话 ' + (l24.spoke || 0) + ' 次 · 没说话 ' + (l24.silent || 0) + ' 次' + (l24.error ? ' · 出错 ' + l24.error + ' 次' : '') + (l24.interrupted ? ' · 停下 ' + l24.interrupted + ' 次' : '')
+                    + (d.push_endpoints ? ' · 前端登记了 ' + d.push_endpoints + ' 个推送地址' : '') + (vals.push_url ? ' · 有 ntfy 推送地址' : '');
+                if (d.test_requested) html += '<br><b>等着试一次</b>（网关一分钟之内来问）';
+                document.getElementById('wake-summary').innerHTML = html;
+                var plans = d.plans || [];
+                document.getElementById('wake-plans').innerHTML = plans.length ? plans.map(function(p) {
+                    return '<div style="background:#fff;border:1px solid #e5e5e5;border-radius:8px;padding:6px 12px;margin-bottom:5px;font-size:13px;' + (p.status === 'pending' ? '' : 'opacity:.6;') + '">'
+                        + '#' + p.id + ' · <b>' + formatTime(p.due_at) + '</b> · ' + escapeHtml(WAKE_PLAN[p.status] || p.status) + (p.source === 'user' ? ' · 你替 ta 约的' : '')
+                        + (p.reason ? ' · 「' + escapeHtml(p.reason) + '」' : '') + (p.note ? ' <span style="color:#888;">（' + escapeHtml(p.note) + '）</span>' : '')
+                        + (p.status === 'pending' ? ' <a href="#" style="color:#c0392b;font-size:12px;" onclick="wakeCancel(' + p.id + ');return false;">取消</a>' : '') + '</div>';
+                }).join('') : '<div style="color:#888;font-size:12px;">还没有</div>';
+                var runs = d.runs || [];
+                document.getElementById('wake-runs').innerHTML = runs.length ? runs.map(function(r) {
+                    var u = r.usage || {};
+                    var bg = r.outcome === 'spoke' ? '#f3f8f3' : (r.outcome === 'error' ? '#fff4f0' : '#fff');
+                    var push = r.push && r.push.targets ? r.push.targets.map(function(t) { return escapeHtml(t.host) + (t.ok ? ' ✓' : ' ✗'); }).join('、') : '';
+                    return '<div style="background:' + bg + ';border:1px solid #e5e5e5;border-radius:8px;padding:8px 12px;margin-bottom:6px;font-size:13px;line-height:1.7;">'
+                        + '<span style="color:#888;">#' + r.id + ' · ' + formatTime(r.started_at) + ' · ' + escapeHtml(WAKE_KIND[r.kind] || r.kind) + ' · </span><b>' + escapeHtml(WAKE_OUT[r.outcome] || r.outcome) + '</b>'
+                        + (r.delivery ? ' <span style="color:#888;">· ' + escapeHtml(WAKE_DELIV[r.delivery] || r.delivery) + '</span>' : '')
+                        + ((r.tools || []).length ? ' <span style="color:#888;">· 用了 ' + r.tools.map(escapeHtml).join('、') + '</span>' : '')
+                        + (r.cost != null ? ' <span style="color:#888;">· 约 ' + usd(r.cost) + '</span>' : '')
+                        + (u.cache_read != null ? ' <span style="color:#aaa;font-size:12px;">（读缓存 ' + u.cache_read + ' · 写 ' + (u.cache_write || 0) + '）</span>' : '')
+                        + (r.text ? '<div style="margin-top:3px;white-space:pre-wrap;">' + escapeHtml(r.text) + '</div>' : '')
+                        + (r.aside ? '<div style="margin-top:3px;color:#777;white-space:pre-wrap;">自己写下、没发出去的：' + escapeHtml(r.aside) + '</div>' : '')
+                        + (r.thinking ? '<details style="margin-top:3px;"><summary style="cursor:pointer;font-size:12px;color:#888;">醒来时想了什么</summary><div style="white-space:pre-wrap;font-size:12px;color:#666;">' + escapeHtml(r.thinking) + '</div></details>' : '')
+                        + (r.note ? '<div style="font-size:12px;color:#888;">' + escapeHtml(r.note) + '</div>' : '')
+                        + (push ? '<div style="font-size:12px;color:#888;">推送：' + push + '</div>' : '') + '</div>';
+                }).join('') : '<div style="color:#888;font-size:12px;">还没有醒来过</div>';
+                renderWakeSettings(spec);
+            }).catch(function(e) { document.getElementById('wake-status').textContent = '读取失败：' + e; });
+        }
+        function renderWakeSettings(spec) {
+            var el = document.getElementById('wake-settings');
+            var items = (spec.items || []).filter(function(it) { return it.key !== 'enabled'; });
+            var html = '', section = null;
+            items.forEach(function(it) {
+                if (it.section !== section) { section = it.section; html += '<div style="margin:10px 0 4px;font-weight:bold;color:#555;">' + escapeHtml(section) + '</div>'; }
+                if (it.type === 'bool') {
+                    html += '<div style="margin-bottom:6px;"><label><input type="checkbox" data-key="' + it.key + '" data-type="bool" ' + (it.value ? 'checked' : '') + '> ' + escapeHtml(it.label) + '</label>'
+                        + (it.help ? '<div style="font-size:12px;color:#888;">' + escapeHtml(it.help) + '</div>' : '') + '</div>';
+                } else if (it.type === 'str') {
+                    html += '<div style="margin-bottom:6px;"><label>' + escapeHtml(it.label) + ' <input type="text" data-key="' + it.key + '" data-type="str" value="' + escapeHtml(it.value || '') + '" style="width:260px;padding:3px 5px;border:1px solid #ddd;border-radius:6px;"></label>'
+                        + (it.help ? '<div style="font-size:12px;color:#888;">' + escapeHtml(it.help) + '</div>' : '') + '</div>';
+                } else {
+                    html += '<div style="margin-bottom:6px;"><label>' + escapeHtml(it.label) + ' <input type="number" data-key="' + it.key + '" data-type="num" value="' + it.value + '" min="' + it.min + '" max="' + it.max + '" step="' + it.step
+                        + '" style="width:80px;padding:3px 5px;border:1px solid #ddd;border-radius:6px;"></label>'
+                        + '<div style="font-size:12px;color:#888;">' + escapeHtml(it.help || '') + '（默认 ' + it.default + '）</div></div>';
+                }
+            });
+            el.innerHTML = html + '<button class="btn" style="padding:3px 12px;font-size:12px;">保存设置</button> <a href="#" style="font-size:12px;margin-left:8px;" id="wake-reset">恢复默认（总开关不动）</a>';
+            el.querySelector('button').onclick = function() {
+                var values = {};
+                el.querySelectorAll('input[data-key]').forEach(function(i) {
+                    var t = i.getAttribute('data-type');
+                    values[i.getAttribute('data-key')] = t === 'bool' ? i.checked : i.value;
+                });
+                saveWakeSettings(values);
+            };
+            document.getElementById('wake-reset').onclick = function() {
+                if (!confirm('除了总开关，其余设置恢复默认？')) return false;
+                var keys = items.map(function(it) { return it.key; });
+                apiCall('POST', '/wake/settings/reset', { keys: keys }).then(function(d) { if (d && d.status !== 'error') loadWake(); });
+                return false;
+            };
+        }
+        function saveWakeSettings(values) {
+            fetch(API + '/wake/settings', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ values: values }) })
+                .then(function(r) { return r.json(); }).then(function(d) {
+                    if (d.status === 'error') { alert(d.message); loadWake(); return; }
+                    document.getElementById('wake-status').textContent = ('enabled' in values) ? (values.enabled ? '已打开（网关半分钟内生效）' : '已关掉') : '保存了（网关半分钟内生效）';
+                    loadWake();
+                });
+        }
+        function wakeTest() {
+            apiCall('POST', '/wake/test').then(function(d) { if (d && d.status !== 'error') { document.getElementById('wake-status').textContent = d.message || '一分钟之内醒一次'; loadWake(); } });
+        }
+        function wakeCancel(id) {
+            if (!confirm('取消 #' + id + '？')) return;
+            apiCall('POST', '/wake/plans', { action: 'cancel', id: id, source: 'user' }).then(function(d) { if (d && d.status !== 'error') loadWake(); });
+        }
+        function wakeAddPlan() {
+            var at = document.getElementById('wake-plan-at').value.trim(), reason = document.getElementById('wake-plan-reason').value.trim();
+            if (!at) return;
+            apiCall('POST', '/wake/plans', { action: 'set', at: at, reason: reason, source: 'user' }).then(function(d) {
+                if (d && d.status !== 'error') { document.getElementById('wake-status').textContent = d.message || '约好了'; document.getElementById('wake-plan-at').value = ''; document.getElementById('wake-plan-reason').value = ''; loadWake(); }
+            });
+        }
+
         // ============ 缓存与心跳 ============
         function pct(x) { return x == null ? '—' : Math.round(x * 100) + '%'; }
         function usd(x) { return x == null ? '—' : '$' + (x < 0.01 ? x.toFixed(4) : x.toFixed(3)); }
@@ -3177,7 +3314,8 @@ function rebuildProfile() {
                 var prov = Object.keys(day.by_provider || {}).map(function(k) { return escapeHtml(k || '?') + ' ' + day.by_provider[k] + ' 轮'; }).join('、');
                 var html = '<b>最近 24 小时</b>：聊了 ' + (day.turns || 0) + ' 轮，平均命中 ' + pct(day.avg_hit_rate) + '，其中 ' + (day.misses || 0) + ' 轮重新写了一大段缓存'
                     + (prov ? '；回答的：' + prov : '') + '；聊天约 ' + usd(day.turn_cost) + '<br>'
-                    + '<b>心跳</b>：' + (day.beats || 0) + ' 次，约 ' + usd(day.beat_cost) + '（只算读缓存，心跳的输出没算进来，一般只有几十个字）<br>';
+                    + '<b>心跳</b>：' + (day.beats || 0) + ' 次，约 ' + usd(day.beat_cost) + '（只算读缓存，心跳的输出没算进来，一般只有几十个字）<br>'
+                    + (day.wakes ? '<b>自动醒来</b>：' + day.wakes + ' 次，约 ' + usd(day.wake_cost) + '<br>' : '');
                 if (kw.armed) html += '<b>正在保温</b>：对话 <code>' + escapeHtml(String(kw.conv_id || '').slice(0, 10)) + '</code>' + (kw.provider ? ' · ' + escapeHtml(kw.provider) : '')
                     + ' · ' + escapeHtml(kw.ttl || '') + ' · 下一次 ' + formatTime(kw.next_at) + ' · 最晚保温到 ' + formatTime(kw.idle_until) + ' · 今天 ' + (kw.beats_today || 0) + ' 次';
                 else html += '<b>现在没在保温</b>' + (kw.reason ? '：' + escapeHtml(kw.reason) : (kw.updated_at ? '' : '（网关还没报过状态，聊一轮以后就有）'));
@@ -3192,8 +3330,8 @@ function rebuildProfile() {
                 document.getElementById('cache-events').innerHTML = ev.length ? '<table style="border-collapse:collapse;font-size:12px;min-width:620px;"><tr style="color:#888;text-align:left;">'
                     + '<th style="padding:3px 8px;">时间</th><th>是什么</th><th>哪家</th><th>时长</th><th style="text-align:right;">读缓存</th><th style="text-align:right;">写缓存</th><th style="text-align:right;">没缓存的输入</th><th style="text-align:right;">命中</th><th style="text-align:right;">约</th></tr>'
                     + ev.map(function(e) {
-                        var bg = e.kind === 'beat' ? '#f3f8f3' : (e.miss ? '#fff4f0' : '');
-                        return '<tr style="border-top:1px solid #eee;background:' + bg + ';"><td style="padding:3px 8px;white-space:nowrap;">' + formatTime(e.ts) + '</td><td>' + (e.kind === 'beat' ? '心跳' : '聊天') + (e.note ? '（' + escapeHtml(e.note) + '）' : '')
+                        var bg = e.kind === 'beat' ? '#f3f8f3' : e.kind === 'wake' ? '#f3f3fb' : (e.miss ? '#fff4f0' : '');
+                        return '<tr style="border-top:1px solid #eee;background:' + bg + ';"><td style="padding:3px 8px;white-space:nowrap;">' + formatTime(e.ts) + '</td><td>' + (e.kind === 'beat' ? '心跳' : e.kind === 'wake' ? '醒来' : '聊天') + (e.note ? '（' + escapeHtml(e.note) + '）' : '')
                             + '</td><td>' + escapeHtml(e.provider || '') + '</td><td>' + escapeHtml(e.ttl || '') + '</td><td style="text-align:right;">' + e.cache_read + '</td><td style="text-align:right;">' + e.cache_write
                             + '</td><td style="text-align:right;">' + e.input + '</td><td style="text-align:right;">' + pct(e.hit_rate) + '</td><td style="text-align:right;">' + usd(e.cost) + '</td></tr>';
                     }).join('') + '</table><div style="font-size:12px;color:#888;margin-top:4px;">浅红：这一轮重新写了一大段（换了一家、缓存过期了、或者前端的窗口刚挪过）；浅绿：心跳。</div>'

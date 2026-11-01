@@ -6,6 +6,7 @@
 召回编排每一轮读一次 get("recall")：有 5 秒缓存，保存 / 恢复默认后立即失效，不用重启。
 """
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -128,6 +129,51 @@ SPECS = {
         _item("daily_max", int, 40, 0, 500, 1, "心跳", "每天最多心跳几次",
               "兜底的上限（0 = 不心跳），按你所在时区的一天算。"),
     ],
+    "wake": [
+        _item("enabled", bool, False, None, None, None, "总开关", "自动醒来",
+              "你不在的时候，ta 偶尔醒来一下：能看到这段对话，可以想一想、翻翻记忆、记小本子，想说话就给你发一条消息，也可以不说。"
+              "醒来走的是平时聊天那条路（同样的 system、历史和工具，缓存也一样），醒一次大约多花一轮的钱。"
+              "前端要能收消息（接入约定第 17 节）才有意义；打开之前，想先在聊天里和 ta 说一声也可以。"),
+        _item("random", bool, True, None, None, None, "两种醒法", "随机醒来",
+              "你停下一段时间以后，每隔一阵掷一次骰子，掷中了就醒（白天、夜里的概率分开设）。"),
+        _item("plans", bool, True, None, None, None, "两种醒法", "ta 自己约时间",
+              "给 ta 一个 schedule_wake 工具：平时聊天时 ta 可以约下次几点醒（比如「你考完试那会儿我来问问」）。"
+              "到点时你们正在聊天，就不单独醒，下次聊天时告诉 ta。打开 / 关掉会让工具清单变一次（那一轮缓存重写一次）。"),
+        _item("speak", bool, True, None, None, None, "两种醒法", "醒来可以给你发消息",
+              "关掉就是「静默档」：ta 醒来只自己待一会儿（可以翻记忆、记小本子），不会给你发消息。"),
+        _item("idle_minutes", int, 120, 20, 1440, 10, "随机醒来", "停下多久以后才开始掷骰子（分钟）",
+              "从你最后一次聊天算起。"),
+        _item("check_minutes", int, 60, 15, 720, 5, "随机醒来", "每隔多久掷一次（分钟）", ""),
+        _item("day_prob", float, 0.3, 0.0, 1.0, 0.05, "随机醒来", "白天每次掷中的概率",
+              "0.3 = 30%。"),
+        _item("night_prob", float, 0.0, 0.0, 1.0, 0.05, "随机醒来", "夜里每次掷中的概率",
+              "默认 0：夜里不随机醒（ta 自己约的照样醒）。"),
+        _item("night_start", int, 23, 0, 23, 1, "白天和夜里", "夜里从几点开始", "按你所在的时区。"),
+        _item("night_end", int, 8, 0, 23, 1, "白天和夜里", "夜里到几点结束", "和开始一样就是不分白天夜里。"),
+        _item("day_max", int, 4, 0, 24, 1, "上限", "白天最多醒几次",
+              "随机的和 ta 约的一起算；白天、夜里分开计数。"),
+        _item("night_max", int, 1, 0, 12, 1, "上限", "夜里最多醒几次", ""),
+        _item("min_gap_minutes", int, 90, 10, 1440, 10, "上限", "随机醒来离上一次醒来至少隔多久（分钟）",
+              "ta 约好的时间不受这条限制。"),
+        _item("unanswered_stop", int, 2, 1, 10, 1, "上限", "连着说了几句你都没回，就先不随机醒",
+              "你回来聊天以后重新算。ta 约好的时间照样醒（ta 会知道你还没回）。"),
+        _item("max_rounds", int, 5, 1, 12, 1, "醒来时", "最多几轮工具调用", "超过就停下，这次醒来到此为止。"),
+        _item("allow_recall", bool, True, None, None, None, "醒来时能用的工具", "想起以前的事（recall）", ""),
+        _item("allow_feel", bool, True, None, None, None, "醒来时能用的工具", "记下感受（feel）", ""),
+        _item("allow_jot", bool, True, None, None, None, "醒来时能用的工具", "记小本子（jot）", ""),
+        _item("allow_profile", bool, False, None, None, None, "醒来时能用的工具", "更新对彼此的认识（update_profile）",
+              "默认关：稳定的认识最好在聊天里、你也在的时候改。"),
+        _item("allow_web", bool, False, None, None, None, "醒来时能用的工具", "联网搜索（bocha_search）", ""),
+        _item("plan_quiet_minutes", int, 15, 0, 240, 5, "ta 自己约时间", "到点前这么久之内聊过天，就不单独醒（分钟）",
+              "你们正在聊的时候不用单独醒；下次聊天时会告诉 ta 这次没醒。"),
+        _item("push_url", str, "", None, None, None, "推送", "推送地址（可不填）",
+              "说了话的时候往这个地址发一条推送，兼容 ntfy（比如 https://ntfy.sh/一个只有你知道的名字，手机上装 ntfy 订阅它）。"
+              "不填就只等前端来取。只接受 https。"),
+        _item("push_title", str, "", None, None, None, "推送", "推送的标题（可不填）",
+              "不填就是「新消息」。"),
+        _item("push_preview", bool, True, None, None, None, "推送", "推送里带上 ta 说的话",
+              "关掉的话推送只写「有一条新消息」，锁屏上看不到内容。"),
+    ],
     "episodes": [
         _item("enabled", bool, True, None, None, None, "整理", "自动整理每日片段",
               "每天把对话整理成片段（会调用模型，花一点点钱）。关掉以后只能手动点「整理」。"),
@@ -187,6 +233,15 @@ SPECS = {
 
 TYPE_NAMES = {float: "float", int: "int", bool: "bool", str: "str"}
 
+
+def _check_https(s, label):
+    if not re.match(r"^https://[^\s/]+(/\S*)?$", s):
+        raise ValueError(f"「{label}」要是 https:// 开头的地址")
+
+
+# 可以留空的文字参数（键名 → 填了时的检查）。目前只有推送地址。
+EMPTY_OK_STR = {"push_url": _check_https, "push_title": None}
+
 _lock = threading.Lock()
 _cache = {}   # 组名 -> (时间, {参数: 值})
 
@@ -214,6 +269,13 @@ def coerce(spec, v):
         raise ValueError(f"「{label}」只能是开或关")
     if t is str:
         s = str(v if v is not None else "").strip()
+        if spec["key"] in EMPTY_OK_STR:     # 可以不填的（推送地址这类）
+            if len(s) > 300:
+                raise ValueError(f"「{label}」不能超过 300 个字符")
+            check = EMPTY_OK_STR[spec["key"]]
+            if s and check:
+                check(s, label)
+            return s
         if not s or len(s) > 100:
             raise ValueError(f"「{label}」不能为空，也不能超过 100 个字符")
         return s

@@ -31,6 +31,7 @@ SIMILAR = 0.6               # 内容这么像，才算同一条改了几个字
 WEAK_CHARS = 20             # 只对上一条、而且这么短：可能是碰巧（「嗯」「晚安」）
 WEAK_TRAILING = 2           # 碰巧对上的那条后面，库里还有超过这么多条对不上，就当一条都没对上
 SHORT_CONV = 4              # 一条都没对上、库里这个会话不超过这么多条、窗口盖住了整段、第一句很像：当成编辑第一句后重发
+RUN_MAX = 6                 # 前端合成一条的，最多拆回库里连着的这么多条
 
 
 def norm(content):
@@ -70,6 +71,31 @@ def ts_between(prev_ts, next_ts, now):
     if n:
         return _fmt(n - timedelta(seconds=1))
     return now
+
+
+def split_merged(old, messages):
+    """前端发历史时会把同一方相邻的几条合成一条（接入约定 15.5）。库里分开存着的几条——比如 ta 醒来时说的话
+    （app/wakes.py，单独存一行，接在 ta 上一条回复后面）——在窗口里就成了一条，按位置对不上。
+    这里把窗口里的这种消息拆回库里那几条：只拆和库里连着的几条（同一方）合起来完全一样（忽略空白和图片占位）的。
+    old：库里的行 (id, role, content, ...)；返回拆好的窗口。"""
+    runs = {}
+    i, n = 0, len(old)
+    while i < n:
+        j = i
+        while j + 1 < n and old[j + 1][1] == old[i][1]:
+            j += 1
+        for a in range(i, j):
+            for b in range(a + 2, min(j + 1, a + RUN_MAX) + 1):
+                seg = old[a:b]
+                key = cmp_key(seg[0][1], "".join(r[2] or "" for r in seg))
+                runs.setdefault(key, [{"role": r[1], "content": r[2]} for r in seg])
+        i = j + 1
+    if not runs:
+        return messages
+    out = []
+    for m in messages:
+        out.extend(runs.get(cmp_key(m["role"], m["content"])) or [m])
+    return out
 
 
 def merge(c, conv_id, client, messages, edited=None, now=None):
@@ -112,6 +138,7 @@ def merge(c, conv_id, client, messages, edited=None, now=None):
     def next_ts(a):
         return old[a][4] if a < len(old) else None
 
+    messages = split_merged(old, messages)
     ok = [cmp_key(r[1], r[2]) for r in old]
     nk = [edited.get(k, k) for k in (cmp_key(m["role"], m["content"]) for m in messages)]
     ops = difflib.SequenceMatcher(None, ok, nk, autojunk=False).get_opcodes()

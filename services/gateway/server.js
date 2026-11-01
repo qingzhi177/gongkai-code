@@ -89,6 +89,11 @@ const USER_TZ_LABEL = USER_TZ === 'Asia/Shanghai' ? '北京时间' : USER_TZ;
 const { createKeepwarm, providerOf, providerName, isOpenRouter } = require('./keepwarm');
 const KEEPWARM_ON = String(process.env.GATEWAY_KEEPWARM || 'on').trim().toLowerCase() !== 'off';
 const keepwarm = createKeepwarm({ memoryUrl: MEMORY_SERVICE_URL, userTz: USER_TZ });
+// 自动醒来（wake.js + 记忆服务 app/wakes.py；Dashboard「自动醒来」页，默认关着）。GATEWAY_WAKE=off：整个不跑。
+const { createWake } = require('./wake');
+const WAKE_ON = String(process.env.GATEWAY_WAKE || 'on').trim().toLowerCase() !== 'off';
+// wake 在下面（upstreamOnce、executeTool 定义以后）创建；这里先占位，函数声明会提升，用的时候已经有了
+let wake = null;
 const WEEKDAY_CN = { Mon: '周一', Tue: '周二', Wed: '周三', Thu: '周四', Fri: '周五', Sat: '周六', Sun: '周日' };
 // 解析库里存的时间：不带时区的当 UTC，带 Z / 偏移的按本身，也支持毫秒时间戳。解析不了返回 null。
 function parseStoredTs(v) {
@@ -288,7 +293,7 @@ function buildTurnMessages(messages, aiText) {
 
 // ============ Pluvia 接入约定 v0.2（docs/plan/pluvia-gateway-contract.md） ============
 // 只有 body 里带了 pluvia 对象的请求才走 v0.2 逻辑；Kelivo 等其它客户端的路径不变。
-const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes', 'cache_ttl', 'keepwarm', 'jot'] };
+const PLUVIA_CONTRACT = { contract: '0.2', features: ['turn', 'tail', 'client_tools', 'tool_events', 'branch_of', 'forged_from', 'window_notes', 'cache_ttl', 'keepwarm', 'jot', 'wake'] };
 
 // 网关时间头：auto（默认）= 前端已经带了「此刻：」就不再加 [当前时间]、带了「离上一句」就不再加 [距上次对话]，
 // 免得模型同时看到两个钟；on = 总是加；off = 都不加。在 .env 里设 GATEWAY_TIME_HEADER 修改。
@@ -762,7 +767,7 @@ function toolLoopLacksThinking(messages) {
 }
 
 // ---- tool_events：记忆工具执行过程，推给前端只做显示 ----
-const TOOL_ERR_RE = /^(检索失败|记忆检索出错|记录感受失败|更新画像失败|网络搜索失败|网络搜索未配置|工具执行失败|小本子没记上)/;
+const TOOL_ERR_RE = /^(检索失败|记忆检索出错|记录感受失败|更新画像失败|网络搜索失败|网络搜索未配置|工具执行失败|小本子没记上|没约上)/;
 function toolEventContent(name, out) {
   let s = String(out == null ? '' : out);
   if (name === 'recall') s = s.replace(/\n*😊 情感：valence [^\n]*/g, '');   // 内部打分不给前端看
@@ -963,6 +968,24 @@ const TOOLS = [
         required: ['query']
       }
     }
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'schedule_wake',
+      description: '约一个时间让自己醒来（对方不在的时候）。到点时你会醒来一次：能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息（对方手机上会收到），不想说也可以不说。\n\n- 适合：对方说了晚点要做的事（考试、面试、出门、看病），你想到时候问问；或者你自己想过一阵再来看看。\n- 不用每次都约；对方正在和你聊的时候，想说什么直接说就好。\n- 时间按对方的时区：at 写「2026-11-01 08:30」或「08:30」（今天过了就是明天），也可以用 in_minutes（多少分钟以后）。最早 10 分钟以后，最晚 7 天以内，最多同时约 3 个。\n- reason 写到时候想做什么（只有你自己醒来时看得到，对方看不到这个约定）。到点时你们正在聊天，就不单独醒。\n- 取消：action=cancel 带上编号 id；看约了哪些：action=list。',
+      parameters: {
+        type: 'object',
+        properties: {
+          action: { type: 'string', enum: ['set', 'cancel', 'list'], description: 'set=约（默认）, cancel=取消, list=看约了哪些' },
+          at: { type: 'string', description: '几点醒（对方的时区），如 2026-11-01 08:30 或 08:30' },
+          in_minutes: { type: 'number', description: '多少分钟以后醒（和 at 二选一）' },
+          reason: { type: 'string', description: '到时候想做什么，一句话（200 字以内）' },
+          id: { type: 'integer', description: '要取消的那一个的编号（cancel 时）' }
+        },
+        required: []
+      }
+    }
   }
 ];
 
@@ -1098,6 +1121,12 @@ async function getMemoryMenu(userMessage, convId, menuCtx, clock = {}) {
   }
   const win = menuCtx && menuCtx.windowP ? await menuCtx.windowP : null;   // 和找记忆同时在问，这里一般早就回来了
   if (win && win.turn_note) headerLines.push(win.turn_note);
+  // 自动醒来：对方不在的时候 ta 醒来过几次（这一轮回复成功以后标成告诉过了，见 runPluvia）
+  const wk = menuCtx && menuCtx.wakeP ? await menuCtx.wakeP : null;
+  if (wk && wk.note) {
+    headerLines.push(wk.note);
+    menuCtx.wakeSeen = { runs: wk.runs || [], plans: wk.plans || [] };
+  }
   return frameMemoryNote(headerLines, card);
 }
 
@@ -1146,6 +1175,18 @@ async function getWindowNotes(convId, entries, pv) {
     return d;
   } catch (e) {
     console.log('[WINDOW] compose/window 失败（这一轮不加窗口附注）:', e.message);
+    return null;
+  }
+}
+
+// 自动醒来：对方回来说话了——还没送到的醒来消息不再送，醒来过的几次写成附注里的一行（/wake/turn_note）
+async function getWakeTurnNote(convId) {
+  try {
+    const r = await axios.post(`${MEMORY_SERVICE_URL}/wake/turn_note`, { conv_id: convId || null }, { timeout: 2000 });
+    const d = r.data || {};
+    if (d.note) console.log(`[WAKE] 这一轮的附注带上醒来记录（${(d.runs || []).length} 次${(d.plans || []).length ? '，约了没醒 ' + d.plans.length + ' 次' : ''}）`);
+    return d;
+  } catch (e) {
     return null;
   }
 }
@@ -1544,6 +1585,19 @@ async function executeTool(name, args, ctx = {}) {
       return d.status === 'error' ? `小本子没记上：${d.message || '出错了'}` : (d.message || '记下了');
     } catch (e) {
       return `小本子没记上：${e.message}`;
+    }
+  }
+
+  if (name === 'schedule_wake') {
+    try {
+      const r = await axios.post(`${MEMORY_SERVICE_URL}/wake/plans`, {
+        action: args.action || 'set', at: args.at, in_minutes: args.in_minutes, reason: args.reason, id: args.id,
+        conv_id: ctx.convId || null, source: 'ai'
+      }, { timeout: 8000 });
+      const d = r.data || {};
+      return d.status === 'error' ? `没约上：${d.message || '出错了'}` : (d.message || '约好了');
+    } catch (e) {
+      return `没约上：${e.message}`;
     }
   }
 
@@ -2348,7 +2402,7 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
   // 缓存心跳要重放的前缀：这一轮第一次发给上游的样子（工具循环会往 messages 后面追加，先抄一份）。续问、辅助请求不算。
   const warmBase = (!skipMemory && !continued) ? {
     system: systemBlocks, messages: messages.slice(), tools: allTools, thinking,
-    outputConfig: req.body.output_config, toolChoice
+    outputConfig: req.body.output_config, toolChoice, maxTokens: req.body.max_tokens
   } : null;
   // OpenRouter：优先发给这个对话上一轮回答的那家（每家缓存分开）
   const providerPref = skipMemory ? null : keepwarm.preferFor(convId, apiUrl);
@@ -2426,12 +2480,19 @@ async function runPluvia({ req, res, pv, stream, isAnthropic, apiUrl, apiKey, re
 
   const allTexts = [...(prev ? prev.texts : []), ...roundTexts];
   const allThinks = [...(prev ? prev.thinks : []), ...thinkTexts];
+  // 附注里告诉过 ta 醒来记录了：标成告诉过（交给前端执行工具的中途也算，续问时不会再带）
+  if (menuCtx && menuCtx.wakeSeen) {
+    axios.post(MEMORY_SERVICE_URL + '/wake/seen', menuCtx.wakeSeen, { timeout: 3000 }).catch(() => {});
+    menuCtx.wakeSeen = null;
+  }
   const shownIds = prev ? (prev.shownIds || []) : (menuCtx.shownIds || []);
   rememberUsage(convId, totalUsage);
   // 用量报给记忆服务（Dashboard「缓存与心跳」），记住是哪家回答的；这一轮设成缓存心跳的对象（辅助请求、试一句不算）
   const answeredBy = result ? providerOf(result.id) : null;
   if (!skipMemory && result) {
     keepwarm.noteTurn({ convId, target: result.target, result, usage: totalUsage, base: KEEPWARM_ON ? warmBase : null, ttlUsed });
+    // 自动醒来接着说的就是这一轮（说完了才算；交给前端执行工具的中途先记着开头）
+    if (wake) wake.noteTurn({ convId, base: warmBase, target: result.target, slug: answeredBy, replyText: allTexts.join('\n\n'), final: !handoff, ttl: ttlUsed });
   }
 
   if (handoff) {
@@ -2678,6 +2739,11 @@ async function chatCompletionsMain(req, res) {
     const winEntries = (WINDOW_NOTES_ON && !pvContinuing && !menuCtx.skipShadow && lastUserIdx >= 0)
       ? windowEntries(req, lastUserIdx) : null;
     menuCtx.windowP = winEntries ? getWindowNotes(convIdForMenu, winEntries, pv) : null;
+    // 自动醒来：对方回来说话了——正醒着的那次停下；醒来过的几次放进这一轮的附注（只对 Pluvia，续问、标题生成这类不算）
+    if (pv && !pvContinuing && !menuCtx.skipShadow && lastUserIdx >= 0) {
+      if (wake) wake.interrupt();
+      menuCtx.wakeP = getWakeTurnNote(convIdForMenu);
+    }
     // 放进 system 的新内容（/compose/system）拿得到就用它；拿不到（记忆服务出错、GATEWAY_COMPOSE=off）用旧的叙事和近期摘要
     const [profile, memoryMenu, composed, customPrompt] = await Promise.all([
       getProfile(),
@@ -2688,6 +2754,9 @@ async function chatCompletionsMain(req, res) {
     ]);
     const [sharedNarrative, recentSummary] = composed ? [null, null]
       : await Promise.all([getSharedNarrative(), getRecentSummary()]);
+    // 自动醒来（只对 Pluvia：醒来说的话要前端来取）
+    const wakeOn = !!(pv && wake && wake.enabled());
+    const wakeToolOn = !!(wakeOn && wake.toolEnabled());
     const profileFacts = composed && composed.profile_extra ? `\n\n${composed.profile_extra}` : '';
     // 功能5：构建可缓存的稳定 system 前缀（角色说明 + L2画像 + 工具说明）。
     // 动态的 memoryMenu 不放这里——它每轮都变，会让缓存前缀失效。改为注入到最新 user 消息前。
@@ -2717,7 +2786,7 @@ ${profile}${profileFacts}
 - feel: 记录你当下的感受
 - update_profile: 更新对彼此的认识和理解（稳定的认识）
 - jot: 在小本子上随手记一笔（聊天里细碎的细节、有意思的小瞬间）
-- bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）
+- bocha_search: 用博查联网搜索可靠的中文网络信息（供应商不支持内置搜索、或需要可信来源时使用）${wakeToolOn ? '\n- schedule_wake: 约一个时间让自己醒来（对方不在的时候）' : ''}
 
 当需要查询当前时间时，必须调用 get_current_time 工具获取准确时间，不要自己编造。
 
@@ -2732,6 +2801,11 @@ ${profile}${profileFacts}
 历史消息里，有的用户消息最前面还有一行「［记忆系统附注｜……］」：写的是窗口里最早那条是几点的、更早滑出窗口的那段我记下的几句、最近新记在小本子上的几笔、和上一句隔了多久（或者中间省略了几条）、新开的窗口接着上一个窗口的哪里。它们也是系统加的，不是用户说的，用户看不到；只是帮你弄清时间和前后，不用回应，也不要模仿这种写法。
 
 记忆片段只是部分提醒，不代表所有相关记忆都已列出。如果你觉得某个话题以前聊过但没看到相关片段，可以用 recall 去找（exact 模式能搜到原始对话）。`;
+
+    // 自动醒来打开着：告诉 ta 有这回事（开关一变 system 变一次，那一轮缓存重写一次）
+    if (wakeOn) {
+      systemPrefix += `\n\n---\n\n对方打开了「自动醒来」：对方不在的时候，你偶尔会醒来一下（随机的${wakeToolOn ? '，或者你自己用 schedule_wake 约的时间' : ''}）。醒来时能看到这段对话，可以想一想、用记忆工具，想说话就给对方发一条消息，也可以不说。醒来时，用户消息的位置会是一段「［记忆系统｜醒来：……］」的说明，那是系统写给你的，不是对方说的话。对方回来以后，附注里会告诉你你醒来过几次、说了什么。`;
+    }
 
     // 如果有 Custom Prompt，追加到 systemPrefix
     if (customPrompt) {
@@ -2831,7 +2905,8 @@ ${profile}${profileFacts}
     // Pluvia v0.2：前端工具和记忆工具撞名时以网关为准（去掉前端那份）。
     const clientTools = (req.body.tools || []).filter(t => !(pv && isServerTool(toolNameOf(t))));
     // 小本子在 Dashboard 上关掉时不给 jot（记忆服务的 /compose/system 带着开关；拿不到时照常给）
-    const gwTools = TOOLS.filter(t => !(t.function.name === 'jot' && composed && composed.notebook === false));
+    const gwTools = TOOLS.filter(t => !(t.function.name === 'jot' && composed && composed.notebook === false))
+      .filter(t => t.function.name !== 'schedule_wake' || wakeToolOn);   // 自动醒来关着（或不让 ta 自己约）时不给
     const allTools = [...clientTools, ...gwTools].map(toAnthropicTool);
     console.log('[TOOLS] 合并后:', JSON.stringify(allTools.map(t => t.name)));
     // OpenAI 格式的 tool_choice（如 Pluvia 第 5 轮的 "none"）转成 Anthropic 格式；Anthropic 格式原样
@@ -3297,6 +3372,7 @@ app.post('/reload-config', async (req, res) => {
   const state = await loadActiveConfig();
   await refreshModelsCache(true);
   await keepwarm.refresh();   // 缓存时长、心跳的设置也立刻重新读
+  await wake.refresh();       // 自动醒来的设置也是
   // active/unconfigured 都算重载成功（unconfigured 是正常状态，回退 .env）；只有 error 是拉取失败
   res.json({
     status: state === 'error' ? 'error' : 'ok',
@@ -3327,6 +3403,70 @@ app.all('/api/*splat', async (req, res) => {
   } catch (e) {
     const status = e.response?.status || 502;
     res.status(status).json(e.response?.data || { error: { message: e.message, type: 'proxy_error' } });
+  }
+});
+
+// ============ 自动醒来（wake.js）：前端来取 ta 醒来时说的话（接入约定第 17 节） ============
+// 上一轮用的中转：重启以后从存档里接上时，按地址找回 key（存档里不存 key）
+function resolveWakeTarget(info) {
+  if (!info || !info.apiUrl) return null;
+  const t = chatTargets.find(x => x.apiUrl === info.apiUrl && x.name === info.name) || chatTargets.find(x => x.apiUrl === info.apiUrl);
+  if (t) return { name: t.name, apiUrl: t.apiUrl, apiKey: t.apiKey, model: info.model };
+  if (activeConfig && activeConfig.base_url && activeConfig.api_key) {
+    const base = activeConfig.base_url.replace(/\/$/, '');
+    const url = base.endsWith('/messages') ? base : base + '/messages';
+    if (url === info.apiUrl) return { name: activeConfig.name, apiUrl: url, apiKey: activeConfig.api_key, model: info.model };
+  }
+  const r = resolveUpstreamTarget(info.model);
+  if (r && r.apiKey && r.apiUrl === info.apiUrl) return { name: info.name || '主上游', apiUrl: r.apiUrl, apiKey: r.apiKey, model: info.model };
+  return null;
+}
+wake = createWake({
+  memoryUrl: MEMORY_SERVICE_URL,
+  runRound: ({ target, system, messages, tools, thinking, outputConfig, toolChoice, maxTokens, signal, providerPref }) => upstreamOnce({
+    apiUrl: target.apiUrl, apiKey: target.apiKey, requestModel: target.model, system, messages, tools, thinking, outputConfig,
+    maxTokens, toolChoice, signal, cands: upstreamCandidates(target.apiUrl, target.apiKey, target.model),
+    providerPref: (providerPref && keepwarm.settings().sticky_provider !== false && isOpenRouter(target.apiUrl)) ? providerPref : null
+  }),
+  execTool: (name, args, ctx) => executeTool(name, args, ctx),
+  isServerTool,
+  resolveTarget: resolveWakeTarget,
+  busy: () => keepwarm.busy(),
+  onTouch: (convId) => keepwarm.touch(convId),
+  stateFile: process.env.GATEWAY_WAKE_STATE || require('path').resolve(__dirname, '../../data/run/wake_last_turn.json'),
+  tickMs: Math.max(200, parseInt(process.env.GATEWAY_WAKE_TICK_MS || '60000', 10) || 60000)
+});
+
+// 前端来取：ta 醒来时说了、还没取走的话。取走（显示了）以后调 ack，网关把它存进聊天记录（接在醒来时最新的那条后面）
+app.get('/v1/pluvia/inbox', async (req, res) => {
+  try {
+    const conv = req.query.conversation_id || req.query.conv_id || '';
+    const r = await axios.get(`${MEMORY_SERVICE_URL}/wake/inbox`, { params: { conv_id: conv || undefined, limit: req.query.limit }, timeout: 5000 });
+    res.json({ messages: (r.data && r.data.messages) || [], wake: { enabled: wake.enabled() } });
+  } catch (e) {
+    res.status(502).json({ error: { message: '取不到：' + e.message, type: 'gateway_error' } });
+  }
+});
+app.post('/v1/pluvia/inbox/ack', async (req, res) => {
+  const b = req.body || {};
+  const ids = (Array.isArray(b.ids) ? b.ids : []).map(Number).filter(Number.isFinite);
+  const dropped = (Array.isArray(b.dropped) ? b.dropped : []).map(Number).filter(Number.isFinite);
+  if (!ids.length && !dropped.length) return res.status(400).json({ error: { message: '要带上 ids（显示了的）或 dropped（不显示的）', type: 'bad_request' } });
+  try {
+    const r = await axios.post(`${MEMORY_SERVICE_URL}/wake/ack`, { ids, dropped }, { timeout: 8000 });
+    res.json({ results: (r.data && r.data.results) || [] });
+  } catch (e) {
+    res.status(502).json({ error: { message: '没记上：' + e.message, type: 'gateway_error' } });
+  }
+});
+// 前端登记推送地址（UnifiedPush 之类：说了话时网关往这里 POST 一个 JSON）
+app.post('/v1/pluvia/push/register', async (req, res) => {
+  const b = req.body || {};
+  try {
+    const r = await axios.post(`${MEMORY_SERVICE_URL}/wake/push/register`, { url: b.endpoint || b.url, format: b.format || 'json', remove: !!b.remove }, { timeout: 5000 });
+    res.json(r.data);
+  } catch (e) {
+    res.status(e.response ? e.response.status : 502).json(e.response ? e.response.data : { error: { message: e.message, type: 'gateway_error' } });
   }
 });
 
@@ -3383,6 +3523,7 @@ for (const host of BIND_HOSTS) {
     // 启动时刷新一次模型列表缓存
     await refreshModelsCache();
     if (KEEPWARM_ON) keepwarm.start();
+    if (WAKE_ON) wake.start();
   });
   srv.on('error', e => console.error(`[BIND] ${host}:${PORT} 监听失败:`, e.message));
 }

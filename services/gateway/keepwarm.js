@@ -137,6 +137,14 @@ function createKeepwarm({ memoryUrl, userTz = 'Asia/Shanghai', log = console.log
   // 一轮真聊天开始 / 结束
   function begin() { realInflight++; }
   function end() { realInflight = Math.max(0, realInflight - 1); }
+  function busy() { return realInflight > 0; }
+  // 别的请求（自动醒来）刚读过这个对话的缓存：心跳从现在重新算
+  function touch(convId) {
+    if (armed && armed.convId === convId && !armed.inflight) {
+      armed.lastTouch = now();
+      reportState();
+    }
+  }
 
   // 一轮聊天成功结束：记用量、记住是哪家回答的、把这一轮设成保温对象
   // base：这一轮第一次发给上游的请求（工具循环之前），{ system, messages, tools, thinking, outputConfig, toolChoice, maxTokens, model }
@@ -262,7 +270,7 @@ function createKeepwarm({ memoryUrl, userTz = 'Asia/Shanghai', log = console.log
   function stop() { if (timer) clearInterval(timer); timer = null; }
 
   return {
-    applyTtl: (messages) => applyTtl(messages, ttl()), ttl, preferFor, noteTurn, begin, end, start, stop, tick, refresh,
+    applyTtl: (messages) => applyTtl(messages, ttl()), ttl, preferFor, noteTurn, begin, end, busy, touch, start, stop, tick, refresh, settings,
     state, _armed: () => armed, _setSettings: (v) => { cached = { at: now(), values: { ...DEFAULTS, ...v } }; }
   };
 }

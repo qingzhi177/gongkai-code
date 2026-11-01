@@ -18,7 +18,7 @@ async function splitWrite(res, str) {
   res.write(b.subarray(prev));
 }
 function scenario(body) {
-  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N|U|J)\]/g);
+  const m = JSON.stringify(body.messages || []).match(/\[(A|B|C|D|S|E|F|G|H|N|U|J|W|K)\]/g);
   return m ? m[m.length - 1][1] : 'A';
 }
 function resultIds(msgs) {
@@ -124,6 +124,10 @@ http.createServer((req, res) => {
         { type: 'tool_use', id: 'toolu_d2', name: 'keepsake', input: { note: 'x' } }]; stop = 'tool_use';
     } else if (scen === 'J' && !ids.has('toolu_jot1')) {   // 小本子：模型记一笔
       blocks = [{ type: 'tool_use', id: 'toolu_jot1', name: 'jot', input: { text: '你说楼下的猫换了蓝色的项圈' } }]; stop = 'tool_use';
+    } else if (scen === 'W' && !ids.has('toolu_wk1')) {   // 自动醒来：模型约一个时间
+      blocks = [{ type: 'tool_use', id: 'toolu_wk1', name: 'schedule_wake', input: { at: '21:30', reason: '问问考试' } }]; stop = 'tool_use';
+    } else if (scen === 'K') {   // 自动醒来：平时回「加油」，醒来时（消息里有醒来说明）回「考完了吗」
+      blocks = [{ type: 'text', text: JSON.stringify(msgs).includes('醒来测试说明') ? '考完了吗' : '加油' }];
     } else if (scen === 'S') {
       blocks = [{ type: 'text', text: '慢慢说', slow: true }];
     } else {

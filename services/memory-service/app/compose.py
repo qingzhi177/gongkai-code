@@ -13,11 +13,13 @@
 import json
 from datetime import date
 
+import timeutil
 from app import settings as app_settings
 from app import notes as notebook
 from app.config import get_conn
 from app.pipeline import arcs as AR
 from app.pipeline import chapters as C
+from app.pipeline import episodes as EP
 from app.pipeline import facts as F
 from app.pipeline import lexicon as LX
 from app.pipeline import loops as LP
@@ -115,9 +117,26 @@ def arcs_text(conn, kws):
     return ("[我们的主题线]（一直延续着的几条线）\n" + "\n".join(lines)) if lines else ""
 
 
-def lexicon_text(conn, kws):
+# 共同语汇的顺序按天定格：{"day": 哪一天, "ids": [当天的顺序]}。
+# lexicon_scan 每 10 分钟更新一次「用了几次」，以前每次都按次数重新排：次数接近的几条换个位置、或者在字数上限边上进进出出，
+# 半静态块就变了，后面的日更块和整段聊天记录的缓存都要重写（2026-11-01 看用量记录：一天里有 3 次是这个原因，每次多写一万多 token）。
+# 现在每天第一次放进聊天时排一次，当天都用这个顺序；当天新认出来的接在最后（多半在上限外面、看不到），第二天再按次数排进去。
+_LEX_ORDER = {"day": None, "ids": []}
+
+
+def _lexicon_order(ranked, now=None):
+    day = EP.day_of(now or timeutil.utc_now_str())
+    if _LEX_ORDER["day"] != day:
+        _LEX_ORDER.update(day=day, ids=[r["id"] for r in ranked])
+    pos = {i: k for k, i in enumerate(_LEX_ORDER["ids"])}
+    known = sorted((r for r in ranked if r["id"] in pos), key=lambda r: pos[r["id"]])
+    return known + [r for r in ranked if r["id"] not in pos]
+
+
+def lexicon_text(conn, kws, now=None):
     rows = sorted(LX._all(conn, ("active",)), key=lambda r: str(r["last_used"] or ""), reverse=True)
     rows.sort(key=lambda r: (r["kind"] != "nickname", -(r["use_count"] or 0)))      # 称呼在前，常用的在前，一样多时最近用过的在前
+    rows = _lexicon_order(rows, now)                                                  # 当天定格（见上）
     lines = []
     for r in rows:
         meaning = (r.get("meaning") or LX.KINDS.get(r.get("kind"), "")).strip()
@@ -214,7 +233,7 @@ def system_blocks(now=None):
                 legacy.append("narrative")
         semi = [chapters,
                 use("arcs", c["arcs"], lambda: arcs_text(conn, kws)),
-                use("lexicon", c["lexicon"], lambda: lexicon_text(conn, kws))]
+                use("lexicon", c["lexicon"], lambda: lexicon_text(conn, kws, now))]
         digest = use("digest", c["digest"], lambda: digest_text(conn))
         if not digest:
             digest = use("legacy_summary", True, lambda: legacy_summary(conn))

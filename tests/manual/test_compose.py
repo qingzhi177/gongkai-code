@@ -146,6 +146,21 @@ def main():
         run("UPDATE chapters SET sections=? WHERE n=2", (json.dumps(sec, ensure_ascii=False),))
         b = CP.system_blocks()
         check("进行中这一章太长：只留后面的部分", "……" + "雨" * CP.CHAPTER_MAX in b["semi"] and "雨" * (CP.CHAPTER_MAX + 1) not in b["semi"])
+        print("\n[共同语汇的顺序按天定格]")
+        CP._LEX_ORDER.update(day=None, ids=[])
+        d1 = "2026-10-20 06:00:00"     # 北京 14:00
+        sb1 = CP.system_blocks(now=d1)["semi"]
+        lex1 = sb1[sb1.index("[我们的共同语汇]"):]
+        run("UPDATE lexicon SET use_count = use_count + 500, last_used = ? WHERE term = '词119'", (d1,))
+        sb2 = CP.system_blocks(now="2026-10-20 08:00:00")["semi"]
+        check("同一天里次数变了：顺序不变，半静态块一字不差（缓存照常命中）", sb2 == sb1)
+        run("INSERT INTO lexicon (term, term_key, aliases, kind, meaning, status, use_count, days_seen, created_at, updated_at) "
+            "VALUES ('新梗', 'xingeng', '[]', 'inside_joke', '今天刚认出来的', 'active', 999, 1, ?, ?)", (d1, d1))
+        sb3 = CP.system_blocks(now="2026-10-20 09:00:00")["semi"]
+        check("当天新认出来的：接在最后（超过上限就看不到），不打乱前面", sb3 == sb1 and "新梗" not in sb3)
+        sb4 = CP.system_blocks(now="2026-10-21 06:00:00")["semi"]
+        lex4 = sb4[sb4.index("[我们的共同语汇]"):]
+        check("第二天：重新按次数排（新梗、用得多的排到前面）", lex4 != lex1 and lex4.index("新梗") < lex4.index("词119") < lex4.index("小雨伞"), lex4[:200])
     finally:
         shutil.rmtree(TMP, ignore_errors=True)
     print(f"\n通过 {PASS}，失败 {FAIL}")

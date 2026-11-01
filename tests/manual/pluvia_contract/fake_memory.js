@@ -58,5 +58,31 @@ app.post('/_test/cache', (q, r) => { cacheVals = q.body || {}; r.json({ ok: true
 app.get('/cache/settings', (q, r) => r.json({ group: 'cache', items: Object.entries(cacheVals).map(([key, value]) => ({ key, value })) }));
 app.post('/cache/events', (q, r) => { log('cache_event', q.body); r.json({ status: 'ok' }); });
 app.post('/cache/keepwarm', (q, r) => { log('keepwarm', q.body); r.json({ status: 'ok' }); });
+// 自动醒来：测试脚本用 POST /_test/wake 设置 /wake/settings 的值、下一次 /wake/check 的回答、这一轮附注里的醒来记录
+let wakeVals = {}, wakeQueue = [], wakeTurn = { note: '', runs: [], plans: [] };
+app.post('/_test/wake', (q, r) => {
+  const b = q.body || {};
+  if (b.vals) wakeVals = b.vals;
+  if (b.check) wakeQueue.push(b.check);
+  if (b.turn) wakeTurn = b.turn;
+  r.json({ ok: true });
+});
+app.get('/wake/settings', (q, r) => r.json({ group: 'wake', items: Object.entries(wakeVals).map(([key, value]) => ({ key, value })) }));
+app.post('/wake/check', (q, r) => {
+  const next = wakeQueue.shift();
+  if (next) log('wake_check', q.body);
+  r.json(next || { status: 'ok', wake: false, reason: '不醒' });
+});
+app.post('/wake/finish', (q, r) => {
+  log('wake_finish', q.body);
+  r.json({ status: 'ok', run: { id: q.body.run_id, conv_id: 'conv-wake', text: q.body.text, outcome: q.body.outcome, finished_at: '2026-10-31 13:00:00' },
+    push: [], push_title: '', push_preview: true });
+});
+app.post('/wake/turn_note', (q, r) => { log('wake_turn', q.body); const t = wakeTurn; wakeTurn = { note: '', runs: [], plans: [] }; r.json({ status: 'ok', ...t }); });
+app.post('/wake/seen', (q, r) => { log('wake_seen', q.body); r.json({ status: 'ok' }); });
+app.post('/wake/plans', (q, r) => { log('wake_plan', q.body); r.json({ status: 'ok', message: '约好了：21:30 醒来（#3）。' }); });
+app.get('/wake/inbox', (q, r) => { log('wake_inbox', q.query); r.json({ status: 'ok', messages: [{ id: 21, conversation_id: q.query.conv_id || null, text: '考完了吗', at: '2026-10-31T13:00:00Z', kind: 'random' }] }); });
+app.post('/wake/ack', (q, r) => { log('wake_ack', q.body); r.json({ status: 'ok', results: (q.body.ids || []).map(id => ({ id, status: 'delivered', l0_id: 99 })) }); });
+app.post('/wake/push/register', (q, r) => { log('wake_push', q.body); r.json({ status: 'ok', endpoints: 1 }); });
 app.use((q, r) => { log('other', { path: q.path, method: q.method }); r.json({ status: 'ok' }); });
 app.listen(3998, '127.0.0.1', () => console.log('fake memory on 3998'));

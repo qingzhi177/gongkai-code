@@ -843,6 +843,74 @@ const oaTools = [{ type: 'function', function: { name: 'music_tool', description
     ok(/当前时间/.test(t.content), 'T33 get_current_time', t);
   }
 
+  console.log('T34 自动醒来（约定 17）');
+  {
+    const memPost = (p, b) => fetch('http://127.0.0.1:3998' + p, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) }).then(r => r.json());
+    const cc = await (await fetch(GW + '/v1/pluvia/contract')).json();
+    ok(cc.features.includes('wake'), 'T34 能力协商里有 wake', cc.features);
+    // 默认关着：工具和 system 和以前一模一样（缓存不受影响）
+    let m = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-wk0',
+      pluvia: { v: '0.2', turn: { id: 'tw0', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '在吗 [A]' }] }));
+    await sleep(200);
+    let up = upReqs(since(m))[0];
+    ok(up && !up.tools.some(t => t.name === 'schedule_wake') && !/自动醒来/.test(JSON.stringify(up.system)), 'T34 关着：不给 schedule_wake，system 里不提', up && up.tools.map(t => t.name));
+    // 打开
+    await memPost('/_test/wake', { vals: { enabled: true, plans: true } });
+    await fetch(GW + '/reload-config', { method: 'POST' });
+    await memPost('/_test/wake', { turn: { note: '[对方不在的时候，你醒来过 1 次：15:00 没说话。]', runs: [5], plans: [] } });
+    m = mark();
+    const s1 = oaSummary(await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-wkp',
+      pluvia: { v: '0.2', turn: { id: 'tw1', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '明天考试 [W]' }] })));
+    await sleep(300);
+    let d = since(m);
+    up = upReqs(d);
+    ok(up[0] && up[0].tools.some(t => t.name === 'schedule_wake') && /自动醒来/.test(JSON.stringify(up[0].system)), 'T34 打开：给 schedule_wake，system 里说明了', up[0] && up[0].tools.map(t => t.name));
+    const lastU = JSON.stringify(up[0].messages[up[0].messages.length - 1].content);
+    ok(/醒来过 1 次/.test(lastU) && /记忆系统自动附注/.test(lastU), 'T34 对方回来了：这一轮的附注里带上醒来记录', lastU.slice(0, 300));
+    const plans = d.mem.filter(x => x.k === 'wake_plan');
+    ok(plans.length === 1 && plans[0].b.at === '21:30' && plans[0].b.reason === '问问考试' && plans[0].b.conv_id === 'conv-wkp' && plans[0].b.source === 'ai',
+      'T34 ta 约时间：转给记忆服务，带上对话 id', plans.map(x => x.b));
+    ok(s1.tools.some(t => t.name === 'schedule_wake' && t.status === 'done' && /约好了/.test(t.content || '')), 'T34 前端收到 schedule_wake 的工具事件', s1.tools);
+    const seen = d.mem.filter(x => x.k === 'wake_seen');
+    ok(seen.length === 1 && JSON.stringify(seen[0].b.runs) === '[5]', 'T34 回复成功：醒来记录标成告诉过了', seen.map(x => x.b));
+    ok(d.mem.filter(x => x.k === 'wake_turn').length === 1 && d.mem.find(x => x.k === 'wake_turn').b.conv_id === 'conv-wkp', 'T34 只在这一轮开头问一次（续问不再问）');
+    // 醒来：走平时那条链
+    m = mark();
+    await sseCollect(await post('/v1/chat/completions', { model: 'fake-model', stream: true, conversation_id: 'conv-wake',
+      pluvia: { v: '0.2', turn: { id: 'tw2', round: 1 }, tail: '' }, messages: [{ role: 'user', content: '我去考试啦 [K]' }] }));
+    await sleep(200);
+    const turnReq = upReqs(since(m))[0];
+    m = mark();
+    await memPost('/_test/wake', { check: { status: 'ok', wake: true, run_id: 21, kind: 'random', note: '［记忆系统｜醒来测试说明］' } });
+    await sleep(1500);
+    d = since(m);
+    const wakeReq = upReqs(d)[0];
+    const ck = d.mem.find(x => x.k === 'wake_check');
+    ok(ck && ck.b.conv_id === 'conv-wake' && ck.b.has_context === true && ck.b.tools.includes('schedule_wake') && /^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$/.test(ck.b.last_real_at),
+      'T34 来问要不要醒：带上最近一轮的对话、时间、工具', ck && ck.b);
+    ok(wakeReq && JSON.stringify(wakeReq.system) === JSON.stringify(turnReq.system) && JSON.stringify(wakeReq.tools) === JSON.stringify(turnReq.tools),
+      'T34 醒来的请求：system、工具和上一轮一模一样（缓存前缀一样）');
+    const wm = wakeReq ? wakeReq.messages : [];
+    ok(wm.length === turnReq.messages.length + 2 && JSON.stringify(wm.slice(0, turnReq.messages.length)) === JSON.stringify(turnReq.messages)
+      && wm[wm.length - 2].role === 'assistant' && wm[wm.length - 2].content[0].text === '加油'
+      && wm[wm.length - 1].content[0].text === '［记忆系统｜醒来测试说明］', 'T34 消息：上一轮原样 + ta 的回复 + 醒来说明', wm.slice(-2));
+    const fin = d.mem.find(x => x.k === 'wake_finish');
+    ok(fin && fin.b.run_id === 21 && fin.b.outcome === 'spoke' && fin.b.text === '考完了吗', 'T34 ta 说了话：记下来（等前端来取）', fin && fin.b);
+    ok(d.mem.some(x => x.k === 'cache_event' && x.b.kind === 'wake'), 'T34 用量报给「缓存与心跳」');
+    ok(!saves(d).length, 'T34 醒来这一轮不走存 L0（前端取走以后才存）');
+    // 前端来取、确认
+    const ib = await (await fetch(GW + '/v1/pluvia/inbox?conversation_id=conv-wake')).json();
+    ok(ib.messages && ib.messages[0].id === 21 && ib.messages[0].text === '考完了吗' && ib.wake && ib.wake.enabled === true, 'T34 前端来取：/v1/pluvia/inbox', ib);
+    m = mark();
+    const ak = await (await post('/v1/pluvia/inbox/ack', { ids: [21] })).json();
+    await sleep(100);
+    ok(ak.results && ak.results[0].status === 'delivered' && since(m).mem.some(x => x.k === 'wake_ack' && JSON.stringify(x.b.ids) === '[21]'), 'T34 前端确认：/v1/pluvia/inbox/ack', ak);
+    ok((await post('/v1/pluvia/inbox/ack', {})).status === 400, 'T34 确认时什么都没带：400');
+    await memPost('/_test/wake', { vals: {} });
+    await fetch(GW + '/reload-config', { method: 'POST' });
+  }
+
   console.log(`\n通过 ${pass}，失败 ${fail}`);
   process.exit(fail ? 1 : 0);
 })().catch(e => { console.error('测试脚本出错', e); process.exit(2); });
